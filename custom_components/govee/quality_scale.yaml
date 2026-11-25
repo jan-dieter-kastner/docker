@@ -1,0 +1,206 @@
+# Home Assistant Integration Quality Scale
+# https://developers.home-assistant.io/docs/core/integration-quality-scale/
+#
+# Status per rule, as verified against the code on 2026-09-13. "done" means
+# the rule is met; "todo" means it is not; "exempt" carries the reason.
+
+rules:
+  # Bronze
+  action-setup:
+    status: done
+    comment: Services are registered in async_setup and validate a loaded entry per call.
+  appropriate-polling:
+    status: done
+    comment: >-
+      DataUpdateCoordinator with a configurable interval (default 60 s,
+      30-300). One request per polled device; devices whose entities are all
+      disabled are skipped, and a rate-limit response backs the interval off.
+  brands:
+    status: done
+    comment: home-assistant/brands ships custom_integrations/govee (icon and logo).
+  common-modules:
+    status: done
+    comment: coordinator.py and entity.py hold the shared patterns.
+  config-flow:
+    status: done
+    comment: >-
+      User, account, verification, Bluetooth discovery, reauth, reconfigure,
+      and options steps; every field carries a data_description.
+  config-flow-test-coverage:
+    status: done
+    comment: >-
+      Every step (user, account, 2FA code, Bluetooth discovery, reauth,
+      reconfigure, options incl. per-device segment modes) is driven through
+      the flow manager in tests/test_config_flow_manager*.py and
+      tests/test_config_flow_bluetooth.py, covering aborts, errors, and entry
+      data; config_flow.py measures 100 % line coverage.
+  dependency-transparency:
+    status: done
+    comment: All requirements are declared in manifest.json.
+  docs-actions:
+    status: done
+    comment: README "Services" section.
+  docs-high-level-description:
+    status: done
+  docs-installation-instructions:
+    status: done
+  docs-removal-instructions:
+    status: done
+    comment: README "Removing the integration" section.
+  entity-event-setup:
+    status: done
+    comment: Entities subscribe in async_added_to_hass and unsubscribe through async_on_remove.
+  entity-unique-id:
+    status: done
+  has-entity-name:
+    status: done
+  runtime-data:
+    status: done
+    comment: >-
+      entry.runtime_data holds the coordinator behind the GoveeConfigEntry
+      alias; hass.data is only read by the v1 to v2 entry migration.
+  test-before-configure:
+    status: done
+    comment: The API key is validated against the device list before an entry is created.
+  test-before-setup:
+    status: done
+    comment: async_config_entry_first_refresh raises ConfigEntryAuthFailed / ConfigEntryNotReady.
+  unique-config-entry:
+    status: done
+    comment: The user step aborts with already_configured when the API key is already set up; reauth and reconfigure refuse a key another entry uses.
+
+  # Silver
+  action-exceptions:
+    status: done
+    comment: Entity actions raise HomeAssistantError when Govee rejects a command; services raise ServiceValidationError on bad input.
+  config-entry-unloading:
+    status: done
+  docs-configuration-parameters:
+    status: done
+    comment: README "Configuration options".
+  docs-installation-parameters:
+    status: done
+    comment: README "Set up".
+  entity-unavailable:
+    status: done
+    comment: >-
+      Entities go unavailable when the last update failed or Govee reports
+      the device offline (segment lights included); a total cloud outage
+      raises UpdateFailed so every cloud-dependent entity goes unavailable.
+      The one exception is a whole-device light whose LAN transport has a
+      fresh read: it stays available and is controlled over LAN (#226).
+  integration-owner:
+    status: done
+  log-when-unavailable:
+    status: done
+    comment: UpdateFailed on a total outage makes the coordinator log once on failure and once on recovery.
+  parallel-updates:
+    status: done
+    comment: >-
+      Every platform declares PARALLEL_UPDATES. Read-only platforms use 0
+      behind the coordinator; the action platforms also use 0 because the
+      coordinator itself paces segment writes and honours the Govee rate limit.
+  reauthentication-flow:
+    status: done
+    comment: >-
+      Reauth replaces the API key through async_update_reload_and_abort. The
+      Developer API exposes no account identity, so a same-account check is
+      not possible; the flow instead refuses a key another entry already uses.
+  test-coverage:
+    status: done
+    comment: >-
+      99.9 % overall and every module above 96 %; tox and .coveragerc enforce
+      a 95 % floor. The only uncovered lines are import fallbacks for optional
+      libraries and branches unreachable by construction.
+
+  # Gold
+  devices:
+    status: done
+  diagnostics:
+    status: done
+    comment: Config-entry and per-device diagnostics with key and value redaction.
+  discovery:
+    status: done
+    comment: >-
+      Bluetooth advertisements from Govee devices (manifest matchers) start
+      a discovery flow that offers the cloud set-up once; it aborts when an
+      entry exists or another flow is open.
+  discovery-update-info:
+    status: exempt
+    comment: >-
+      Bluetooth discovery carries no network address and the cloud endpoint
+      is fixed, so there is nothing to update.
+  docs-configuration-parameters:
+    status: done
+  docs-data-update:
+    status: done
+  docs-examples:
+    status: done
+    comment: README "Example automations".
+  docs-known-limitations:
+    status: done
+    comment: README "Known limitations".
+  docs-supported-devices:
+    status: done
+  docs-supported-functions:
+    status: done
+  docs-troubleshooting:
+    status: done
+  docs-use-cases:
+    status: done
+    comment: README "Use cases".
+  dynamic-devices:
+    status: done
+    comment: Devices added to the account after startup trigger a throttled config-entry reload (issue #101).
+  entity-category:
+    status: done
+    comment: >-
+      Diagnostics carry DIAGNOSTIC; settings (music sensitivity, heater
+      auto-stop, probe alarm limits, probe polling, scene refresh) carry CONFIG.
+  entity-device-class:
+    status: done
+  entity-disabled-by-default:
+    status: done
+    comment: >-
+      The rate-limit sensor, the last-update, last-command, and MQTT-received
+      timestamps, and the leak address sensors are disabled by default;
+      per-transport connectivity sensors are opt-in through an option.
+  entity-translations:
+    status: done
+    comment: Every entity has a translation key; no entity hard-codes a name.
+  exception-translations:
+    status: done
+    comment: Raised exceptions carry translation keys from the exceptions block of strings.json.
+  icon-translations:
+    status: done
+    comment: All icons live in icons.json, including the state-based connection-mode icon.
+  reconfiguration-flow:
+    status: done
+  repair-issues:
+    status: done
+    comment: >-
+      rate_limited and mqtt_disconnected are fixable: their repair flows raise
+      the polling interval and retry the account sign-in respectively.
+      mqtt_2fa_required and mqtt_token_expired tell the user to reconfigure.
+      Invalid API keys go through Home Assistant's own reauth flow.
+  stale-devices:
+    status: done
+    comment: >-
+      Entities of devices missing from a complete discovery are removed;
+      leak sensors, hubs, and the diagnostics device are protected; a failed
+      discovery step or an empty device list skips removal;
+      async_remove_config_entry_device allows manual deletion.
+
+  # Platinum
+  async-dependency:
+    status: done
+  inject-websession:
+    status: done
+    comment: GoveeApiClient and GoveeAuthClient use the Home Assistant client session; no fallback session is created.
+  strict-typing:
+    status: done
+    comment: >-
+      The API client code lives in-tree and ships a py.typed marker; the
+      whole package passes mypy --strict (setup.cfg) with no
+      ignore_missing_imports for Home Assistant or the typed dependencies,
+      and GoveeConfigEntry types the config entry throughout.

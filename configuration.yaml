@@ -1,0 +1,74 @@
+
+# Loads default set of integrations. Do not remove.
+default_config:
+  network:
+    #rflink:
+    #port: /dev/ttyACM0
+# Load frontend themes from the themes folder
+frontend:
+  themes: !include_dir_merge_named themes
+
+    #light:
+    #- platform: rflink
+    #automatic_add: true
+    #sensor:
+    #- platform: rflink
+    #automatic_add: true
+    #logger:
+    #default: error
+    #logs:
+    #rflink: debug
+    #homeassistant.components.rflink: debug
+automation: !include automations.yaml
+script: !include scripts.yaml
+scene: !include scenes.yaml
+
+rest_command:
+  govee_appliance_request:
+    url: https://openapi.api.govee.com/router/api/v1/device/control
+    method: POST
+    headers:
+      Content-Type: application/json
+      Govee-API-Key: !secret govee_api_key
+    content_type: "application/json; charset=utf-8"
+    payload: >
+      {
+        "requestId": "uuid",
+        "payload": {
+          "sku": "{{ model }}",
+          "device": "{{ device }}",
+          "capability": {
+            "type": "devices.capabilities.{{ cmd_name }}",
+            "instance": "{{ cmd_instance }}",
+            "value": {{ cmd_value }}
+          }
+        }
+      }
+    verify_ssl: true
+
+input_boolean:
+  smart_heater_state:
+    name: Govee Smart Heater State
+    icon: >-
+      {% if is_state('input_boolean.smart_heater_state', 'on') %} mdi:radiator
+      {% else %} mdi:radiator-off
+      {% endif %}
+
+switch:
+  - platform: template
+    switches:
+      smart_heater_lr_toggle:
+        value_template: '{{ states("input_boolean.smart_heater_state") }}'
+        friendly_name: "Govee Smart Heater"
+        turn_on:
+          - service: input_boolean.turn_on
+            entity_id: input_boolean.smart_heater_state
+          - service: script.govee_smart_heater_on
+        turn_off:
+          - service: input_boolean.turn_off
+            entity_id: input_boolean.smart_heater_state
+          - service: script.smart_space_heater_off
+        icon_template: >-
+          {% if is_state('input_boolean.smart_heater_state', 'on') %} mdi:radiator
+          {% else %} mdi:radiator-off
+          {% endif %}

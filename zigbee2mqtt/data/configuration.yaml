@@ -1,0 +1,97 @@
+homeassistant:
+  enabled: true
+mqtt:
+  base_topic: zigbee2mqtt
+  server: mqtt://172.17.0.1
+serial:
+  port: /dev/ttyUSB0
+advanced: {}
+device_options: {}
+devices:
+  '0x28dba7fffee55fc6':
+    friendly_name: '0x28dba7fffee55fc6'
+  '0xecf64cfffe10b2b4':
+    friendly_name: '0xecf64cfffe10b2b4'
+  '0x680ae2fffe36ca1f':
+    friendly_name: '0x680ae2fffe36ca1f'
+  '0xa4c138105a6451a1':
+    friendly_name: '0xa4c138105a6451a1'
+  '0xa4c13820c3781e01':
+    friendly_name: '0xa4c13820c3781e01'
+  '0x8c65a3fffe526a88':
+    friendly_name: '0x8c65a3fffe526a88'
+  '0xa4c138b7e6e6f754':
+    friendly_name: '0xa4c138b7e6e6f754'
+  '0xa4c1385f099dfb51':
+    friendly_name: '0xa4c1385f099dfb51'
+  '0xa4c138ae27025d6a':
+    friendly_name: '0xa4c138ae27025d6a'
+  '0x0cae5ffffeae6730':
+    friendly_name: '0x0cae5ffffeae6730'
+  '0x0cae5ffffeb12f67':
+    friendly_name: '0x0cae5ffffeb12f67'
+  '0x0cae5ffffeb360c0':
+    friendly_name: '0x0cae5ffffeb360c0'
+  '0x0cae5ffffeb27ca3':
+    friendly_name: '0x0cae5ffffeb27ca3'
+  '0x0ceff6fffe59be21':
+    friendly_name: '0x0ceff6fffe59be21'
+  '0x0ceff6fffe3fcc56':
+    friendly_name: '0x0ceff6fffe3fcc56'
+  '0x00158d008b0ba12e':
+    friendly_name: '0x00158d008b0ba12e'
+  '0x0ceff6fffe5b83e8':
+    friendly_name: '0x0ceff6fffe5b83e8'
+  '0x00158d008b0ba0da':
+    friendly_name: '0x00158d008b0ba0da'
+  '0x0ceff6fffe69f3a8':
+    friendly_name: '0x0ceff6fffe69f3a8'
+  '0x842712fffe33c984':
+    friendly_name: '0x842712fffe33c984'
+  '0x842712fffe418355':
+    friendly_name: '0x842712fffe418355'
+  '0x00158d008b0bc29f':
+    friendly_name: '0x00158d008b0bc29f'
+  '0x881a14fffee96739':
+    friendly_name: '0x881a14fffee96739'
+  '0x0cae5ffffed02ee3':
+    friendly_name: '0x0cae5ffffed02ee3'
+  '0x0cae5ffffed0fec7':
+    friendly_name: '0x0cae5ffffed0fec7'
+  '0xa4c1386b18fe9844':
+    friendly_name: '0xa4c1386b18fe9844'
+  '0xa4c13879eb7ec79a':
+    friendly_name: '0xa4c13879eb7ec79a'
+  '0xa4c138919a88e4bf':
+    friendly_name: '0xa4c138919a88e4bf'
+  '0x001788010dbd8410':
+    friendly_name: '0x001788010dbd8410'
+  '0x001788010dbd8bd4':
+    friendly_name: '0x001788010dbd8bd4'
+  '0xa4c138f9d410f172':
+    friendly_name: '0xa4c138f9d410f172'
+  '0x00158d008b0baed9':
+    friendly_name: '0x00158d008b0baed9'
+  '0x00158d008b0ba9ac':
+    friendly_name: '0x00158d008b0ba9ac'
+  '0x00158d008afe12ef':
+    friendly_name: '0x00158d008afe12ef'
+  '0x0cae5ffffec2a74f':
+    friendly_name: '0x0cae5ffffec2a74f'
+  '0xa4c138b9196b91a6':
+    friendly_name: '0xa4c138b9196b91a6'
+  '0xa4c1383ca4c071be':
+    friendly_name: '0xa4c1383ca4c071be'
+  '0xa4c1384cc1e27f97':
+    friendly_name: '0xa4c1384cc1e27f97'
+  '0x00158d000ad9d9e6':
+    friendly_name: '0x00158d000ad9d9e6'
+  '0x0ceff6fffe16cb3f':
+    friendly_name: '0x0ceff6fffe16cb3f'
+  '0xa4c138d2aecc2e8a':
+    friendly_name: '0xa4c138d2aecc2e8a'
+  '0x001788010e6c1782':
+    friendly_name: '0x001788010e6c1782'
+  '0x18690afffe698cea':
+    friendly_name: '0x18690afffe698cea'
+version: 5

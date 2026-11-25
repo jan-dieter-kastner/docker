@@ -1,0 +1,10 @@
+*.db
+*.db-*
+*.log
+*.log.*
+secrets.yaml
+.storage/
+.cloud/
+tts/
+__pycache__/
+backups/

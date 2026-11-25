@@ -1,0 +1,746 @@
+"""Binary Sensor platform for battery_notes."""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Any
+
+from homeassistant.components.binary_sensor import (
+    BinarySensorDeviceClass,
+    BinarySensorEntity,
+    BinarySensorEntityDescription,
+)
+from homeassistant.const import (
+    STATE_UNAVAILABLE,
+    STATE_UNKNOWN,
+)
+from homeassistant.core import (
+    Event,
+    HomeAssistant,
+    callback,
+)
+from homeassistant.exceptions import TemplateError
+from homeassistant.helpers import (
+    entity_registry as er,
+    template,
+)
+from homeassistant.helpers.entity import EntityCategory
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.entity_registry import (
+    EVENT_ENTITY_REGISTRY_UPDATED,
+)
+from homeassistant.helpers.event import (
+    EventStateChangedData,
+    async_track_state_change_event,
+)
+from homeassistant.helpers.restore_state import RestoreEntity
+from homeassistant.util import dt as dt_util
+
+from .common import async_hide_source_battery, validate_is_float
+from .const import (
+    ATTR_BATTERY_INCREASE_THRESHOLD,
+    ATTR_BATTERY_LAST_REPLACED,
+    ATTR_BATTERY_LAST_REPORTED,
+    ATTR_BATTERY_LOW_THRESHOLD,
+    ATTR_BATTERY_QUANTITY,
+    ATTR_BATTERY_TYPE,
+    ATTR_BATTERY_TYPE_AND_QUANTITY,
+    ATTR_DEVICE_ID,
+    ATTR_DEVICE_NAME,
+    ATTR_NOTE,
+    ATTR_SOURCE_ENTITY_ID,
+    DOMAIN,
+    SUBENTRY_BATTERY_NOTE,
+)
+from .coordinator import (
+    BatteryNotesConfigEntry,
+    BatteryNotesSubentryCoordinator,
+)
+from .entity import BatteryNotesEntity, BatteryNotesEntityDescription
+from .template_helpers import TemplateTrackingMixin
+
+_LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, kw_only=True)
+class BatteryNotesBinarySensorEntityDescription(
+    BatteryNotesEntityDescription,
+    BinarySensorEntityDescription,
+):
+    """Describes Battery Notes binary sensor entity."""
+
+    unique_id_suffix: str
+
+
+async def async_setup_entry(
+    hass: HomeAssistant,
+    config_entry: BatteryNotesConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Initialize Battery Type config entry."""
+
+    for subentry in config_entry.get_subentries_of_type(SUBENTRY_BATTERY_NOTE):
+        assert config_entry.runtime_data.subentry_coordinators
+        coordinator = config_entry.runtime_data.subentry_coordinators.get(
+            subentry.subentry_id
+        )
+        assert coordinator
+
+        if coordinator.is_orphaned:
+            _LOGGER.debug(
+                "Skipping binary_sensor creation for orphaned subentry: %s",
+                subentry.title,
+            )
+            continue
+
+        battery_low_entity_description = BatteryNotesBinarySensorEntityDescription(
+            unique_id_suffix="_battery_low",
+            key="_battery_plus_low",
+            translation_key="battery_low",
+            entity_category=EntityCategory.DIAGNOSTIC,
+            device_class=BinarySensorDeviceClass.BATTERY,
+            entity_type="binary_sensor",
+        )
+
+        entities: list[
+            BatteryNotesBatteryLowBinaryTemplateSensor
+            | BatteryNotesBatteryWrappedLowSensor
+            | BatteryNotesBatteryBinaryLowSensor
+            | BatteryNotesBatteryPercentageTemplateLowSensor
+        ] = []
+
+        if (
+            coordinator.battery_low_template
+            and coordinator.battery_low_template.strip()
+        ):
+            entities.append(
+                BatteryNotesBatteryLowBinaryTemplateSensor(
+                    hass,
+                    coordinator,
+                    battery_low_entity_description,
+                    f"{subentry.unique_id}{battery_low_entity_description.unique_id_suffix}",
+                    coordinator.battery_low_template,
+                )
+            )
+
+        elif (
+            coordinator.battery_percentage_template
+            and coordinator.battery_percentage_template.strip()
+        ):
+            entities.append(
+                BatteryNotesBatteryPercentageTemplateLowSensor(
+                    hass,
+                    coordinator,
+                    battery_low_entity_description,
+                    f"{subentry.unique_id}{battery_low_entity_description.unique_id_suffix}",
+                )
+            )
+
+        elif coordinator.wrapped_battery is not None:
+            entities.append(
+                BatteryNotesBatteryWrappedLowSensor(
+                    hass,
+                    coordinator,
+                    battery_low_entity_description,
+                    f"{subentry.unique_id}{battery_low_entity_description.unique_id_suffix}",
+                )
+            )
+
+        elif coordinator.wrapped_battery_low is not None:
+            entities.append(
+                BatteryNotesBatteryBinaryLowSensor(
+                    hass,
+                    coordinator,
+                    battery_low_entity_description,
+                    f"{subentry.unique_id}{battery_low_entity_description.unique_id_suffix}",
+                )
+            )
+
+        if entities:
+            async_add_entities(
+                entities,
+                config_subentry_id=subentry.subentry_id,
+            )
+
+
+class BatteryNotesBatteryLowBaseSensor(
+    BatteryNotesEntity, BinarySensorEntity, RestoreEntity
+):
+    """Low battery binary sensor base."""
+
+    entity_description: BatteryNotesBinarySensorEntityDescription
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        coordinator: BatteryNotesSubentryCoordinator,
+        entity_description: BatteryNotesBinarySensorEntityDescription,
+    ):
+        """Initialize the low battery binary sensor."""
+
+        super().__init__(
+            hass, entity_description=entity_description, coordinator=coordinator
+        )
+
+        self.enable_replaced = self.domain_config.enable_replaced
+
+    _unrecorded_attributes = frozenset(
+        {
+            ATTR_BATTERY_INCREASE_THRESHOLD,
+            ATTR_BATTERY_LOW_THRESHOLD,
+            ATTR_BATTERY_QUANTITY,
+            ATTR_BATTERY_TYPE,
+            ATTR_BATTERY_TYPE_AND_QUANTITY,
+            ATTR_NOTE,
+            ATTR_BATTERY_LAST_REPLACED,
+            ATTR_BATTERY_LAST_REPORTED,
+            ATTR_DEVICE_ID,
+            ATTR_SOURCE_ENTITY_ID,
+            ATTR_DEVICE_NAME,
+        }
+    )
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Return the state attributes of the battery type."""
+
+        # Battery related attributes
+        attrs = {
+            ATTR_BATTERY_INCREASE_THRESHOLD: self.coordinator.battery_increased_threshold,
+            ATTR_BATTERY_LOW_THRESHOLD: self.coordinator.battery_low_threshold,
+            ATTR_BATTERY_QUANTITY: self.coordinator.battery_quantity,
+            ATTR_BATTERY_TYPE: self.coordinator.battery_type,
+            ATTR_BATTERY_TYPE_AND_QUANTITY: self.coordinator.battery_type_and_quantity,
+            ATTR_BATTERY_LAST_REPORTED: (
+                self.coordinator.last_reported
+                if (
+                    self.coordinator.wrapped_battery is not None
+                    or self.coordinator.wrapped_battery_low is not None
+                )
+                else None
+            ),
+            ATTR_NOTE: self.coordinator.battery_note,
+        }
+
+        if self.enable_replaced:
+            attrs[ATTR_BATTERY_LAST_REPLACED] = self.coordinator.last_replaced
+
+        # Other attributes that should follow battery, attribute list is unsorted
+        attrs[ATTR_DEVICE_ID] = self.coordinator.device_id or ""
+        attrs[ATTR_SOURCE_ENTITY_ID] = self.coordinator.source_entity_id or ""
+        attrs[ATTR_DEVICE_NAME] = self.coordinator.device_name
+
+        super_attrs = super().extra_state_attributes
+        if super_attrs:
+            attrs.update(super_attrs)
+        return attrs
+
+
+class BatteryNotesNonTemplateBatteryLowSensor(BatteryNotesBatteryLowBaseSensor):
+    """Low battery binary sensor base for non templated entities."""
+
+    entity_description: BatteryNotesBinarySensorEntityDescription
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        coordinator: BatteryNotesSubentryCoordinator,
+        entity_description: BatteryNotesBinarySensorEntityDescription,
+    ):
+        """Initialize the low battery binary sensor."""
+
+        super().__init__(
+            hass, entity_description=entity_description, coordinator=coordinator
+        )
+
+    async def async_added_to_hass(self) -> None:
+        """Handle added to Hass."""
+
+        await super().async_added_to_hass()
+
+        entity_registry = er.async_get(self.hass)
+        entity = entity_registry.async_get(self.entity_id)
+
+        if entity is not None and entity.hidden_by != er.RegistryEntryHider.USER:
+            entity_registry.async_update_entity(
+                self.entity_id,
+                hidden_by=er.RegistryEntryHider.INTEGRATION
+                if self.domain_config.hide_battery_low
+                and self.coordinator.wrapped_battery is not None
+                else None,
+            )
+
+
+class BatteryNotesBatteryLowBinaryTemplateSensor(
+    TemplateTrackingMixin, BatteryNotesBatteryLowBaseSensor
+):
+    """Represents a low battery threshold binary sensor from a template."""
+
+    _attr_should_poll = False
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        coordinator: BatteryNotesSubentryCoordinator,
+        entity_description: BatteryNotesBinarySensorEntityDescription,
+        unique_id: str,
+        battery_low_template: str,
+    ) -> None:
+        """Create a low battery binary sensor."""
+
+        super().__init__(
+            hass=hass, coordinator=coordinator, entity_description=entity_description
+        )
+
+        self._attr_unique_id = unique_id
+        self._init_template_tracking(battery_low_template)
+        self._state: bool | None = None
+
+    async def async_added_to_hass(self) -> None:
+        """Handle added to Hass."""
+
+        await super().async_added_to_hass()
+
+        self._async_start_template_tracking()
+
+    @callback
+    def _update_state(self, result):
+        # result_as_boolean treats an unavailable or unknown source as not low
+        if (
+            isinstance(result, TemplateError)
+            or result is None
+            or (
+                isinstance(result, str)
+                and result.strip().lower() in (STATE_UNAVAILABLE, STATE_UNKNOWN)
+            )
+        ):
+            if self.coordinator.retain_state:
+                return
+            self._attr_available = False
+            state = None
+        else:
+            self._attr_available = True
+            state = template.result_as_boolean(result)
+
+        if state is not None:
+            self.coordinator.last_reported = dt_util.utcnow()
+            _LOGGER.debug(
+                "Entity id %s has been reported via template.",
+                self.entity_id,
+            )
+
+        if state == self._state:
+            return
+
+        self._state = state
+        self.coordinator.battery_low_template_state = state
+        _LOGGER.debug(
+            "%s binary sensor battery_low set to: %s via template",
+            self.entity_id,
+            state,
+        )
+
+    @property
+    def is_on(self) -> bool | None:
+        """Return true if sensor is on."""
+        return self._state
+
+
+class BatteryNotesBatteryPercentageTemplateLowSensor(
+    BatteryNotesNonTemplateBatteryLowSensor
+):
+    """Represents a low battery threshold binary sensor from a template percentage."""
+
+    _attr_should_poll = False
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        coordinator: BatteryNotesSubentryCoordinator,
+        entity_description: BatteryNotesBinarySensorEntityDescription,
+        unique_id: str,
+    ) -> None:
+        """Create a low battery binary sensor."""
+        super().__init__(
+            hass=hass, coordinator=coordinator, entity_description=entity_description
+        )
+
+        self._attr_unique_id = unique_id
+
+    async def async_added_to_hass(self) -> None:
+        """Handle added to Hass."""
+
+        await super().async_added_to_hass()
+
+        await self.coordinator.async_refresh()
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Handle updated data from the coordinator."""
+
+        if self.coordinator.current_battery_level is None or not validate_is_float(
+            self.coordinator.current_battery_level
+        ):
+            if not self.coordinator.retain_state:
+                self._attr_is_on = None
+                self._attr_available = False
+                self.async_write_ha_state()
+            return
+
+        self._attr_available = True
+        self._attr_is_on = self.coordinator.battery_low
+
+        self.async_write_ha_state()
+
+        _LOGGER.debug(
+            "%s binary sensor battery_low set to: %s via percentage template",
+            self.entity_id,
+            self.coordinator.battery_low,
+        )
+
+
+class BatteryNotesBatteryWrappedLowSensor(BatteryNotesNonTemplateBatteryLowSensor):
+    """Represents a low battery threshold binary sensor from a device percentage."""
+
+    _attr_should_poll = False
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        coordinator: BatteryNotesSubentryCoordinator,
+        entity_description: BatteryNotesBinarySensorEntityDescription,
+        unique_id: str,
+    ) -> None:
+        """Create a low battery binary sensor."""
+
+        self._attr_unique_id = unique_id
+
+        super().__init__(
+            hass=hass, coordinator=coordinator, entity_description=entity_description
+        )
+
+    async def async_added_to_hass(self) -> None:
+        """Handle added to Hass."""
+
+        await super().async_added_to_hass()
+
+        # The coordinator only updates for valid battery levels, follow the source
+        # directly so this sensor also reflects the source becoming unavailable
+        if self.coordinator.wrapped_battery:
+            source_entity_id = self.coordinator.wrapped_battery.entity_id
+            unsub_source = async_track_state_change_event(
+                self.hass,
+                [source_entity_id],
+                self._async_source_state_changed,
+            )
+
+            @callback
+            def _async_source_renamed(
+                event: Event[er.EventEntityRegistryUpdatedData],
+            ) -> None:
+                nonlocal source_entity_id, unsub_source
+                unsub_source()
+                source_entity_id = event.data["entity_id"]
+                unsub_source = async_track_state_change_event(
+                    self.hass,
+                    [source_entity_id],
+                    self._async_source_state_changed,
+                )
+
+            @callback
+            def _filter_source_rename(
+                event_data: er.EventEntityRegistryUpdatedData,
+            ) -> bool:
+                return (
+                    event_data["action"] == "update"
+                    and event_data.get("old_entity_id") == source_entity_id
+                )
+
+            @callback
+            def _async_remove_source_listener() -> None:
+                unsub_source()
+
+            self.async_on_remove(_async_remove_source_listener)
+            self.async_on_remove(
+                self.hass.bus.async_listen(
+                    EVENT_ENTITY_REGISTRY_UPDATED,
+                    _async_source_renamed,
+                    event_filter=_filter_source_rename,
+                )
+            )
+
+        await self.coordinator.async_refresh()
+
+    @callback
+    def _async_source_state_changed(self, event: Event[EventStateChangedData]) -> None:
+        """Handle the wrapped battery becoming unavailable or invalid.
+
+        Availability must recover even when Battery Plus is disabled.
+        """
+        new_state = event.data["new_state"]
+        if (
+            new_state is None
+            or not validate_is_float(new_state.state)
+            or not self._attr_available
+        ):
+            self._handle_coordinator_update()
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Handle updated data from the coordinator."""
+
+        if (
+            not self.coordinator.wrapped_battery
+            or (
+                wrapped_battery_state := self.hass.states.get(
+                    self.coordinator.wrapped_battery.entity_id
+                )
+            )
+            is None
+            or wrapped_battery_state.state
+            in [
+                STATE_UNAVAILABLE,
+                STATE_UNKNOWN,
+            ]
+            or not validate_is_float(wrapped_battery_state.state)
+        ):
+            if not self.coordinator.retain_state:
+                self._attr_is_on = None
+                self._attr_available = False
+                self.async_write_ha_state()
+            return
+
+        self._attr_available = True
+        self._attr_is_on = self.coordinator.battery_low
+
+        self.async_write_ha_state()
+
+        _LOGGER.debug(
+            "%s binary sensor battery_low set to: %s via wrapped low sensor",
+            self.coordinator.wrapped_battery.entity_id,
+            self.coordinator.battery_low,
+        )
+
+
+class BatteryNotesBatteryBinaryLowSensor(BatteryNotesNonTemplateBatteryLowSensor):
+    """Represents a low battery binary sensor from a binary sensor."""
+
+    _attr_should_poll = False
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        coordinator: BatteryNotesSubentryCoordinator,
+        entity_description: BatteryNotesBinarySensorEntityDescription,
+        unique_id: str,
+    ) -> None:
+        """Create a low battery binary sensor."""
+        super().__init__(
+            hass=hass, coordinator=coordinator, entity_description=entity_description
+        )
+
+        self._attr_unique_id = unique_id
+
+        self._state: bool | None = None
+        self._wrapped_attributes: dict[str, Any] | None = None
+
+    async def async_state_changed_listener(
+        self,
+        event: Event[EventStateChangedData] | None = None,  # noqa: ARG002
+    ) -> None:
+        # pylint: disable=unused-argument
+        """Handle child updates."""
+
+        if not self.coordinator.wrapped_battery_low:
+            return
+
+        if (
+            (
+                wrapped_battery_low_state := self.hass.states.get(
+                    self.coordinator.wrapped_battery_low.entity_id
+                )
+            )
+            is None
+            or wrapped_battery_low_state.state
+            in [
+                STATE_UNAVAILABLE,
+                STATE_UNKNOWN,
+            ]
+            or wrapped_battery_low_state.state not in ["on", "off"]
+        ):
+            if not self.coordinator.retain_state:
+                self._attr_is_on = None
+                self._attr_available = False
+                self.async_write_ha_state()
+            return
+
+        self.coordinator.last_reported = dt_util.utcnow()
+        self.coordinator.battery_low_binary_state = (
+            wrapped_battery_low_state.state == "on"
+        )
+
+        await self.coordinator.async_request_refresh()
+
+        self._attr_available = True
+        self._attr_is_on = self.coordinator.battery_low_binary_state
+        self._wrapped_attributes = wrapped_battery_low_state.attributes
+
+        self.async_write_ha_state()
+
+    async def _register_entity_id_change_listener(
+        self,
+        entity_id: str,
+        source_entity_id: str,
+    ) -> None:
+        """Listen for battery entity_id changes and update battery_plus."""
+
+        async def _entity_rename_listener(
+            event: Event[er.EventEntityRegistryUpdatedData],
+        ) -> None:
+            """Handle renaming of the entity."""
+            new_entity_id = event.data["entity_id"]
+            old_entity_id = event.data.get("old_entity_id", None)
+
+            if not old_entity_id:
+                return
+
+            _LOGGER.debug(
+                "Entity id has been changed, updating battery notes plus entity registry. old_id=%s, new_id=%s",
+                old_entity_id,
+                new_entity_id,
+            )
+
+            entity_registry = er.async_get(self.hass)
+            if entity_registry.async_get(entity_id) is not None:
+                entity_registry.async_update_entity_options(
+                    entity_id,
+                    DOMAIN,
+                    {"entity_id": new_entity_id},
+                )
+
+                new_wrapped_battery_low = entity_registry.async_get(new_entity_id)
+                self.coordinator.wrapped_battery_low = new_wrapped_battery_low
+
+                # Create a listener for the newly named battery entity
+                if self.coordinator.wrapped_battery_low:
+                    self.async_on_remove(
+                        async_track_state_change_event(
+                            self.hass,
+                            [self.coordinator.wrapped_battery_low.entity_id],
+                            self.async_state_changed_listener,
+                        )
+                    )
+
+        @callback
+        def _filter_entity_id(event_data: Mapping[str, Any]) -> bool:
+            """Only dispatch the listener for update events concerning the source entity."""
+
+            return (
+                event_data["action"] == "update"
+                and "old_entity_id" in event_data
+                and event_data["old_entity_id"] == source_entity_id
+            )
+
+        self.async_on_remove(
+            self.hass.bus.async_listen(
+                EVENT_ENTITY_REGISTRY_UPDATED,
+                _entity_rename_listener,
+                event_filter=_filter_entity_id,
+            )
+        )
+
+    async def async_added_to_hass(self) -> None:
+        """Handle added to Hass."""
+
+        await super().async_added_to_hass()
+
+        async def _async_state_changed_listener(
+            event: Event[EventStateChangedData] | None = None,
+        ) -> None:
+            """Handle child updates."""
+            await self.async_state_changed_listener(event)
+
+        if self.coordinator.wrapped_battery_low:
+            self.async_on_remove(
+                async_track_state_change_event(
+                    self.hass,
+                    [self.coordinator.wrapped_battery_low.entity_id],
+                    _async_state_changed_listener,
+                )
+            )
+
+            await self._register_entity_id_change_listener(
+                self.entity_id,
+                self.coordinator.wrapped_battery_low.entity_id,
+            )
+
+        # Call once on adding
+        await _async_state_changed_listener()
+
+        # Update entity options
+        registry = er.async_get(self.hass)
+        if (
+            registry.async_get(self.entity_id) is not None
+            and self.coordinator.wrapped_battery_low
+        ):
+            registry.async_update_entity_options(
+                self.entity_id,
+                DOMAIN,
+                {"entity_id": self.coordinator.wrapped_battery_low.entity_id},
+            )
+
+        if not self.coordinator.wrapped_battery_low:
+            return
+
+        if self.domain_config.hide_battery:
+            async_hide_source_battery(
+                self.hass,
+                self.coordinator.config_entry.runtime_data.store,
+                self.coordinator.subentry.subentry_id,
+                self.coordinator.wrapped_battery_low.entity_id,
+            )
+
+        await self.coordinator.async_refresh()
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Handle updated data from the coordinator."""
+
+        if (
+            not self.coordinator.wrapped_battery_low
+            or (
+                wrapped_battery_low_state := self.hass.states.get(
+                    self.coordinator.wrapped_battery_low.entity_id
+                )
+            )
+            is None
+            or wrapped_battery_low_state.state
+            in [
+                STATE_UNAVAILABLE,
+                STATE_UNKNOWN,
+            ]
+            or wrapped_battery_low_state.state not in ["on", "off"]
+        ):
+            if not self.coordinator.retain_state:
+                self._attr_is_on = None
+                self._attr_available = False
+                self.async_write_ha_state()
+            return
+
+        self._attr_available = True
+        self._attr_is_on = self.coordinator.battery_low_binary_state
+
+        self.async_write_ha_state()
+
+        _LOGGER.debug(
+            "%s binary sensor battery_low set to: %s via binary low sensor",
+            self.coordinator.wrapped_battery_low.entity_id,
+            self.coordinator.battery_low,
+        )
+
+    @property
+    def is_on(self) -> bool | None:
+        """Return true if sensor is on."""
+        return self._attr_is_on

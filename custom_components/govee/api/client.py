@@ -1,0 +1,877 @@
+"""Govee REST API client with automatic retry support.
+
+Uses aiohttp-retry for exponential backoff on transient failures.
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+import time
+import uuid
+from collections import deque
+from collections.abc import Callable
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from typing import TYPE_CHECKING, Any, TypeGuard
+
+import aiohttp
+from aiohttp_retry import ExponentialRetry, RetryClient
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+
+from ..models.device import GoveeDevice
+from ..models.state import GoveeDeviceState
+from .exceptions import (
+    GoveeApiError,
+    GoveeAuthError,
+    GoveeConnectionError,
+    GoveeDeviceNotFoundError,
+    GoveeDeviceOfflineError,
+    GoveeRateLimitError,
+)
+
+if TYPE_CHECKING:
+    from homeassistant.core import HomeAssistant
+
+    from ..models.commands import DeviceCommand
+
+_LOGGER = logging.getLogger(__name__)
+
+# How many hourly buckets of request history to keep. Govee documents a
+# 10,000/day cap but returns no daily counter of its own, so the only way
+# to know what an install actually spends is to count locally.
+REQUEST_HISTORY_HOURS = 24
+
+# Govee API v2.0 endpoints
+API_BASE = "https://openapi.api.govee.com/router/api/v1"
+ENDPOINT_DEVICES = f"{API_BASE}/user/devices"
+ENDPOINT_STATE = f"{API_BASE}/device/state"
+ENDPOINT_CONTROL = f"{API_BASE}/device/control"
+ENDPOINT_SCENES = f"{API_BASE}/device/scenes"
+ENDPOINT_DIY_SCENES = f"{API_BASE}/device/diy-scenes"
+
+# Retry configuration
+RETRY_ATTEMPTS = 3
+RETRY_START_TIMEOUT = 1.0  # Initial retry delay in seconds
+RETRY_MAX_TIMEOUT = 30.0  # Maximum retry delay
+RETRY_FACTOR = 2.0  # Exponential factor
+
+# Retryable server error status codes
+RETRY_STATUSES = {500, 502, 503, 504}
+
+# Control commands are sent exactly once. A timeout or 5xx does not mean the
+# command was not applied, and resending it spends the quota again and holds
+# the service call for up to three request timeouts.
+SINGLE_ATTEMPT = ExponentialRetry(attempts=1)
+
+# Per-request deadline. Home Assistant's shared session has no default
+# timeout, so without this a stalled connection would hold a service call for
+# aiohttp's default of five minutes.
+REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30)
+
+# Ring-buffer size for the control-command history kept for diagnostics.
+COMMAND_BUFFER_SIZE = 30
+
+# Longest Retry-After honoured. The back-off becomes the poll interval, so a
+# huge value from a misbehaving upstream or proxy would stop polling until
+# the entry reloads.
+MAX_RETRY_AFTER_SECONDS = 3600.0
+
+
+def _is_count(value: Any) -> TypeGuard[int]:
+    """True for a plain non-negative int (bool is an int subclass, so excluded)."""
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _parse_retry_after(value: str | None) -> float | None:
+    """Seconds to wait from a ``Retry-After`` header, or None if unusable.
+
+    The header is either a number of seconds or an HTTP date; anything else,
+    a date already past, or a non-finite number gives None (the caller's
+    default back-off). Longer waits are capped at MAX_RETRY_AFTER_SECONDS.
+    """
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+    except ValueError:
+        try:
+            when = parsedate_to_datetime(value)
+        except (TypeError, ValueError):
+            return None
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        seconds = (when - datetime.now(timezone.utc)).total_seconds()
+    if not math.isfinite(seconds) or seconds <= 0:
+        return None
+    return min(seconds, MAX_RETRY_AFTER_SECONDS)
+
+
+def _is_offline_message(message: object) -> bool:
+    """Whether Govee's error text says the device is offline (#242)."""
+    return isinstance(message, str) and "offline" in message.lower()
+
+
+class GoveeApiClient:
+    """Async HTTP client for Govee Cloud API v2.0.
+
+    Features:
+    - Automatic retry with exponential backoff (via aiohttp-retry)
+    - Rate limit tracking from response headers
+    - Proper exception mapping
+    - Device and state parsing
+
+    Usage:
+        async with GoveeApiClient(api_key) as client:
+            devices = await client.get_devices()
+    """
+
+    def __init__(
+        self,
+        api_key: str,
+        session: aiohttp.ClientSession | None = None,
+        hass: HomeAssistant | None = None,
+    ) -> None:
+        """Initialize the API client.
+
+        Args:
+            api_key: Govee API key from developer portal.
+            session: Optional shared aiohttp session. Takes precedence over hass.
+            hass: Home Assistant instance — when provided (and no `session`),
+                the HA-managed clientsession is used so the client participates
+                in HA shutdown/DNS lifecycle (Platinum rule `inject-websession`).
+        """
+        self._api_key = api_key
+        self._session = session
+        self._owns_session = session is None
+        self._retry_client: RetryClient | None = None
+
+        if session is None and hass is not None:
+            self._session = async_get_clientsession(hass)
+            self._owns_session = False
+
+        # Rate limit tracking (updated from response headers)
+        self.rate_limit_remaining: int = 100
+        self.rate_limit_total: int = 100
+        self.rate_limit_reset: int = 0
+
+        # Local request accounting. The per-minute allowance comes back in
+        # response headers, but the daily one does not, so it is counted here.
+        # Hourly buckets rather than per-request timestamps: 24 small entries
+        # instead of tens of thousands, which is ample to answer "are we over
+        # the daily cap, and by how much".
+        self._request_buckets: deque[list[int]] = deque()
+        self._request_day: int = 0
+        self._requests_today: int = 0
+        # Told of every counted request, so the owner can persist the counts
+        # (see export_request_counts).
+        self._request_listener: Callable[[], None] | None = None
+
+        # Last raw API responses, retained for diagnostics (redacted at dump
+        # time). Lets a diagnostics download include exactly what the device
+        # list and /device/state endpoints returned — essential for debugging
+        # state-shape issues the parsed model hides (e.g. thermometers, #83).
+        self._last_raw_devices: list[dict[str, Any]] | None = None
+        self._last_raw_state: dict[str, dict[str, Any]] = {}
+
+        # Recent /device/control sends, retained for diagnostics (redacted at
+        # dump time). Each record carries the exact capability payload sent
+        # plus Govee's HTTP status and response body — the data debug logging
+        # would show, available from a diagnostics download alone (#127).
+        self._recent_commands: deque[dict[str, Any]] = deque(maxlen=COMMAND_BUFFER_SIZE)
+
+    @property
+    def api_key(self) -> str:
+        """The Developer API key (also used by the OpenAPI event channel)."""
+        return self._api_key
+
+    async def __aenter__(self) -> GoveeApiClient:
+        """Async context manager entry."""
+        await self._ensure_client()
+        return self
+
+    async def __aexit__(self, *args: Any) -> None:
+        """Async context manager exit."""
+        await self.close()
+
+    async def _ensure_client(self) -> RetryClient:
+        """Ensure retry client is initialized."""
+        if self._retry_client is None:
+            if self._session is None:
+                raise RuntimeError(
+                    "GoveeApiClient requires either a `session` or `hass` parameter "
+                    "at construction. Pass `hass=hass` so the HA-managed "
+                    "clientsession is used (Platinum rule `inject-websession`)."
+                )
+
+            retry_options = ExponentialRetry(
+                attempts=RETRY_ATTEMPTS,
+                start_timeout=RETRY_START_TIMEOUT,
+                max_timeout=RETRY_MAX_TIMEOUT,
+                factor=RETRY_FACTOR,
+                statuses=RETRY_STATUSES,
+                exceptions={aiohttp.ClientError, TimeoutError},
+            )
+
+            self._retry_client = RetryClient(
+                client_session=self._session,
+                retry_options=retry_options,
+            )
+
+        return self._retry_client
+
+    async def close(self) -> None:
+        """Close the client and release resources.
+
+        Only closes the underlying aiohttp session when this client owns it.
+        When `hass` was passed at construction the session belongs to Home
+        Assistant — closing it would tear down the shared client session
+        and trigger HA's frame-helper warning. RetryClient.close() forwards
+        unconditionally to the wrapped session, so we drop the reference
+        instead of calling its close() in that case.
+        """
+        if self._retry_client is not None:
+            if self._owns_session:
+                await self._retry_client.close()
+            self._retry_client = None
+
+        if self._owns_session and self._session is not None:
+            await self._session.close()
+            self._session = None
+
+    def _get_headers(self) -> dict[str, str]:
+        """Get request headers with API key."""
+        return {
+            "Govee-API-Key": self._api_key,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+
+    def _note_request(self) -> None:
+        """Record that one request was spent against the Govee quota.
+
+        Counted for every response, including 429s and errors: a rejected
+        request still consumed the allowance.
+
+        Called from response handling, so the totals are a FLOOR, not an exact
+        figure. A request that dies below the HTTP layer — connection timeout,
+        DNS failure, a retry chain exhausting itself — never reaches here but
+        may still have been counted on Govee's side. Undercounting is the safe
+        direction for the question these numbers exist to answer: if the floor
+        already exceeds the daily cap, the real spend certainly does.
+        """
+        now = time.time()
+        hour = int(now // 3600)
+        day = int(now // 86400)
+
+        if day != self._request_day:
+            self._request_day = day
+            self._requests_today = 0
+        self._requests_today += 1
+
+        if self._request_buckets and self._request_buckets[-1][0] == hour:
+            self._request_buckets[-1][1] += 1
+        else:
+            self._request_buckets.append([hour, 1])
+
+        cutoff = hour - (REQUEST_HISTORY_HOURS - 1)
+        while self._request_buckets and self._request_buckets[0][0] < cutoff:
+            self._request_buckets.popleft()
+
+        if self._request_listener is not None:
+            self._request_listener()
+
+    def set_request_listener(self, listener: Callable[[], None] | None) -> None:
+        """Register a callback run after every counted request."""
+        self._request_listener = listener
+
+    def export_request_counts(self) -> dict[str, Any]:
+        """The request counters as JSON-friendly data, for persistence.
+
+        The client is rebuilt on every config-entry reload; without carrying
+        these across, budget pacing would see a fresh, unspent day each time.
+        """
+        return {
+            "day": self._request_day,
+            "today": self._requests_today,
+            "buckets": [list(bucket) for bucket in self._request_buckets],
+        }
+
+    def import_request_counts(self, data: Any) -> None:
+        """Add counts saved by :meth:`export_request_counts` to this client's.
+
+        Anything malformed, from an earlier UTC day, older than the 24-hour
+        window, or dated in a future hour is ignored, so a bad file can only
+        ever under-count. A future hour would also sit after the current one
+        in the deque and break the oldest-first pruning in _note_request.
+        """
+        if not isinstance(data, dict):
+            return
+        now = time.time()
+        day = int(now // 86400)
+        current_hour = int(now // 3600)
+        cutoff = current_hour - (REQUEST_HISTORY_HOURS - 1)
+
+        saved_day = data.get("day")
+        saved_today = data.get("today")
+        if _is_count(saved_day) and _is_count(saved_today) and saved_day == day:
+            if self._request_day != day:
+                self._request_day = day
+                self._requests_today = 0
+            self._requests_today += saved_today
+
+        saved_buckets = data.get("buckets")
+        if not isinstance(saved_buckets, list):
+            return
+        merged: dict[int, int] = {hour: count for hour, count in self._request_buckets}
+        for bucket in saved_buckets:
+            if not isinstance(bucket, list) or len(bucket) != 2:
+                continue
+            hour, count = bucket
+            if _is_count(hour) and _is_count(count) and cutoff <= hour <= current_hour:
+                merged[hour] = merged.get(hour, 0) + count
+        self._request_buckets = deque([hour, count] for hour, count in sorted(merged.items()))
+
+    @property
+    def requests_last_24h(self) -> int:
+        """Requests spent in the trailing 24 hours, to hourly resolution."""
+        cutoff = int(time.time() // 3600) - (REQUEST_HISTORY_HOURS - 1)
+        return sum(count for hour, count in self._request_buckets if hour >= cutoff)
+
+    @property
+    def requests_today(self) -> int:
+        """Requests spent since UTC midnight.
+
+        Tracked alongside the rolling figure because a daily cap resets on a
+        clock boundary, and the two answer different questions: this one says
+        how much of today's allowance is gone, the rolling one says what a
+        steady state actually costs.
+        """
+        if int(time.time() // 86400) != self._request_day:
+            return 0
+        return self._requests_today
+
+    @property
+    def requests_per_hour(self) -> float:
+        """Mean requests/hour across the span of history held, 0.0 if none.
+
+        Divided by hours *elapsed*, not by buckets recorded. A bucket only
+        exists for an hour that saw traffic, so averaging over buckets would
+        drop idle hours out of the denominator — a restart or a reload would
+        make the rate read higher than it truly was, on an attribute people
+        will read as a plain average.
+
+        This describes what has happened over the window held; it is not a
+        projection of what the next 24 hours will cost.
+        """
+        cutoff = int(time.time() // 3600) - (REQUEST_HISTORY_HOURS - 1)
+        buckets = [b for b in self._request_buckets if b[0] >= cutoff]
+        if not buckets:
+            return 0.0
+        hours_elapsed = buckets[-1][0] - buckets[0][0] + 1
+        return round(sum(count for _, count in buckets) / hours_elapsed, 1)
+
+    @property
+    def rate_limit_reset_in(self) -> int:
+        """Seconds until the rate-limit window resets, per the last response.
+
+        ``X-RateLimit-Reset`` is sent in two shapes in the wild — an absolute
+        epoch timestamp, or a plain seconds-until-reset — and Govee does not
+        document which. Both are accepted: a value in the future is read as
+        an epoch stamp and differenced, anything else small enough to be a
+        duration is taken as one, and a past epoch stamp reads as 0.
+
+        Returns 0 when nothing is known, which callers read as "no reason to
+        back off".
+        """
+        reset = self.rate_limit_reset
+        if reset <= 0:
+            return 0
+        now = int(time.time())
+        if reset > now:
+            return reset - now
+        # Too large to be a duration, and not in the future: a stale stamp.
+        if reset > 86400:
+            return 0
+        return reset
+
+    def _update_rate_limits(self, headers: Any) -> None:
+        """Update rate limit tracking from response headers."""
+        if "X-RateLimit-Remaining" in headers:
+            try:
+                self.rate_limit_remaining = int(headers["X-RateLimit-Remaining"])
+            except (ValueError, TypeError):
+                pass
+
+        if "X-RateLimit-Limit" in headers:
+            try:
+                self.rate_limit_total = int(headers["X-RateLimit-Limit"])
+            except (ValueError, TypeError):
+                pass
+
+        if "X-RateLimit-Reset" in headers:
+            try:
+                self.rate_limit_reset = int(headers["X-RateLimit-Reset"])
+            except (ValueError, TypeError):
+                pass
+
+    async def _handle_response(
+        self,
+        response: aiohttp.ClientResponse,
+    ) -> dict[str, Any]:
+        """Handle API response and raise appropriate exceptions.
+
+        Args:
+            response: aiohttp response object.
+
+        Returns:
+            Parsed JSON response data.
+
+        Raises:
+            GoveeAuthError: 401 Unauthorized.
+            GoveeRateLimitError: 429 Too Many Requests.
+            GoveeDeviceNotFoundError: 400 for missing device.
+            GoveeApiError: Other API errors.
+        """
+        self._note_request()
+        self._update_rate_limits(response.headers)
+
+        # Status first: a 401 or 429 means the same thing whatever body (a
+        # proxy's HTML page, nothing at all) came with it.
+        if response.status == 401:
+            raise GoveeAuthError("Invalid API key")
+
+        if response.status == 429:
+            raise GoveeRateLimitError(
+                "Rate limit exceeded",
+                retry_after=_parse_retry_after(response.headers.get("Retry-After")),
+            )
+
+        error_code = response.status if response.status >= 400 else None
+        try:
+            decoded: Any = await response.json(content_type=None)
+        except (aiohttp.ContentTypeError, ValueError) as err:
+            text = await response.text()
+            raise GoveeApiError(f"Invalid JSON response: {text[:200]}", code=error_code) from err
+        if not isinstance(decoded, dict):
+            if error_code is None:
+                raise GoveeApiError(f"Invalid JSON response: {str(decoded)[:200]}")
+            decoded = {}
+        data: dict[str, Any] = decoded
+
+        if response.status == 400:
+            # Govee API uses both "message" and "msg" for errors
+            message = data.get("message") or data.get("msg", "Bad request")
+            _LOGGER.debug("API 400 error response: %s", data)
+            # Check for "devices not exist" error (expected for groups)
+            if "not exist" in message.lower():
+                raise GoveeDeviceNotFoundError(message)
+            if _is_offline_message(message):
+                raise GoveeDeviceOfflineError(message, code=400)
+            raise GoveeApiError(message, code=400)
+
+        if response.status >= 400:
+            message = data.get("message") or data.get("msg", f"HTTP {response.status}")
+            raise GoveeApiError(message, code=response.status)
+
+        # Check response code within JSON
+        code = data.get("code")
+        if code is not None and code != 200:
+            message = data.get("message") or data.get("msg", f"API error code {code}")
+            if code == 401:
+                raise GoveeAuthError(message)
+            if _is_offline_message(message):
+                raise GoveeDeviceOfflineError(message, code=code)
+            raise GoveeApiError(message, code=code)
+
+        return data
+
+    async def get_devices(self) -> list[GoveeDevice]:
+        """Fetch all devices from Govee API.
+
+        Returns:
+            List of GoveeDevice instances with capabilities.
+
+        Raises:
+            GoveeAuthError: Invalid API key.
+            GoveeConnectionError: Network error.
+            GoveeApiError: Other API errors.
+        """
+        client = await self._ensure_client()
+
+        try:
+            async with client.get(
+                ENDPOINT_DEVICES,
+                headers=self._get_headers(),
+                timeout=REQUEST_TIMEOUT,
+            ) as response:
+                data = await self._handle_response(response)
+
+                devices = []
+                for device_data in data.get("data", []):
+                    try:
+                        device = GoveeDevice.from_api_response(device_data)
+                        devices.append(device)
+                    except Exception as err:
+                        _LOGGER.warning(
+                            "Failed to parse device %s: %s",
+                            device_data.get("device", "unknown"),
+                            err,
+                        )
+
+                self._last_raw_devices = data.get("data", [])
+                _LOGGER.debug("Fetched %d devices from Govee API", len(devices))
+                return devices
+
+        except (aiohttp.ClientError, TimeoutError) as err:
+            raise GoveeConnectionError(f"Connection error: {str(err) or type(err).__name__}") from err
+
+    async def get_device_state(
+        self,
+        device_id: str,
+        sku: str,
+    ) -> GoveeDeviceState:
+        """Fetch current state for a device.
+
+        Args:
+            device_id: Device identifier (MAC address format).
+            sku: Device SKU/model number.
+
+        Returns:
+            GoveeDeviceState with current values.
+
+        Raises:
+            GoveeDeviceNotFoundError: Device not found (expected for groups).
+            GoveeApiError: Other API errors.
+        """
+        client = await self._ensure_client()
+
+        payload = {
+            "requestId": str(uuid.uuid4()),
+            "payload": {
+                "sku": sku,
+                "device": device_id,
+            },
+        }
+
+        try:
+            async with client.post(
+                ENDPOINT_STATE,
+                headers=self._get_headers(),
+                timeout=REQUEST_TIMEOUT,
+                json=payload,
+            ) as response:
+                data = await self._handle_response(response)
+
+                state = GoveeDeviceState.create_empty(device_id)
+                payload_data = data.get("payload", {})
+                state.update_from_api(payload_data)
+
+                # Diagnostic (issue #62): log the raw poll response for standalone
+                # event sensors (e.g. H5054 water detectors) so a debug capture
+                # shows whether the developer device-state endpoint ever returns
+                # the bodyAppearedEvent trip — earlier dumps showed only `online`.
+                if any(
+                    cap.get("type") == "devices.capabilities.event" for cap in payload_data.get("capabilities", [])
+                ):
+                    _LOGGER.debug(
+                        "Event-sensor poll for %s (%s) raw=%s",
+                        device_id,
+                        sku,
+                        payload_data,
+                    )
+
+                self._last_raw_state[device_id] = payload_data
+                return state
+
+        except (aiohttp.ClientError, TimeoutError) as err:
+            raise GoveeConnectionError(f"Connection error: {str(err) or type(err).__name__}") from err
+
+    @property
+    def last_raw_devices(self) -> list[dict[str, Any]] | None:
+        """Raw device-list payload from the most recent get_devices() call."""
+        return self._last_raw_devices
+
+    @property
+    def recent_commands(self) -> list[dict[str, Any]]:
+        """Recent control-command sends for the diagnostics download (oldest first)."""
+        return list(self._recent_commands)
+
+    def record_local_command(
+        self,
+        device_id: str,
+        sku: str,
+        transport: str,
+        capability: dict[str, Any],
+        *,
+        delivered: bool,
+        detail: str | None = None,
+    ) -> None:
+        """Add a non-REST send to the same command history diagnostics reads.
+
+        Only cloud commands used to be recorded, so a diagnostics download from
+        someone whose light ignores a colour change showed nothing at all when
+        that write had gone out over LAN, MQTT or BLE. Since those transports
+        are exactly where "accepted but nothing happened" reports come from
+        (issues #127, #143, #149, #158), they belong in the same buffer.
+
+        Args:
+            device_id: The device the command was addressed to.
+            sku: The device model.
+            transport: ``"lan"`` / ``"mqtt"`` / ``"ble"``.
+            capability: The command payload, in the REST record's shape.
+            delivered: Whether the transport reported the write as delivered —
+                for LAN that means confirmed by readback.
+            detail: Optional note, e.g. why the write wasn't confirmed.
+        """
+        self._recent_commands.append(
+            {
+                "sent_at": datetime.now(timezone.utc).isoformat(),
+                "device": device_id,
+                "sku": sku,
+                "transport": transport,
+                "capability": capability,
+                "http_status": None,
+                "response": {"delivered": delivered, "detail": detail},
+                "error": None if delivered else (detail or "not confirmed"),
+            }
+        )
+
+    def peek_last_command_record(self) -> dict[str, Any] | None:
+        """Return the most recently appended command record (same object, not a copy).
+
+        Lets a caller attach follow-up data (e.g. a verification poll result)
+        to the record that a diagnostics download will surface, without
+        re-plumbing control_device's return value.
+        """
+        return self._recent_commands[-1] if self._recent_commands else None
+
+    @property
+    def last_raw_state(self) -> dict[str, dict[str, Any]]:
+        """Raw /device/state payloads keyed by device_id (latest per device)."""
+        return self._last_raw_state
+
+    async def control_device(
+        self,
+        device_id: str,
+        sku: str,
+        command: DeviceCommand,
+    ) -> bool:
+        """Send control command to device.
+
+        Args:
+            device_id: Device identifier.
+            sku: Device SKU.
+            command: Command to execute.
+
+        Returns:
+            True if command was accepted by API.
+
+        Raises:
+            GoveeApiError: If command fails.
+        """
+        client = await self._ensure_client()
+
+        # Build request payload
+        cmd_payload = command.to_api_payload()
+        payload = {
+            "requestId": str(uuid.uuid4()),
+            "payload": {
+                "sku": sku,
+                "device": device_id,
+                "capability": cmd_payload,
+            },
+        }
+
+        _LOGGER.debug(
+            "Control send: device=%s sku=%s type=%s instance=%s value=%s",
+            device_id,
+            sku,
+            cmd_payload["type"],
+            cmd_payload["instance"],
+            cmd_payload["value"],
+        )
+
+        # Command-history record for diagnostics: what was sent and exactly how
+        # Govee answered (aiohttp caches the body, so reading it here does not
+        # consume it from _handle_response).
+        record: dict[str, Any] = {
+            "sent_at": datetime.now(timezone.utc).isoformat(),
+            "device": device_id,
+            "sku": sku,
+            "capability": cmd_payload,
+            "http_status": None,
+            "response": None,
+            "error": None,
+        }
+
+        try:
+            async with client.post(
+                ENDPOINT_CONTROL,
+                retry_options=SINGLE_ATTEMPT,
+                headers=self._get_headers(),
+                timeout=REQUEST_TIMEOUT,
+                json=payload,
+            ) as response:
+                record["http_status"] = response.status
+                try:
+                    record["response"] = await response.json(content_type=None)
+                except Exception:
+                    record["response"] = (await response.text())[:500]
+                _LOGGER.debug(
+                    "Control response: device=%s instance=%s HTTP %s body=%s",
+                    device_id,
+                    cmd_payload["instance"],
+                    response.status,
+                    str(record["response"])[:300],
+                )
+                await self._handle_response(response)
+                return True
+
+        except (aiohttp.ClientError, TimeoutError) as err:
+            record["error"] = f"connection: {err}"
+            raise GoveeConnectionError(f"Connection error: {str(err) or type(err).__name__}") from err
+        except GoveeApiError as err:
+            record["error"] = str(err)
+            _LOGGER.warning(
+                "Control rejected by Govee: device=%s sku=%s instance=%s value=%s HTTP %s body=%s (%s)",
+                device_id,
+                sku,
+                cmd_payload["instance"],
+                cmd_payload["value"],
+                record["http_status"],
+                str(record["response"])[:300],
+                err,
+            )
+            raise
+        finally:
+            self._recent_commands.append(record)
+
+    async def get_dynamic_scenes(
+        self,
+        device_id: str,
+        sku: str,
+    ) -> list[dict[str, Any]]:
+        """Fetch available scenes for a device.
+
+        Args:
+            device_id: Device identifier.
+            sku: Device SKU.
+
+        Returns:
+            List of scene definitions with id, name, etc.
+        """
+        client = await self._ensure_client()
+
+        payload = {
+            "requestId": str(uuid.uuid4()),
+            "payload": {
+                "sku": sku,
+                "device": device_id,
+            },
+        }
+
+        try:
+            async with client.post(
+                ENDPOINT_SCENES,
+                headers=self._get_headers(),
+                timeout=REQUEST_TIMEOUT,
+                json=payload,
+            ) as response:
+                data = await self._handle_response(response)
+
+                scenes = []
+                capabilities = data.get("payload", {}).get("capabilities", [])
+                for cap in capabilities:
+                    if cap.get("type") == "devices.capabilities.dynamic_scene":
+                        params = cap.get("parameters", {})
+                        options = params.get("options", [])
+                        scenes.extend(options)
+
+                _LOGGER.debug(
+                    "Fetched %d scenes for device %s",
+                    len(scenes),
+                    device_id,
+                )
+                return scenes
+
+        except GoveeDeviceNotFoundError:
+            _LOGGER.debug("No scenes available for device %s", device_id)
+            return []
+        except (aiohttp.ClientError, TimeoutError) as err:
+            raise GoveeConnectionError(f"Connection error: {str(err) or type(err).__name__}") from err
+
+    async def get_diy_scenes(
+        self,
+        device_id: str,
+        sku: str,
+    ) -> list[dict[str, Any]]:
+        """Fetch available DIY scenes for a device.
+
+        Args:
+            device_id: Device identifier.
+            sku: Device SKU.
+
+        Returns:
+            List of DIY scene definitions with id, name, etc.
+        """
+        client = await self._ensure_client()
+
+        payload = {
+            "requestId": str(uuid.uuid4()),
+            "payload": {
+                "sku": sku,
+                "device": device_id,
+            },
+        }
+
+        try:
+            async with client.post(
+                ENDPOINT_DIY_SCENES,
+                headers=self._get_headers(),
+                timeout=REQUEST_TIMEOUT,
+                json=payload,
+            ) as response:
+                data = await self._handle_response(response)
+
+                scenes = []
+                capabilities = data.get("payload", {}).get("capabilities", [])
+                for cap in capabilities:
+                    # DIY scenes endpoint returns dynamic_scene type with diyScene instance
+                    if cap.get("type") == "devices.capabilities.dynamic_scene":
+                        params = cap.get("parameters", {})
+                        options = params.get("options", [])
+                        scenes.extend(options)
+
+                _LOGGER.debug(
+                    "Fetched %d DIY scenes for device %s",
+                    len(scenes),
+                    device_id,
+                )
+                return scenes
+
+        except GoveeDeviceNotFoundError:
+            _LOGGER.debug("No DIY scenes available for device %s", device_id)
+            return []
+        except (aiohttp.ClientError, TimeoutError) as err:
+            raise GoveeConnectionError(f"Connection error: {str(err) or type(err).__name__}") from err
+
+
+async def validate_api_key(api_key: str, hass: HomeAssistant | None = None) -> bool:
+    """Validate a Govee API key by making a test request.
+
+    Args:
+        api_key: API key to validate.
+        hass: Home Assistant instance for shared aiohttp session (required since v2026.5.4).
+
+    Returns:
+        True if valid.
+
+    Raises:
+        GoveeAuthError: Invalid API key.
+        GoveeApiError: Other errors.
+    """
+    async with GoveeApiClient(api_key, hass=hass) as client:
+        # get_devices will raise GoveeAuthError if key is invalid
+        await client.get_devices()
+        return True

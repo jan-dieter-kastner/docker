@@ -1,0 +1,130 @@
+"""Zigbee2MQTT local calibration value fix.
+
+This model fix addresses an issue where Zigbee2MQTT reports incorrect
+floating-point values (e.g., +/- 1e6) for the local calibration. The
+helper functions below normalize values to sensible integer offsets.
+"""
+
+from __future__ import annotations
+
+import math
+
+from custom_components.better_thermostat.model_fixes.types import (
+    ModelFixHost,
+    ModelQuirks,
+)
+
+
+def fix_local_calibration(
+    self: ModelFixHost, entity_id: str, calibration_offset: float
+) -> float:
+    """Sanitize and normalize a reported calibration offset.
+
+    Rounds to the nearest integer (towards ceiling if the room is heating)
+    to recover from the erroneous float values produced by some Zigbee
+    integrations. Without a room temperature the heating direction is
+    unknown and the offset rounds down.
+
+    Parameters
+    ----------
+    self : ModelFixHost
+        Better Thermostat host providing device state and HA access.
+    entity_id : str
+        Entity id of the TRV the offset belongs to.
+    calibration_offset : float
+        Local calibration offset reported by the device.
+
+    Returns
+    -------
+    float
+        The normalized integer-valued calibration offset.
+    """
+    _room_temperature = self.room_temperature
+    _heat_target_temperature = self.heat_target_temperature
+
+    if _room_temperature is not None and _room_temperature < _heat_target_temperature:
+        calibration_offset = float(math.ceil(calibration_offset))
+    else:
+        calibration_offset = float(math.floor(calibration_offset))
+
+    return calibration_offset
+
+
+def fix_target_temperature_calibration(
+    self: ModelFixHost, entity_id: str, temperature: float
+) -> float:
+    """No-op target-temperature calibration fix for this model.
+
+    Parameters
+    ----------
+    self : ModelFixHost
+        Better Thermostat host providing device state and HA access.
+    entity_id : str
+        Entity id of the TRV whose setpoint is calibrated.
+    temperature : float
+        Requested setpoint temperature.
+
+    Returns
+    -------
+    float
+        The unchanged setpoint temperature.
+    """
+    return temperature
+
+
+async def override_set_hvac_mode(
+    self: ModelFixHost, entity_id: str, hvac_mode: str
+) -> bool:
+    """No override on system mode for this model.
+
+    Parameters
+    ----------
+    self : ModelFixHost
+        Better Thermostat host providing device state and HA access.
+    entity_id : str
+        Entity id of the TRV.
+    hvac_mode : str
+        Requested HVAC mode.
+
+    Returns
+    -------
+    bool
+        True if the model handled the change, otherwise False.
+    """
+    return False
+
+
+async def override_set_temperature(
+    self: ModelFixHost, entity_id: str, temperature: float
+) -> bool:
+    """No temperature override for this model.
+
+    Parameters
+    ----------
+    self : ModelFixHost
+        Better Thermostat host providing device state and HA access.
+    entity_id : str
+        Entity id of the TRV.
+    temperature : float
+        Requested setpoint temperature.
+
+    Returns
+    -------
+    bool
+        True if the model handled the change, otherwise False.
+    """
+    return False
+
+
+class _Surface:
+    """Quirk surface of the module, bound below to each Protocol it implements."""
+
+    fix_local_calibration = staticmethod(fix_local_calibration)
+    fix_target_temperature_calibration = staticmethod(
+        fix_target_temperature_calibration
+    )
+    override_set_hvac_mode = staticmethod(override_set_hvac_mode)
+    override_set_temperature = staticmethod(override_set_temperature)
+
+
+_MODEL_QUIRKS: ModelQuirks = _Surface()

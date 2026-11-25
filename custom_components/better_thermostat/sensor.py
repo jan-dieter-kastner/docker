@@ -1,0 +1,1062 @@
+"""Better Thermostat Sensor Platform."""
+
+from __future__ import annotations
+
+from collections.abc import Iterator, Sequence
+import logging
+import math
+from time import monotonic
+from typing import TYPE_CHECKING, Literal, override
+
+from homeassistant.components.climate.const import HVACMode
+from homeassistant.components.sensor import (
+    SensorDeviceClass,
+    SensorEntity,
+    SensorStateClass,
+)
+from homeassistant.const import EntityCategory, Platform, UnitOfTemperature, UnitOfTime
+from homeassistant.core import Event, EventStateChangedData, HomeAssistant, callback
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_registry import (
+    EntityRegistry,
+    async_get as async_get_entity_registry,
+)
+from homeassistant.helpers.event import async_track_state_change_event
+
+from . import BetterThermostatConfigEntry
+from .entity import remove_unclaimed_registry_entries
+from .number import BetterThermostatPIDNumber, BetterThermostatPresetNumber
+from .switch import (
+    BetterThermostatChildLockSwitch,
+    BetterThermostatPIDAutoTuneSwitch,
+    BetterThermostatReleaseTrvSwitch,
+)
+from .tracked_entities import (
+    PidNumberRef,
+    PresetNumberRef,
+    SwitchKind,
+    SwitchRef,
+    TrackedEntities,
+)
+from .utils.calibration.pid import PID_GAIN_LIMITS
+from .utils.const import (
+    CONF_CALIBRATION_MODE,
+    DOMAIN,
+    SIGNAL_CONFIG_CHANGED,
+    CalibrationMode,
+)
+from .utils.helpers import async_normalize_bt_entity_ids, configured_calibration_mode
+
+if TYPE_CHECKING:
+    from .climate import BetterThermostat
+    from .utils.telemetry import CalibrationBalance
+
+_LOGGER = logging.getLogger(__name__)
+
+# Every entity is pushed and none polls; actions are not limited per platform.
+PARALLEL_UPDATES = 0
+
+# The algorithms that bring diagnostic sensors of their own; only these are
+# ever tracked in ``TrackedEntities.algorithm_sensors``.
+_ALGORITHMS_WITH_SENSORS: frozenset[CalibrationMode] = frozenset(
+    {
+        CalibrationMode.MPC_CALIBRATION,
+        CalibrationMode.MPC_V2_CALIBRATION,
+        CalibrationMode.PID_CALIBRATION,
+    }
+)
+
+
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: BetterThermostatConfigEntry,
+    async_add_entities: AddEntitiesCallback,
+) -> None:
+    """Set up Better Thermostat sensors."""
+    bt_climate = entry.runtime_data.climate
+    if not bt_climate:
+        _LOGGER.warning(
+            "Better Thermostat climate entity not found for entry %s. "
+            "Sensors will not be added.",
+            entry.entry_id,
+        )
+        return
+
+    sensors: list[SensorEntity] = [
+        BetterThermostatExternalTempSensor(bt_climate),
+        BetterThermostatExternalTemp1hEMASensor(bt_climate),
+        BetterThermostatTempSlopeSensor(bt_climate),
+        BetterThermostatHeatingPowerSensor(bt_climate),
+        BetterThermostatHeatLossSensor(bt_climate),
+    ]
+
+    algorithm_sensors = await _setup_algorithm_sensors(hass, entry, bt_climate)
+    sensors.extend(algorithm_sensors)
+    remove_unclaimed_registry_entries(
+        async_get_entity_registry(hass),
+        entry,
+        Platform.SENSOR,
+        (sensor.unique_id for sensor in sensors),
+        bt_climate,
+    )
+
+    async_normalize_bt_entity_ids(hass, entry, Platform.SENSOR)
+    async_add_entities(sensors, True)
+
+    # Register callback for dynamic entity updates
+    await _register_dynamic_entity_callback(hass, entry, bt_climate, async_add_entities)
+
+
+async def _setup_algorithm_sensors(
+    hass: HomeAssistant,
+    entry: BetterThermostatConfigEntry,
+    bt_climate: BetterThermostat,
+    algorithms_to_create: set[CalibrationMode] | None = None,
+) -> list[SensorEntity]:
+    """Set up algorithm-specific sensors based on current configuration.
+
+    The entities of every algorithm no TRV uses any more are removed first,
+    whichever algorithms are being created. A sensor already tracked for its
+    algorithm is live and is not created a second time, so an algorithm
+    whose cleanup removed only some of its sensors gets exactly the missing
+    ones back when it is used again.
+
+    Parameters
+    ----------
+    hass : HomeAssistant
+        Home Assistant instance.
+    entry : BetterThermostatConfigEntry
+        Config entry the sensors belong to.
+    bt_climate : BetterThermostat
+        Better Thermostat climate entity the sensors report on.
+    algorithms_to_create : set | None
+        When provided, only sensors for these algorithms are created.
+        When ``None`` (initial setup), all active algorithms are created.
+
+    Returns
+    -------
+    list[SensorEntity]
+        The sensors not yet tracked, for the caller to add.
+    """
+    algorithm_sensors: list[SensorEntity] = []
+    entry_id = entry.entry_id
+    tracked = entry.runtime_data.tracked_entities
+    active_algorithms = _get_active_algorithms(bt_climate)
+
+    await _cleanup_stale_algorithm_entities(
+        hass, tracked, bt_climate, active_algorithms
+    )
+
+    current_algorithms = active_algorithms
+    if algorithms_to_create is not None:
+        current_algorithms = current_algorithms & algorithms_to_create
+
+    # Setup MPC sensors
+    if CalibrationMode.MPC_CALIBRATION in current_algorithms:
+        mpc_sensors = _track_algorithm_sensors(
+            tracked,
+            CalibrationMode.MPC_CALIBRATION,
+            [
+                BetterThermostatVirtualTempSensor(bt_climate),
+                BetterThermostatMpcGainSensor(bt_climate),
+                BetterThermostatMpcLossSensor(bt_climate),
+                BetterThermostatMpcKaSensor(bt_climate),
+            ],
+        )
+        algorithm_sensors.extend(mpc_sensors)
+
+        _LOGGER.debug(
+            "Better Thermostat %s: Created MPC sensors for entry %s",
+            bt_climate.device_name,
+            entry_id,
+        )
+
+    # Keep the MPC v1 diagnostic surface available for the dashboard, but map
+    # it to the corresponding MPC v2 controller diagnostics.  These are only
+    # observations; they never feed back into the controller.
+    if CalibrationMode.MPC_V2_CALIBRATION in current_algorithms:
+        mpc_v2_sensors = _track_algorithm_sensors(
+            tracked,
+            CalibrationMode.MPC_V2_CALIBRATION,
+            [
+                BetterThermostatMpcV2VirtualTempSensor(bt_climate),
+                BetterThermostatMpcV2CouplingSensor(bt_climate),
+                BetterThermostatMpcV2DisturbanceSensor(bt_climate),
+                BetterThermostatMpcV2RoomTimeConstantSensor(bt_climate),
+            ],
+        )
+        algorithm_sensors.extend(mpc_v2_sensors)
+        _adopt_shared_mpc_v2_registry_entries(hass, mpc_v2_sensors)
+
+        _LOGGER.debug(
+            "Better Thermostat %s: Created MPC v2 diagnostic sensors for entry %s",
+            bt_climate.device_name,
+            entry_id,
+        )
+
+    # Setup PID sensors
+    if CalibrationMode.PID_CALIBRATION in current_algorithms:
+        pid_sensors = _track_algorithm_sensors(
+            tracked,
+            CalibrationMode.PID_CALIBRATION,
+            [
+                BetterThermostatPidOutputSensor(bt_climate),
+                BetterThermostatPidErrorSensor(bt_climate),
+            ],
+        )
+        algorithm_sensors.extend(pid_sensors)
+
+        _LOGGER.debug(
+            "Better Thermostat %s: Created PID sensors for entry %s",
+            bt_climate.device_name,
+            entry_id,
+        )
+
+    return algorithm_sensors
+
+
+def _track_algorithm_sensors(
+    tracked: TrackedEntities,
+    algorithm: CalibrationMode,
+    sensors: Sequence[_BtSensorBase],
+) -> list[SensorEntity]:
+    """Record the unique_ids of one algorithm's sensors, return the untracked ones.
+
+    The stale-entity cleanup removes exactly what is recorded here, so the
+    record is taken from the sensors themselves. A sensor whose unique_id is
+    already recorded is live, and adding it again would register a second
+    entity under the same unique_id; only the others come back.
+    """
+    tracked_unique_ids = tracked.algorithm_sensors.setdefault(algorithm, [])
+    untracked: list[SensorEntity] = []
+    for sensor in sensors:
+        unique_id = sensor.unique_id
+        if unique_id not in tracked_unique_ids:
+            tracked_unique_ids.append(unique_id)
+            untracked.append(sensor)
+    return untracked
+
+
+def _adopt_shared_mpc_v2_registry_entries(
+    hass: HomeAssistant, sensors: Sequence[SensorEntity]
+) -> None:
+    """Move MPC v2 registry entries off the unique_ids MPC v1 sensors carry.
+
+    A registry entry under an MPC v1 unique_id that carries an MPC v2
+    translation key belongs to the MPC v2 sensor and moves to that sensor's
+    unique_id, keeping its entity_id and history. An entry under an MPC v1
+    translation key stays where it is.
+    """
+    registry = async_get_entity_registry(hass)
+    for sensor in sensors:
+        if not isinstance(sensor, _BtMpcV2SensorBase):
+            continue
+        shared_unique_id = (
+            f"{sensor._bt_climate.unique_id}_{sensor._shared_unique_id_suffix}"
+        )
+        entity_id = registry.async_get_entity_id("sensor", DOMAIN, shared_unique_id)
+        if entity_id is None:
+            continue
+        if registry.async_get_entity_id("sensor", DOMAIN, sensor.unique_id):
+            continue
+        reg_entry = registry.async_get(entity_id)
+        if reg_entry is None or reg_entry.translation_key != sensor.translation_key:
+            continue
+        registry.async_update_entity(entity_id, new_unique_id=sensor.unique_id)
+
+
+async def _register_dynamic_entity_callback(
+    hass: HomeAssistant,
+    entry: BetterThermostatConfigEntry,
+    bt_climate: BetterThermostat,
+    async_add_entities: AddEntitiesCallback,
+) -> None:
+    """Register callback for dynamic entity management."""
+
+    @callback
+    def _on_config_change() -> None:
+        """Handle configuration changes that might affect entity requirements."""
+        _LOGGER.debug(
+            "Better Thermostat %s: Configuration change detected via signal, checking entity requirements",
+            bt_climate.device_name,
+        )
+        # Scoped to the entry, so an unload cancels an update still pending
+        # instead of letting it add entities to an entry that is gone.
+        entry.async_create_background_task(
+            hass,
+            _handle_dynamic_entity_update(hass, entry, bt_climate, async_add_entities),
+            name=f"bt_dynamic_entity_update_{entry.entry_id}",
+        )
+
+    # Listen to configuration change signals until the entry unloads
+    entry.async_on_unload(
+        async_dispatcher_connect(
+            hass, SIGNAL_CONFIG_CHANGED.format(entry.entry_id), _on_config_change
+        )
+    )
+
+
+async def _handle_dynamic_entity_update(
+    hass: HomeAssistant,
+    entry: BetterThermostatConfigEntry,
+    bt_climate: BetterThermostat,
+    async_add_entities: AddEntitiesCallback,
+) -> None:
+    """Handle dynamic entity creation/removal based on configuration."""
+    tracked = entry.runtime_data.tracked_entities
+    # Compared on the tracked side only: an algorithm without sensors is never
+    # tracked, so it would read as added on every change.
+    current_algorithms = _get_active_algorithms(bt_climate) & _ALGORITHMS_WITH_SENSORS
+    previous_algorithms = set(tracked.algorithm_sensors)
+
+    # Check for changes in the algorithms
+    algorithms_added = current_algorithms - previous_algorithms
+    algorithms_removed = previous_algorithms - current_algorithms
+
+    if algorithms_added or algorithms_removed:
+        _LOGGER.info(
+            "Better Thermostat %s: Algorithm configuration changed. Added: %s, Removed: %s",
+            bt_climate.device_name,
+            [alg.value for alg in algorithms_added],
+            [alg.value for alg in algorithms_removed],
+        )
+
+    # Set up for every active algorithm, not only the added ones: one whose
+    # earlier cleanup removed some of its sensors is still tracked, so it is
+    # not "added" when a TRV uses it again, and only its missing sensors are
+    # created.
+    new_sensors = await _setup_algorithm_sensors(hass, entry, bt_climate)
+    if new_sensors:
+        async_add_entities(new_sensors, True)
+
+    # Always check and cleanup entities regardless of algorithm changes
+    # This ensures preset and PID number cleanup happens even when only presets change
+    await _cleanup_unused_number_entities(hass, tracked, bt_climate)
+
+
+async def _cleanup_stale_algorithm_entities(
+    hass: HomeAssistant,
+    tracked: TrackedEntities,
+    bt_climate: BetterThermostat,
+    current_algorithms: set[CalibrationMode],
+) -> None:
+    """Remove algorithm-specific entities that are no longer needed."""
+    tracked_algorithms = tracked.algorithm_sensors
+    if not tracked_algorithms:
+        return
+
+    entity_registry = async_get_entity_registry(hass)
+
+    algorithms_to_remove = []
+
+    for algorithm, entity_unique_ids in tracked_algorithms.items():
+        if algorithm not in current_algorithms:
+            # This algorithm is no longer active - remove its entities. An id
+            # the registry no longer holds is already gone; only the ones whose
+            # removal fails stay tracked for the next cleanup.
+            removed_count = 0
+            remaining_unique_ids = []
+            for entity_unique_id in entity_unique_ids:
+                entity_id = entity_registry.async_get_entity_id(
+                    "sensor", DOMAIN, entity_unique_id
+                )
+                if entity_id:
+                    try:
+                        entity_registry.async_remove(entity_id)
+                        removed_count += 1
+                        _LOGGER.debug(
+                            "Better Thermostat %s: Removed %s entity %s",
+                            bt_climate.device_name,
+                            algorithm.value,
+                            entity_id,
+                        )
+                    except Exception as e:
+                        remaining_unique_ids.append(entity_unique_id)
+                        _LOGGER.warning(
+                            "Better Thermostat %s: Failed to remove %s entity %s: %s",
+                            bt_climate.device_name,
+                            algorithm.value,
+                            entity_id,
+                            e,
+                            exc_info=True,
+                        )
+
+            if removed_count > 0:
+                _LOGGER.info(
+                    "Better Thermostat %s: Removed %d %s entities",
+                    bt_climate.device_name,
+                    removed_count,
+                    algorithm.value,
+                )
+
+            if remaining_unique_ids:
+                tracked_algorithms[algorithm] = remaining_unique_ids
+            else:
+                algorithms_to_remove.append(algorithm)
+
+    # Clean up tracking for removed algorithms
+    for algorithm in algorithms_to_remove:
+        del tracked_algorithms[algorithm]
+
+
+def _get_active_algorithms(bt_climate: BetterThermostat) -> set[CalibrationMode]:
+    """Get set of calibration algorithms currently in use by any TRV."""
+    if not bt_climate.real_trvs:
+        return set()
+
+    active_algorithms: set[CalibrationMode] = set()
+    for trv_entity_id, trv in bt_climate.real_trvs.items():
+        calibration_mode = configured_calibration_mode(trv.advanced)
+        if calibration_mode is None:
+            _LOGGER.warning(
+                "Better Thermostat %s: Invalid calibration mode '%s' for TRV %s",
+                bt_climate.device_name,
+                trv.advanced.get(CONF_CALIBRATION_MODE),
+                trv_entity_id,
+            )
+            continue
+        active_algorithms.add(calibration_mode)
+
+    return active_algorithms
+
+
+def _get_pid_trvs(bt_climate: BetterThermostat) -> set[str]:
+    """Return entity IDs of TRVs currently using PID calibration."""
+    pid_trvs: set[str] = set()
+    if not bt_climate.real_trvs:
+        return pid_trvs
+    for trv_entity_id, trv in bt_climate.real_trvs.items():
+        if configured_calibration_mode(trv.advanced) == CalibrationMode.PID_CALIBRATION:
+            pid_trvs.add(trv_entity_id)
+    return pid_trvs
+
+
+async def _cleanup_unused_number_entities(
+    hass: HomeAssistant, tracked: TrackedEntities, bt_climate: BetterThermostat
+) -> None:
+    """Clean up unused preset and PID number entities."""
+    entity_registry = async_get_entity_registry(hass)
+
+    # Get current enabled presets from climate entity (guard against None)
+    current_presets = set(bt_climate.preset_modes or [])
+    current_presets.discard("none")  # Remove "none" as it doesn't have a number entity
+
+    # Cleanup unused preset number entities
+    await _cleanup_preset_number_entities(
+        hass, entity_registry, tracked, bt_climate, current_presets
+    )
+
+    # Cleanup unused PID number entities
+    await _cleanup_pid_number_entities(hass, entity_registry, tracked, bt_climate)
+
+    # Cleanup unused switch entities (PID Auto-Tune switches)
+    await _cleanup_pid_switch_entities(hass, entity_registry, tracked, bt_climate)
+
+
+async def _cleanup_preset_number_entities(
+    hass: HomeAssistant,
+    entity_registry: EntityRegistry,
+    tracked: TrackedEntities,
+    bt_climate: BetterThermostat,
+    current_presets: set[str],
+) -> None:
+    """Remove preset number entities for disabled presets."""
+    tracked_presets = tracked.preset_numbers
+
+    # Find number entities to remove
+    entities_to_remove = []
+    for preset_unique_id, ref in tracked_presets.items():
+        if ref.preset and ref.preset not in current_presets:
+            entities_to_remove.append((preset_unique_id, ref.preset))
+
+    # Remove entities from registry – only delete tracking key on success
+    removed_count = 0
+    for preset_unique_id, preset_name in entities_to_remove:
+        entity_id = entity_registry.async_get_entity_id(
+            "number", DOMAIN, preset_unique_id
+        )
+        if entity_id:
+            try:
+                entity_registry.async_remove(entity_id)
+                removed_count += 1
+                tracked_presets.pop(preset_unique_id, None)
+                _LOGGER.debug(
+                    "Better Thermostat %s: Removed unused preset number entity %s (preset: %s)",
+                    bt_climate.device_name,
+                    entity_id,
+                    preset_name,
+                )
+            except Exception as e:
+                _LOGGER.warning(
+                    "Better Thermostat %s: Failed to remove preset number entity %s: %s",
+                    bt_climate.device_name,
+                    entity_id,
+                    e,
+                    exc_info=True,
+                )
+
+    # Merge new entries for current presets without wiping failed removals
+    for preset in current_presets:
+        uid = BetterThermostatPresetNumber.build_unique_id(bt_climate.unique_id, preset)
+        tracked_presets[uid] = PresetNumberRef(preset)
+
+    if removed_count > 0:
+        _LOGGER.info(
+            "Better Thermostat %s: Cleaned up %d unused preset number entities",
+            bt_climate.device_name,
+            removed_count,
+        )
+
+
+async def _cleanup_pid_number_entities(
+    hass: HomeAssistant,
+    entity_registry: EntityRegistry,
+    tracked: TrackedEntities,
+    bt_climate: BetterThermostat,
+) -> None:
+    """Remove PID number entities for TRVs no longer using PID calibration."""
+    tracked_pid_numbers = tracked.pid_numbers
+    current_pid_trvs = _get_pid_trvs(bt_climate)
+
+    # Find PID number entities to remove
+    entities_to_remove = []
+    for pid_unique_id, ref in tracked_pid_numbers.items():
+        if ref.trv and ref.trv not in current_pid_trvs:
+            entities_to_remove.append(pid_unique_id)
+
+    # Remove entities from registry – only delete tracking key on success
+    removed_count = 0
+    for pid_unique_id in entities_to_remove:
+        entity_id = entity_registry.async_get_entity_id("number", DOMAIN, pid_unique_id)
+        if entity_id:
+            try:
+                entity_registry.async_remove(entity_id)
+                removed_count += 1
+                tracked_pid_numbers.pop(pid_unique_id, None)
+                _LOGGER.debug(
+                    "Better Thermostat %s: Removed unused PID number entity %s",
+                    bt_climate.device_name,
+                    entity_id,
+                )
+            except Exception as e:
+                _LOGGER.warning(
+                    "Better Thermostat %s: Failed to remove PID number entity %s: %s",
+                    bt_climate.device_name,
+                    entity_id,
+                    e,
+                    exc_info=True,
+                )
+
+    # Merge new entries for current PID TRVs without wiping failed removals
+    for trv_entity_id in current_pid_trvs:
+        for gain in PID_GAIN_LIMITS:
+            uid = BetterThermostatPIDNumber.build_unique_id(
+                bt_climate.unique_id, trv_entity_id, gain
+            )
+            tracked_pid_numbers[uid] = PidNumberRef(trv_entity_id, gain)
+
+    if removed_count > 0:
+        _LOGGER.info(
+            "Better Thermostat %s: Cleaned up %d unused PID number entities",
+            bt_climate.device_name,
+            removed_count,
+        )
+
+
+async def _cleanup_pid_switch_entities(
+    hass: HomeAssistant,
+    entity_registry: EntityRegistry,
+    tracked: TrackedEntities,
+    bt_climate: BetterThermostat,
+) -> None:
+    """Remove the per-TRV switch entities of TRVs that changed or were removed."""
+    tracked_switches = tracked.switches
+    current_pid_trvs = _get_pid_trvs(bt_climate)
+
+    # Find switch entities to remove using stored metadata
+    entities_to_remove = []
+    for switch_unique_id, ref in tracked_switches.items():
+        should_remove = False
+
+        if ref.kind is SwitchKind.PID_AUTO_TUNE:
+            if ref.trv not in current_pid_trvs:
+                should_remove = True
+        elif ref.kind in (SwitchKind.CHILD_LOCK, SwitchKind.RELEASE_TRV):
+            # Remove the switches of TRVs that no longer exist
+            if not bt_climate.real_trvs or ref.trv not in bt_climate.real_trvs:
+                should_remove = True
+
+        if should_remove:
+            entities_to_remove.append(switch_unique_id)
+
+    # Remove entities from registry – only delete tracking key on success
+    removed_count = 0
+    for switch_unique_id in entities_to_remove:
+        entity_id = entity_registry.async_get_entity_id(
+            "switch", DOMAIN, switch_unique_id
+        )
+        if entity_id:
+            try:
+                entity_registry.async_remove(entity_id)
+                removed_count += 1
+                tracked_switches.pop(switch_unique_id, None)
+                _LOGGER.debug(
+                    "Better Thermostat %s: Removed unused switch entity %s",
+                    bt_climate.device_name,
+                    entity_id,
+                )
+            except Exception as e:
+                _LOGGER.warning(
+                    "Better Thermostat %s: Failed to remove switch entity %s: %s",
+                    bt_climate.device_name,
+                    entity_id,
+                    e,
+                    exc_info=True,
+                )
+
+    # Merge new entries without wiping failed removals
+    # Add PID Auto-Tune switches for current PID TRVs
+    for trv_entity_id in current_pid_trvs:
+        uid = BetterThermostatPIDAutoTuneSwitch.build_unique_id(
+            bt_climate.unique_id, trv_entity_id
+        )
+        tracked_switches[uid] = SwitchRef(trv_entity_id, SwitchKind.PID_AUTO_TUNE)
+
+    # Add the Child Lock and Release switches (always present for all TRVs)
+    if bt_climate.real_trvs:
+        for trv_entity_id in bt_climate.real_trvs:
+            uid = BetterThermostatChildLockSwitch.build_unique_id(
+                bt_climate.unique_id, trv_entity_id
+            )
+            tracked_switches[uid] = SwitchRef(trv_entity_id, SwitchKind.CHILD_LOCK)
+            uid = BetterThermostatReleaseTrvSwitch.build_unique_id(
+                bt_climate.unique_id, trv_entity_id
+            )
+            tracked_switches[uid] = SwitchRef(trv_entity_id, SwitchKind.RELEASE_TRV)
+
+    if removed_count > 0:
+        _LOGGER.info(
+            "Better Thermostat %s: Cleaned up %d unused switch entities",
+            bt_climate.device_name,
+            removed_count,
+        )
+
+
+# Helper
+
+
+def _get_filtered_temperature(bt_climate: BetterThermostat) -> float | None:
+    """Return room_temperature_filtered with fallback to room_temperature_ema."""
+    value = bt_climate.room_temperature_filtered
+    if value is None:
+        value = bt_climate.room_temperature_ema
+    return value
+
+
+# Base classes
+
+
+def _debug_number(value: object) -> float | None:
+    """Return a calibration debug value as a float, or ``None`` if not numeric."""
+    match value:
+        case int() | float():
+            return float(value)
+        case str():
+            try:
+                return float(value)
+            except ValueError:
+                return None
+        case _:
+            return None
+
+
+class _BtSensorBase(SensorEntity):
+    """Base class for all Better Thermostat sensors.
+
+    Every sensor reports what the thermostat computes; the room is read and
+    controlled through the climate entity, so the sensors are diagnostics.
+    """
+
+    _attr_has_entity_name = True
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_should_poll = False
+    _unique_id_suffix: str
+
+    def __init__(self, bt_climate: BetterThermostat) -> None:
+        """Initialize the sensor."""
+        self._bt_climate = bt_climate
+        self._attr_device_info = bt_climate.device_info
+
+    @property
+    @override
+    def unique_id(self) -> str:
+        """Return the thermostat's unique id joined with the sensor's suffix."""
+        return f"{self._bt_climate.unique_id}_{self._unique_id_suffix}"
+
+    @override
+    async def async_added_to_hass(self) -> None:
+        """Register callbacks."""
+        if self._bt_climate.entity_id:
+            self.async_on_remove(
+                async_track_state_change_event(
+                    self.hass, [self._bt_climate.entity_id], self._on_climate_update
+                )
+            )
+        else:
+            _LOGGER.warning(
+                "Better Thermostat climate entity has no entity_id yet. "
+                "Sensor update might be delayed."
+            )
+        # Also update initially
+        self._update_state()
+
+    @callback
+    def _on_climate_update(self, event: Event[EventStateChangedData]) -> None:
+        """Handle climate entity update."""
+        self._update_state()
+        self.async_write_ha_state()
+
+    def _update_state(self) -> None:
+        """Update state from climate entity."""
+        raise NotImplementedError
+
+
+type MpcSensorKey = Literal["mpc_virtual_temp", "mpc_gain", "mpc_loss", "mpc_ka"]
+type MpcV2SensorKey = Literal[
+    "T_room_hat", "coupling_rad_room", "D_hat_K_per_min", "tau_room_min"
+]
+type PidSensorKey = Literal["u", "e_K"]
+
+
+class _BtMpcSensorBase(_BtSensorBase):
+    """Base class for calibration debug sensors (MPC and PID).
+
+    Reads a single key from the ``calibration_balance['debug']`` payload of
+    the controller the sensor belongs to, iterating all TRVs of the climate
+    entity; the first TRV whose payload contains the key wins.
+
+    The values are gains and estimates of an algorithm, read when it is
+    tuned, so a new entry registers these sensors disabled.
+    """
+
+    _attr_entity_registry_enabled_default = False
+    _debug_key: MpcSensorKey
+
+    @property
+    @override
+    def available(self) -> bool:
+        """Return if entity is available.
+
+        Follow HA guidelines: return False when entity should be unavailable.
+        This prevents "unknown" states and properly shows "unavailable".
+        """
+        if not self._bt_climate._available:
+            return False
+        if self._bt_climate.contact_open:
+            return False
+        if self._bt_climate.hvac_mode == HVACMode.OFF:
+            return False
+        return True
+
+    def _balances(self) -> Iterator[CalibrationBalance]:
+        """Yield the calibration balance of every TRV that carries one."""
+        if not self._bt_climate.real_trvs:
+            return
+        for trv in self._bt_climate.real_trvs.values():
+            if trv.calibration_balance is not None:
+                yield trv.calibration_balance
+
+    def _debug_value(self) -> float | str | None:
+        """Return the reading of the first MPC payload that contains the key."""
+        for balance in self._balances():
+            if (
+                balance["controller"] == CalibrationMode.MPC_CALIBRATION
+                and self._debug_key in balance["debug"]
+            ):
+                return balance["debug"][self._debug_key]
+        return None
+
+    @override
+    def _update_state(self) -> None:
+        """Update state from calibration_balance debug data."""
+        self._attr_native_value = _debug_number(self._debug_value())
+
+
+class _BtSimpleAttributeSensor(_BtSensorBase):
+    """Base class for sensors reading a single climate attribute."""
+
+    _rounding: int | None = None
+
+    def _climate_value(self) -> float | None:
+        """Return the climate entity value this sensor publishes."""
+        raise NotImplementedError
+
+    @override
+    def _update_state(self) -> None:
+        """Update state from a climate entity attribute."""
+        value = self._climate_value()
+        if value is not None:
+            try:
+                fval = float(value)
+                self._attr_native_value = (
+                    round(fval, self._rounding) if self._rounding is not None else fval
+                )
+            except ValueError, TypeError:
+                self._attr_native_value = None
+        else:
+            self._attr_native_value = None
+
+
+# Concrete sensor classes
+
+
+class BetterThermostatExternalTempSensor(_BtSensorBase):
+    """Representation of a Better Thermostat External Temperature Sensor (EMA)."""
+
+    _attr_translation_key = "external_temp_ema"
+    _attr_device_class = SensorDeviceClass.TEMPERATURE
+    _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
+    _unique_id_suffix = "external_temp_ema"
+
+    @override
+    def _update_state(self) -> None:
+        """Update state from climate entity."""
+        value = _get_filtered_temperature(self._bt_climate)
+        if value is not None:
+            try:
+                self._attr_native_value = float(value)
+            except ValueError, TypeError:
+                self._attr_native_value = None
+        else:
+            self._attr_native_value = None
+
+
+class BetterThermostatExternalTemp1hEMASensor(_BtSensorBase):
+    """Representation of a Better Thermostat External Temperature 1h EMA Sensor."""
+
+    _attr_translation_key = "external_temp_ema_1h"
+    _attr_device_class = SensorDeviceClass.TEMPERATURE
+    _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
+    _attr_suggested_display_precision = 2
+    _unique_id_suffix = "external_temp_ema_1h"
+
+    def __init__(self, bt_climate: BetterThermostat) -> None:
+        """Initialize the sensor."""
+        super().__init__(bt_climate)
+        self._ema_value: float | None = None
+        self._last_update_ts: float | None = None
+        self._tau_s: float = 3600.0  # 1 hour
+
+    def _update_ema(self, new_value: float) -> None:
+        """Update the 1h EMA with a new value."""
+        now = monotonic()
+        prev_ts = self._last_update_ts
+        prev_ema = self._ema_value
+
+        if prev_ts is None or prev_ema is None:
+            ema = float(new_value)
+        else:
+            dt_seconds = max(0.0, now - prev_ts)
+            alpha = 1.0 - math.exp(-dt_seconds / self._tau_s) if dt_seconds > 0 else 0.0
+            ema = prev_ema + alpha * (new_value - prev_ema)
+
+        self._ema_value = ema
+        self._last_update_ts = now
+
+    @override
+    def _update_state(self) -> None:
+        """Update state from internal EMA."""
+        value = _get_filtered_temperature(self._bt_climate)
+        if value is not None:
+            try:
+                self._update_ema(float(value))
+                assert self._ema_value is not None  # set by _update_ema
+                self._attr_native_value = round(self._ema_value, 2)
+            except ValueError, TypeError:
+                self._attr_native_value = None
+        else:
+            self._attr_native_value = None
+
+
+class BetterThermostatTempSlopeSensor(_BtSimpleAttributeSensor):
+    """Representation of a Better Thermostat Temperature Slope Sensor."""
+
+    _attr_translation_key = "temp_slope"
+    _attr_device_class = None
+    _attr_native_unit_of_measurement = "K/min"
+    _rounding = 4
+    _unique_id_suffix = "temp_slope"
+
+    @override
+    def _climate_value(self) -> float | None:
+        return self._bt_climate.temperature_slope
+
+
+class BetterThermostatHeatingPowerSensor(_BtSimpleAttributeSensor):
+    """Representation of a Better Thermostat Heating Power Sensor."""
+
+    _attr_translation_key = "heating_power"
+    _attr_device_class = None
+    _attr_native_unit_of_measurement = "K/min"
+    _rounding = 4
+    _unique_id_suffix = "heating_power"
+
+    @override
+    def _climate_value(self) -> float | None:
+        return self._bt_climate.heating_power
+
+
+class BetterThermostatHeatLossSensor(_BtSimpleAttributeSensor):
+    """Representation of a Better Thermostat Heat Loss Sensor."""
+
+    _attr_translation_key = "heat_loss"
+    _attr_device_class = None
+    _attr_native_unit_of_measurement = "K/min"
+    _rounding = 5
+    _unique_id_suffix = "heat_loss"
+
+    @override
+    def _climate_value(self) -> float | None:
+        return self._bt_climate.heat_loss_rate
+
+
+class BetterThermostatVirtualTempSensor(_BtMpcSensorBase):
+    """Representation of a Better Thermostat Virtual Temperature Sensor (MPC)."""
+
+    _attr_translation_key = "virtual_temp"
+    _attr_device_class = SensorDeviceClass.TEMPERATURE
+    _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
+    _debug_key = "mpc_virtual_temp"
+    _unique_id_suffix = "virtual_temp"
+
+
+class BetterThermostatMpcGainSensor(_BtMpcSensorBase):
+    """Representation of a Better Thermostat MPC Gain Sensor."""
+
+    _attr_translation_key = "mpc_gain"
+    _attr_device_class = None
+    _attr_native_unit_of_measurement = "K/min"
+    _debug_key = "mpc_gain"
+    _unique_id_suffix = "mpc_gain"
+
+
+class BetterThermostatMpcLossSensor(_BtMpcSensorBase):
+    """Representation of a Better Thermostat MPC Loss Sensor."""
+
+    _attr_translation_key = "mpc_loss"
+    _attr_device_class = None
+    _attr_native_unit_of_measurement = "K/min"
+    _debug_key = "mpc_loss"
+    _unique_id_suffix = "mpc_loss"
+
+
+class BetterThermostatMpcKaSensor(_BtMpcSensorBase):
+    """Representation of a Better Thermostat MPC Ka (Insulation) Sensor."""
+
+    _attr_translation_key = "mpc_ka"
+    _attr_device_class = None
+    _attr_native_unit_of_measurement = "1/min"
+    _debug_key = "mpc_ka"
+    _unique_id_suffix = "mpc_ka"
+
+
+class _BtMpcV2SensorBase(_BtMpcSensorBase):
+    """Base class for MPC v2 diagnostic sensors.
+
+    MPC v2 publishes a typed diagnostic payload instead of the MPC v1 keys.
+    Its sensors carry unique_ids of their own, so heads calibrated by MPC v1
+    and MPC v2 in one room each get their sensors. ``_shared_unique_id_suffix``
+    names the MPC v1 sensor whose unique_id an MPC v2 registry entry may still
+    hold.
+    """
+
+    _v2_debug_key: MpcV2SensorKey
+    _shared_unique_id_suffix: str
+
+    @override
+    def _debug_value(self) -> float | str | None:
+        """Return the reading of the first MPC v2 payload."""
+        for balance in self._balances():
+            if balance["controller"] == CalibrationMode.MPC_V2_CALIBRATION:
+                return balance["debug"][self._v2_debug_key]
+        return None
+
+
+class _BtPidSensorBase(_BtMpcSensorBase):
+    """Base class for PID diagnostic sensors."""
+
+    _pid_debug_key: PidSensorKey
+
+    @override
+    def _debug_value(self) -> float | str | None:
+        """Return the reading of the first PID payload that contains the key."""
+        for balance in self._balances():
+            if (
+                balance["controller"] == CalibrationMode.PID_CALIBRATION
+                and self._pid_debug_key in balance["debug"]
+            ):
+                return balance["debug"][self._pid_debug_key]
+        return None
+
+
+class BetterThermostatMpcV2VirtualTempSensor(_BtMpcV2SensorBase):
+    """Representation of the MPC v2 estimated room temperature."""
+
+    _attr_translation_key = "mpc_v2_virtual_temp"
+    _attr_device_class = SensorDeviceClass.TEMPERATURE
+    _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
+    _v2_debug_key = "T_room_hat"
+    _unique_id_suffix = "mpc_v2_virtual_temp"
+    _shared_unique_id_suffix = "virtual_temp"
+
+
+class BetterThermostatMpcV2CouplingSensor(_BtMpcV2SensorBase):
+    """Representation of the MPC v2 radiator-to-room coupling."""
+
+    _attr_translation_key = "mpc_v2_coupling"
+    _v2_debug_key = "coupling_rad_room"
+    _unique_id_suffix = "mpc_v2_coupling"
+    _shared_unique_id_suffix = "mpc_gain"
+
+
+class BetterThermostatMpcV2DisturbanceSensor(_BtMpcV2SensorBase):
+    """Representation of the MPC v2 estimated unmodelled heat disturbance."""
+
+    _attr_translation_key = "mpc_v2_disturbance"
+    _attr_native_unit_of_measurement = "K/min"
+    _v2_debug_key = "D_hat_K_per_min"
+    _unique_id_suffix = "mpc_v2_disturbance"
+    _shared_unique_id_suffix = "mpc_loss"
+
+
+class BetterThermostatMpcV2RoomTimeConstantSensor(_BtMpcV2SensorBase):
+    """Representation of the MPC v2 room time constant."""
+
+    _attr_translation_key = "mpc_v2_room_time_constant"
+    _attr_device_class = SensorDeviceClass.DURATION
+    _attr_native_unit_of_measurement = UnitOfTime.MINUTES
+    _v2_debug_key = "tau_room_min"
+    _unique_id_suffix = "mpc_v2_room_time_constant"
+    _shared_unique_id_suffix = "mpc_ka"
+
+
+class BetterThermostatPidOutputSensor(_BtPidSensorBase):
+    """Representation of a Better Thermostat PID Output (valve command) Sensor."""
+
+    _attr_translation_key = "pid_output"
+    _attr_device_class = None
+    _attr_native_unit_of_measurement = "%"
+    _pid_debug_key = "u"
+    _unique_id_suffix = "pid_output"
+
+
+class BetterThermostatPidErrorSensor(_BtPidSensorBase):
+    """Representation of a Better Thermostat PID Error (setpoint deviation) Sensor."""
+
+    _attr_translation_key = "pid_error"
+    _attr_device_class = None
+    _attr_native_unit_of_measurement = "K"
+    _pid_debug_key = "e_K"
+    _unique_id_suffix = "pid_error"

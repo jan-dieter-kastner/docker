@@ -1,0 +1,45 @@
+"""MPC v2 — receding-horizon QP controller for direct-valve TRVs.
+
+Entry point:
+
+    compute_mpc_v2(inp, params, state) -> (MpcV2Output | None, MpcV2State)
+
+Internals live in :mod:`mpc_v2_internals` (plant model, Kalman observer,
+Smith predictor, disturbance observer, reference governor, QP optimiser).
+Scope is direct-valve TRVs only; the indirect (offset-based) TRV family is
+out of scope.
+"""
+
+from __future__ import annotations
+
+from ..mpc_v2_internals.plant import PlantParams
+from .compute import compute_mpc_v2
+from .controller import SNAPSHOT_VERSION, ControllerSnapshot, MpcV2Controller
+from .io import MpcV2Diagnostics, MpcV2Input, MpcV2Output
+from .params import PLANT_PRESETS, MpcV2Params, MpcV2PlantPreset, make_plant_prior
+from .reid import ReidBuffer, ReidConfig, ReidFit, ReidOutcome, ReidSample, run_reid_fit
+from .state import MpcV2State, export_mpc_v2_state, import_mpc_v2_state
+
+__all__ = [
+    "MpcV2Input",
+    "MpcV2Output",
+    "MpcV2Diagnostics",
+    "MpcV2Params",
+    "MpcV2PlantPreset",
+    "MpcV2State",
+    "MpcV2Controller",
+    "ControllerSnapshot",
+    "PlantParams",
+    "ReidBuffer",
+    "ReidConfig",
+    "ReidFit",
+    "ReidOutcome",
+    "ReidSample",
+    "compute_mpc_v2",
+    "export_mpc_v2_state",
+    "import_mpc_v2_state",
+    "make_plant_prior",
+    "run_reid_fit",
+    "PLANT_PRESETS",
+    "SNAPSHOT_VERSION",
+]

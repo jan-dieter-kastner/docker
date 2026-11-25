@@ -1,0 +1,7277 @@
+"""DataUpdateCoordinator for Govee integration.
+
+Manages device discovery, state polling, and the MQTT, LAN, and BLE transports.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import copy
+import dataclasses
+import logging
+import time
+import zlib
+from collections.abc import Awaitable, Callable, Coroutine, Mapping
+from datetime import datetime, timedelta, timezone
+from typing import Any, Final
+
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
+from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import issue_registry as ir
+from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.helpers.storage import Store
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.util import color as color_util
+from homeassistant.util import dt as dt_util
+
+from .api import (
+    Govee2FACodeInvalidError,
+    Govee2FARequiredError,
+    GoveeApiClient,
+    GoveeApiError,
+    GoveeAuthError,
+    GoveeAwsIotClient,
+    GoveeConnectionError,
+    GoveeDeviceNotFoundError,
+    GoveeDeviceOfflineError,
+    GoveeIotCredentials,
+    GoveeLoginRejectedError,
+    GoveeRateLimitError,
+)
+from .api.auth import GoveeAuthClient, _derive_client_id, is_connection_error
+from .api.ble_status import H6104Report
+from .api.openapi_events import GoveeOpenApiEventClient
+from .ble_passthrough import BlePassthroughManager
+from .command_confirm import CommandConfirmer, PendingConfirm
+from .kettle.manager import KettleManager
+from .status_burst import StatusBurst
+
+from homeassistant.helpers.event import async_call_later
+
+# BLE direct support — conditionally imported to avoid hard Bluetooth dependency
+try:
+    from .api.ble import GoveeBLEDevice  # noqa: F401  (used in __init__)
+
+    HAS_BLUETOOTH = True
+except ImportError:  # pragma: no cover — HA installs without Bluetooth
+    HAS_BLUETOOTH = False
+    GoveeBLEDevice = None  # type: ignore[assignment,misc]
+
+from .ble_advertisement import BleAdvertisementHandler
+from .ble_advertisement import sku_from_ble_name as _sku_from_ble_name  # noqa: F401
+from .api.mqtt_control import color_legacy_followup, command_to_mqtt
+from .api.lan import (
+    LanTargetError,
+    async_get_lan_broadcast_addresses,
+    async_get_lan_interface_ips,
+    async_scan_lan_devices,
+    expand_lan_targets,
+    parse_lan_device_overrides,
+)
+from .api.lan_client import (
+    GoveeLanClient,
+    LanDevStatus,
+    LanDeviceInfo,
+    correlate_scan,
+)
+from .api.lan_control import command_to_lan, lan_brightness_to_device
+from .const import (
+    ACCOUNT_LOGIN_RETRY_INTERVAL,
+    ACCOUNT_LOGIN_RETRY_MAX_INTERVAL,
+    CONF_ENABLE_H6104_BLE,
+    DEFAULT_ENABLE_H6104_BLE,
+    HEATER_AUTO_STOP_STRUCT_SKUS,
+    CONF_API_TEMPERATURE_UNIT,
+    CONF_EMAIL,
+    CONF_CONFIRM_COMMANDS,
+    CONF_ENABLE_MQTT_CONTROL,
+    CONF_DAILY_REQUEST_BUDGET,
+    CONF_LAN_TARGETS,
+    CONF_MQTT_STATUS_INTERVAL,
+    CONF_PASSWORD,
+    CONF_PROBE_POLL_INTERVAL,
+    CONF_WATER_DETECTOR_POLL_INTERVAL,
+    DEFAULT_API_TEMPERATURE_UNIT,
+    DEFAULT_CONFIRM_COMMANDS,
+    DEFAULT_DAILY_REQUEST_BUDGET,
+    KETTLE_FOLLOWUP_MIN_REMAINING,
+    DEFAULT_ENABLE_MQTT_CONTROL,
+    MQTT_COLOR_SKUS,
+    DEFAULT_MQTT_STATUS_INTERVAL,
+    DEFAULT_PROBE_POLL_INTERVAL,
+    DEFAULT_WATER_DETECTOR_POLL_INTERVAL,
+    DEVICE_REDISCOVERY_INTERVAL,
+    DOMAIN,
+    DREAMVIEW_OFF_VIA_COLOUR_SKUS,
+    IDLE_DEVICE_AFTER_SECONDS,
+    IDLE_DEVICE_POLL_DIVISOR,
+    IOT_RELOGIN_MIN_INTERVAL,
+    KEY_IOT_CREDENTIALS,
+    KEY_IOT_LOGIN_FAILED,
+    LAN_CORRELATION_TTL_SECONDS,
+    LAN_READ_MISS_DEMOTE_THRESHOLD,
+    LAN_RESCAN_INTERVAL,
+    LAN_SETUP_RETRY_MAX_INTERVAL,
+    LAN_WRITE_CONFIRM_TIMEOUT,
+    LAN_WRITE_SUPPRESS_SECONDS,
+    LAN_WRITE_SUPPRESS_THRESHOLD,
+    LEAK_DUAL_PROBE_SKUS,
+    LOCAL_READING_FRESHNESS_FACTOR,
+    LOGIN_FAILED_2FA,
+    MAX_BUDGET_PACED_INTERVAL,
+    MAX_LOCAL_FRESH_SKIPS,
+    MAX_MQTT_STATUS_INTERVAL,
+    MAX_PROBE_POLL_INTERVAL,
+    MAX_WATER_DETECTOR_POLL_INTERVAL,
+    MIN_MQTT_STATUS_INTERVAL,
+    MIN_PROBE_POLL_INTERVAL,
+    MIN_WATER_DETECTOR_POLL_INTERVAL,
+    MQTT_MUSIC_MODE_SKUS,
+    MQTT_STATUS_POLL_OFF,
+    MQTT_STATUS_QUERY_ACCOUNT_REFUSAL_SKUS,
+    MQTT_STATUS_QUERY_EXCLUDED_SKUS,
+    MQTT_STATUS_QUERY_QUARANTINE_STRIKES,
+    MQTT_STATUS_QUERY_SPACING,
+    OPTIMISTIC_GRACE_CAP_SECONDS,
+    POWER_MONITORING_STATUS_INTERVAL,
+    PROBE_LIMITS_READ_EVERY,
+    PROBE_PACKET_SPACING,
+    REQUEST_STATUS_MIN_INTERVAL,
+    MQTT_SILENT_CHECK_DELAY,
+    MQTT_SILENT_MIN_MISSED_PUSHES,
+    MQTT_SILENT_MIN_QUERIES,
+    REACHABLE_PUSH_WINDOW,
+    PTREAL_DREAMVIEW_SKUS,
+    DREAMVIEW_STATE_FROM_FRAMES_SKUS,
+    PTREAL_LIGHT_ZONE_SKUS,
+    PTREAL_MAIN_PANEL_BIT,
+    PTREAL_RING_MASK,
+    PTREAL_SEGMENT_SKUS,
+    PTREAL_ZONE_MAX_KELVIN,
+    PTREAL_ZONE_MIN_KELVIN,
+    RECENT_COMMAND_WINDOW_SECONDS,
+    resolve_fahrenheit_conversion,
+)
+from .request_budget import (
+    budget_paced_interval,
+    cloud_poll_divisor,
+    header_backoff_interval,
+    local_reading_is_fresh,
+    poll_exceeds_budget,
+)
+from .models import (
+    GoveeDevice,
+    GoveeDeviceState,
+    ProbeReading,
+    RGBColor,
+    TransportHealth,
+    TransportKind,
+)
+from .models.transport import TRANSPORT_KINDS
+from .transport_health import TransportHealthTracker
+from .models.commands import (
+    BrightnessCommand,
+    ColorCommand,
+    ColorTempCommand,
+    DeviceCommand,
+    DIYSceneCommand,
+    ModeCommand,
+    MusicModeCommand,
+    OscillationCommand,
+    PowerCommand,
+    RangeCommand,
+    SceneCommand,
+    SegmentColorCommand,
+    TemperatureSettingCommand,
+    ToggleCommand,
+    WorkModeCommand,
+    create_dreamview_command,
+)
+from .api.ble_packet import (
+    LIGHT_ZONE_MAIN,
+    LIGHT_ZONE_RING,
+    build_light_zone_ptreal,
+    build_packet,
+    build_segment_brightness_ptreal,
+    build_segment_color_ptreal,
+    build_segment_color_temp_ptreal,
+    calculate_checksum,
+    encode_packet_base64,
+    music_v3_effect_code,
+)
+from .api.probe_thermometer import (
+    ProbeLimits,
+    build_limits_read_packet,
+    build_limits_write_packet,
+    build_probe_read_packet,
+    probes_for_sku,
+)
+from .models.device import (
+    INSTANCE_BACKGROUND_LIGHT_TOGGLE,
+    INSTANCE_DREAMVIEW,
+    INSTANCE_FAN_OSCILLATE,
+    INSTANCE_FAN_SPEED_MODE,
+    INSTANCE_FAN_TOGGLE,
+    INSTANCE_HDMI_SOURCE,
+    INSTANCE_HUMIDITY,
+    INSTANCE_MAIN_LIGHT_TOGGLE,
+    INSTANCE_REVERSE_AIRFLOW,
+    INSTANCE_THERMOSTAT_TOGGLE,
+    MAINS_POWERED_BATTERY_SKUS,
+    MAINS_POWERED_DEVICE_TYPES,
+    PROBE_THERMOMETER_BFF_SKUS,
+    FRAME_CLIMATE_DEHUMIDIFIER_SKUS,
+    looks_like_group_id,
+)
+from .models.device import GoveeLeakSensor, GoveeLeakSensorState
+from .scene_cache import SceneCacheManager
+from .repairs import (
+    async_create_mqtt_issue,
+    async_create_rate_limit_issue,
+    async_delete_mqtt_issue,
+    async_create_mqtt_silent_issue,
+    async_delete_mqtt_silent_issue,
+    async_delete_rate_limit_issue,
+)
+
+# Ceiling of the re-login back-off after repeated rejections (6 hours).
+IOT_RELOGIN_MAX_INTERVAL = 21600
+
+_LOGGER = logging.getLogger(__name__)
+
+# Toggle instance -> ``33 30`` zone byte for PTREAL_LIGHT_ZONE_SKUS (issue #223).
+_PTREAL_LIGHT_ZONES: Final = {
+    INSTANCE_MAIN_LIGHT_TOGGLE: LIGHT_ZONE_MAIN,
+    INSTANCE_BACKGROUND_LIGHT_TOGGLE: LIGHT_ZONE_RING,
+}
+
+# API calls held back from the segment re-assert so a many-coloured ring on a
+# frequently toggled panel cannot exhaust the account's budget. Govee allows
+# 100/min; leaving a fifth of that free keeps ordinary control working even
+# when the ring is expensive to restore.
+_REASSERT_RATE_LIMIT_RESERVE: Final = 20
+
+# State fetch timeout per device
+STATE_FETCH_TIMEOUT = 30
+
+# Per-step timeout for fallible account/BFF discovery calls during setup. Bounds
+# each so a hung endpoint degrades that feature to polling instead of letting HA
+# cancel the whole config-entry setup (issue #146).
+STARTUP_STEP_TIMEOUT = 30
+
+# Segment command pacing — Govee silently rate-limits bursts of segment
+# updates on RGBIC strips (H80A1 has 14 segments). Serialize per-device
+# with a small gap so a "scene" that hits every segment doesn't drop
+# commands with empty JSON responses (issue #53).
+SEGMENT_COMMAND_PACING_SECONDS = 0.12
+
+# Tolerance (device-native brightness units) for confirming a LAN brightness
+# write by reading the device back. A LAN devStatus reports brightness on the
+# coarse 0-100 scale, so rescaling it into a wider device range (and the
+# round-trip back) can drift by a unit or two; ±2 absorbs that without masking
+# a genuinely wrong value (issue #57).
+LAN_BRIGHTNESS_CONFIRM_TOLERANCE = 2
+
+# Tolerance (Kelvin) for confirming a LAN colour-temperature write by reading
+# the device back. Firmware snaps the requested value onto its own grid, so an
+# exact match would reject writes that did land (issues #149, #158).
+LAN_COLOR_TEMP_CONFIRM_TOLERANCE = 150
+
+# BFF polling interval for leak sensor state (seconds)
+BFF_POLL_INTERVAL = 300  # 5 minutes
+
+# When MQTT last reported each leak sensor wet and dry (epoch seconds, our
+# clock), as {sensor_id: {"wet": t, "dry": t}}. The BFF fallback in
+# _poll_bff_leak_state must not force a sensor wet for a leak that MQTT both
+# reported and saw end, and per-sensor state is rebuilt on every entry reload,
+# so the stamps are kept in hass.data (survives a reload) backed by a Store
+# (survives a Home Assistant restart).
+LEAK_MQTT_STORE_KEY: Final = f"{DOMAIN}.leak_mqtt_stamps"
+LEAK_MQTT_STORE_VERSION: Final = 1
+LEAK_MQTT_SAVE_DELAY: Final = 1  # seconds
+_LEAK_MQTT_DATA_KEY: Final = f"{DOMAIN}_leak_mqtt_stamps"
+# The MQTT wet stamp counts as "MQTT reported this leak" when it is no more
+# than this long before the BFF's last_wet_time. That time comes from Govee's
+# clock and the stamp from ours, so the margin absorbs our clock running behind
+# Govee's. It errs toward a false alarm: with a larger skew the fallback fires
+# as it did before. A dry report alone never cancels the fallback, so a leak
+# MQTT never reported wet is still forced wet even if its dry frame arrived.
+LEAK_MQTT_SKEW_MARGIN: Final = 60  # seconds
+
+# Field names a probe frame may carry. Derived from the dataclass so a new
+# channel cannot be silently dropped by the merge.
+_PROBE_READING_FIELDS: Final = frozenset(f.name for f in dataclasses.fields(ProbeReading))
+
+
+def normalize_device_id(device_id: str) -> str:
+    """Canonical form for comparing device IDs across Govee's APIs."""
+    return device_id.replace(":", "").upper()
+
+
+# HTTP statuses that mean Govee's backend itself is down, as opposed to a
+# rejected request. Together with connection and timeout errors they define an
+# outage for the whole-poll check in ``_async_update_data``.
+_OUTAGE_HTTP_CODES: Final = frozenset({500, 502, 503, 504})
+
+
+def _is_outage_error(err: Exception) -> bool:
+    """True for a failure that means the cloud API could not be reached at all."""
+    if isinstance(err, (GoveeConnectionError, TimeoutError)):
+        return True
+    return isinstance(err, GoveeApiError) and err.code in _OUTAGE_HTTP_CODES
+
+
+# Delay before re-polling device state after a humidifier work_mode/humidity
+# write, to attach a timestamped "what Govee reports N seconds later" snapshot
+# to that same recent_commands entry (issue #118: these writes return HTTP 200
+# but the H7150's physical setpoint may not move, and the regular coordinator
+# poll cycle isn't correlated in time with the write under test).
+HUMIDITY_VERIFICATION_DELAY_SECONDS = 8
+
+# Minimum seconds between topic refetches triggered by one device whose MQTT
+# topic is missing from the account's lists.
+TOPIC_REFRESH_MIN_INTERVAL = 600
+
+
+@dataclasses.dataclass
+class _LanReadOverlay:
+    """Device-native LAN ``devStatus`` shaped for ``update_from_lan`` (issue #57).
+
+    The parsed :class:`LanDevStatus` carries brightness on the LAN 0-100 scale
+    (``brightness_0_100``), but :meth:`GoveeDeviceState.update_from_lan` expects
+    DEVICE-NATIVE brightness under ``brightness`` (the ``LanDevStatusLike``
+    protocol). This tiny adapter holds the rescaled value so the coordinator
+    rescales exactly once, before the overlay, as the design requires. It is a
+    plain (mutable) dataclass so its attributes are settable, satisfying the
+    ``LanDevStatusLike`` protocol's read-write members.
+    """
+
+    on: bool | None
+    brightness: int | None
+    color: RGBColor | None
+    color_temp_kelvin: int | None
+
+
+class _ConfirmHooks:
+    """The coordinator as CommandConfirmer sees it (command_confirm.ConfirmHooks, #245)."""
+
+    def __init__(self, coordinator: GoveeCoordinator) -> None:
+        self._coordinator = coordinator
+
+    def device(self, device_id: str) -> GoveeDevice | None:
+        return self._coordinator.devices.get(device_id)
+
+    def state(self, device_id: str) -> GoveeDeviceState | None:
+        return self._coordinator.get_state(device_id)
+
+    def heard_over_mqtt(self, device_id: str) -> bool:
+        return self._coordinator._mqtt_heard_from(device_id)
+
+    async def async_request_status(self, device_id: str) -> bool:
+        # The automatic path: throttled, and off with the re-query option.
+        return await self._coordinator.async_request_status(device_id)
+
+    def resend_allowed(self) -> bool:
+        return self._coordinator.extra_cloud_read_allowed()
+
+    async def async_resend(self, device_id: str, command: DeviceCommand) -> bool:
+        return await self._coordinator._async_resend_command(device_id, command)
+
+    def create_task(self, coro: Coroutine[Any, Any, None], name: str) -> asyncio.Task[None]:
+        coordinator = self._coordinator
+        return coordinator._config_entry.async_create_background_task(coordinator.hass, coro, name)
+
+
+class GoveeCoordinator(DataUpdateCoordinator[dict[str, GoveeDeviceState]]):
+    """Coordinator for Govee device state management.
+
+    Features:
+    - Parallel state fetching for all devices
+    - MQTT integration for real-time updates
+    - Scene caching
+    - Optimistic state updates
+    - Group device handling
+    """
+
+    # Set on first announcement; the class default keeps hand-built test
+    # coordinators that skip __init__ working.
+    _budget_pacing_announced = False
+    _header_deferred = False
+    # Set by async_shutdown. Timer callbacks run as untracked hass tasks, so
+    # one that was mid-await when the entry unloaded must not re-arm itself
+    # or open a second MQTT session on the dead coordinator.
+    _shut_down = False
+    # Set once Govee definitively refuses the stored login; only an entry reload clears it.
+    _relogin_disabled = False
+    # Consecutive re-logins Govee rejected or failed; doubles the retry interval (reset on success).
+    _relogin_rejections = 0
+    # Per poll cycle: devices whose "read" handed back held state instead of a
+    # fresh cloud answer, and whether any device answered 429. Reset at the
+    # start of every cycle; class defaults for the same reason as above.
+    _cycle_cached_ids: frozenset[str] = frozenset()
+    _cycle_rate_limited = False
+    # Monotonic time from which the status timer's next tick queries every
+    # device, not just the power-monitoring ones (see _status_poll_callback).
+    _next_full_status_sweep = 0.0
+    # Silent-session watchdog (#222): status queries sent and the client's
+    # inbound count when the current session came up, the pending check,
+    # whether the one forced reconnect was spent, and whether the repair is
+    # up. Class defaults for the same reason as above.
+    _mqtt_queries_since_connect = 0
+    _mqtt_inbound_at_connect = 0
+    _mqtt_silence_unsub: CALLBACK_TYPE | None = None
+    _mqtt_silent_reconnected = False
+    _mqtt_silent_reported = False
+    # True until a session arms the check, so only a live session clears the repair.
+    _mqtt_silent_cleared = True
+    # Gateway readings the cloud received while the session got nothing, the
+    # last device-side lastTime seen per thermometer, and a guard so the timer
+    # and the BFF refresh never handle one silent session twice (#222).
+    _mqtt_missed_pushes_since_connect = 0
+    _bff_last_time_seen: dict[str, int] = {}
+    _mqtt_silence_handling = False
+    # Confirm-and-resend for light commands, when the option is on (#245).
+    _command_confirmer: CommandConfirmer | None = None
+    # Probe polling (#266): sweeps run so far (limits are read on every Nth),
+    # and the running timer-driven sweep, cancelled on shutdown. Class
+    # defaults for the same reason as above.
+    _probe_poll_tick = 0
+    _probe_poll_task: asyncio.Task[None] | None = None
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        config_entry: ConfigEntry,
+        api_client: GoveeApiClient,
+        iot_credentials: GoveeIotCredentials | None,
+        poll_interval: int,
+        enable_groups: bool = False,
+    ) -> None:
+        """Initialize the coordinator.
+
+        Args:
+            hass: Home Assistant instance.
+            config_entry: Config entry for this integration.
+            api_client: Govee REST API client.
+            iot_credentials: Optional IoT credentials for MQTT.
+            poll_interval: Polling interval in seconds.
+            enable_groups: Whether to include group devices.
+        """
+        super().__init__(
+            hass,
+            _LOGGER,
+            config_entry=config_entry,
+            name=DOMAIN,
+            update_interval=timedelta(seconds=poll_interval),
+            # _async_update_data mutates and returns the same self._states dict
+            # every poll. With always_update=False, HA's refresh gate compares
+            # previous_data != self.data by identity (same object) and never
+            # fires listeners after the first poll, so poll-only devices (BLE
+            # thermometers like H5109 with no MQTT push) freeze until reload.
+            # MQTT devices are masked via async_set_updated_data. (fixes #93)
+            always_update=True,
+        )
+
+        self._config_entry = config_entry
+        self._h6104_tv_settings: dict[str, tuple[int, int]] = {}
+        self._h6104_tv_settings_locks: dict[str, asyncio.Lock] = {}
+        self._h6104_ble_fields: dict[str, dict[str, tuple[Any, datetime]]] = {}
+        self._h6104_last_write: dict[str, datetime] = {}
+        self._h6104_last_query: dict[str, float] = {}
+        # The options this instance was built with. The entry's update listener
+        # compares against this to tell an options change from a data-only
+        # write, such as storing a refreshed account token (#132) — reloading
+        # for one of those would drop every entity for a background refresh.
+        self.options_snapshot: dict[str, Any] = dict(config_entry.options)
+        self._api_client = api_client
+        self._iot_credentials = iot_credentials
+        self._login_retry_unsub: CALLBACK_TYPE | None = None
+        # Delay before the next background login retry; doubles per failure.
+        self._login_retry_delay: float = ACCOUNT_LOGIN_RETRY_INTERVAL
+        self._enable_groups = enable_groups
+        # Opt-in: route power/brightness/color over MQTT instead of REST.
+        self._enable_mqtt_control = config_entry.options.get(CONF_ENABLE_MQTT_CONTROL, DEFAULT_ENABLE_MQTT_CONTROL)
+
+        # Device registry
+        self._devices: dict[str, GoveeDevice] = {}
+
+        # State cache
+        self._states: dict[str, GoveeDeviceState] = {}
+
+        # Per-device transport health: extracted to TransportHealthTracker
+        # (audit H1). Drives optional connectivity binary_sensors + diagnostic
+        # transport attributes.
+        self._transport = TransportHealthTracker()
+
+        # Per-device asyncio.Lock for serializing segment commands. Govee
+        # rate-limits parallel segment dispatch with empty-body 200s; the
+        # lock keeps one in flight at a time, paced by
+        # SEGMENT_COMMAND_PACING_SECONDS to stay under the 100/min cap.
+        self._segment_locks: dict[str, asyncio.Lock] = {}
+
+        # Scene cache manager
+        self._scene_cache = SceneCacheManager(api_client)
+
+        # Observers for state changes
+
+        # MQTT client for real-time updates
+        self._mqtt_client: GoveeAwsIotClient | None = None
+
+        # Official OpenAPI event-subscription channel (API-key-only MQTT).
+        # Carries edge-triggered devices.capabilities.event pushes
+        # (waterFullEvent, lackWaterEvent, bodyAppearedEvent, ...) and feeds
+        # the diagnostics event ring buffer (issues #114, #118).
+        self._openapi_events_client: GoveeOpenApiEventClient | None = None
+
+        # Device-specific MQTT topics from undocumented API
+        # Maps device_id -> MQTT topic for publishing commands
+        self._device_topics: dict[str, str] = {}
+        # device_id -> monotonic time of the last topic refetch made because
+        # that device's topic was missing (see _ensure_device_topic).
+        self._topic_refresh_at: dict[str, float] = {}
+        # device_id -> its gateway's {device, sku, topic}. Gateway-attached BLE
+        # devices (e.g. an H5901 behind an H5044) ignore anything published to
+        # their own topic; commands have to be relayed through the gateway
+        # (issue #135).
+        self._gateway_routes: dict[str, dict[str, str]] = {}
+
+        # BLE passthrough manager for MQTT-based commands
+        self._ble_manager = BlePassthroughManager(
+            get_mqtt_client=lambda: self._mqtt_client,
+            device_topics=self._device_topics,
+            ensure_device_topic=self._ensure_device_topic,
+        )
+        # H7175 kettle pushes, unit decisions and poll rules (kettle/manager.py).
+        self.kettles = KettleManager(self)
+        # Opt-in confirm-and-resend for light commands (command_confirm.py, #245).
+        self._command_confirmer = (
+            CommandConfirmer(_ConfirmHooks(self))
+            if config_entry.options.get(CONF_CONFIRM_COMMANDS, DEFAULT_CONFIRM_COMMANDS)
+            else None
+        )
+        # Repeated status queries for one device (status_burst.py).
+        self.status_burst = StatusBurst(self)
+
+        # BLE direct transport — per-device GoveeBLEDevice instances
+        # populated dynamically from Bluetooth advertisements.
+        self._ble_devices: dict[str, GoveeBLEDevice] = {} if HAS_BLUETOOTH else {}
+
+        # SKUs for which we've already logged "advertised but not on the
+        # BLE command allowlist" — avoid spamming the log on every advert.
+        self._ble_ignored_skus_logged: set[str] = set()
+
+        # Per-device BLE connect back-off (#246): a failing link (no free
+        # connection slot, out of range) must not cost every command a retry.
+        self._ble_connect_backoff_until: dict[str, float] = {}
+        self._ble_connect_failures: dict[str, int] = {}
+
+        # BLE advertisement subscription + correlation handler (audit H1).
+        self._ble_handler = BleAdvertisementHandler(self)
+
+        # Track in-flight power-off commands so segment entities can
+        # avoid racing with a concurrent device power-off (issue #16).
+        self._pending_power_off: set[str] = set()
+
+        # Last colour written to each device's segments, per segment index
+        # ({device_id: {segment_index: (r, g, b)}}). On the two-zone Ceiling
+        # Light Pro fixtures the whole-device colour/CCT/brightness channel
+        # drives the ENTIRE fixture, clobbering the segment overlay the ring
+        # actually uses, so a write to that channel has to re-assert the
+        # segments afterwards to leave the ring where the user put it
+        # (issue #131). See ``async_reassert_segments``.
+        self._segment_colors: dict[str, dict[int, tuple[int, int, int]]] = {}
+
+        # Track rate limit state to avoid spamming repair issues
+        self._rate_limited: bool = False
+
+        # Store original poll interval for restoring after rate limit backoff
+        self._original_update_interval = timedelta(seconds=poll_interval)
+
+        # Requests/day this install is willing to spend on polling. The poll
+        # interval is paced against the client's running daily counter to land
+        # on it — see _apply_budget_pacing and request_budget.py.
+        self._daily_request_budget: int = int(
+            config_entry.options.get(CONF_DAILY_REQUEST_BUDGET, DEFAULT_DAILY_REQUEST_BUDGET)
+        )
+        self._budget_pacing_announced = False
+
+        # Consecutive cloud reads skipped per device because a local
+        # (LAN/MQTT/BLE) reading was fresher. Capped at MAX_LOCAL_FRESH_SKIPS
+        # so a device is always reconciled against the cloud eventually.
+        self._local_fresh_skips: dict[str, int] = {}
+
+        # Cycle counter per device, used to hold idle devices to one poll in
+        # IDLE_DEVICE_POLL_DIVISOR (see _idle_devices_to_skip).
+        self._poll_cycle_counts: dict[str, int] = {}
+        # True while the previous cycle was deferred on the rate-limit headers.
+        self._header_deferred = False
+        # When each device's cloud state was last observed to change. Drives
+        # the idle-cadence test; absent until a change is seen.
+        self._state_changed_at: dict[str, datetime] = {}
+
+        # Developer-API thermometers whose live reading we also pull from the
+        # BFF device list (e.g. H5110/H5075 via H5151, H5179). The BFF call
+        # tickles Govee's cloud into refreshing + carries the live value (#83).
+        self._thermo_bff_devices: set[str] = set()
+        # Set once a reload has been scheduled to pick up newly-added BFF leak
+        # sensors, so the periodic poll doesn't queue a reload every tick while
+        # the reload is pending (issue #101).
+        self._bff_reload_scheduled = False
+        # Set once a reload has been scheduled to pick up a thermometer battery
+        # sensor missed at startup (issue #132), so a slow tick doesn't queue a
+        # reload every 5 minutes while the reload is pending.
+        self._battery_reload_scheduled = False
+        # Same one-shot guard for a second temperature probe that starts
+        # reporting after startup — plugging one in must not need a manual
+        # restart to get its entity (#150).
+        self._probe2_reload_scheduled = False
+        # Leak sensor subsystem
+        self._leak_sensors: dict[str, GoveeLeakSensor] = {}
+        self._leak_states: dict[str, GoveeLeakSensorState] = {}
+        # Per-sensor "MQTT reported wet/dry at" stamps, shared across entry
+        # reloads once _async_load_leak_mqtt_stamps has run (see
+        # LEAK_MQTT_STORE_KEY).
+        self._leak_mqtt_at: dict[str, dict[str, float]] = {}
+        self._leak_mqtt_store: Store[dict[str, dict[str, float]]] | None = None
+        # BFF-discovered thermo-hygrometers (H5301, issue #86): synthesized into
+        # self._devices but absent from the Developer API, so their state is
+        # owned by the BFF poll, not /device/state. Tracked here so
+        # _fetch_device_state skips the (futile) developer poll for them.
+        self._bff_thermometer_ids: set[str] = set()
+        # Developer-API devices the BFF also lists but has no reading for yet
+        # (issue #151). They stay on the Developer poll — claiming them would
+        # leave the sensor permanently unknown — and are promoted into
+        # _bff_thermometer_ids by the 5-min refresh once a reading shows up.
+        self._bff_thermo_pending: set[str] = set()
+        # The account's own display-unit preference per device, read from the
+        # BFF `deviceSettings.fahOpen` flag. BFF `tem` itself is always °C
+        # (confirmed on an H5111 with fahOpen=false, issue #134), but the
+        # *Developer* API mirrors this preference — an H5310 on a °F account
+        # returns 88.34 meaning 88.34°F (issue #157). Authoritative when known;
+        # FAHRENHEIT_REPORTING_SKUS is only the fallback for accounts whose BFF
+        # list we can't read.
+        self._display_fahrenheit: dict[str, bool] = {}
+        # Gateway hubs (e.g. H5044) bridging BFF thermo-hygrometers, keyed by
+        # hub_device_id -> {"sku"}. Registered as HA devices so via_device on
+        # the thermo entities resolves (#86).
+        self._bff_thermo_hubs: dict[str, dict[str, str]] = {}
+        # When a device's temp/humidity reading last *changed* — backs the
+        # "Last Reading" diagnostic timestamp sensor (#83). Cloud batches
+        # BLE-bridged sensors every 15-60 min; this exposes when a new value
+        # actually landed.
+        self._sensor_reading_changed_at: dict[str, datetime] = {}
+        # When the water-tank-full alert last changed (event push or manual
+        # clear) — backs the sensor's changed_at attribute and restart
+        # restore (#118).
+        self._water_full_changed_at: dict[str, datetime] = {}
+        # Monotonic stamp of the last account re-login attempt, throttling
+        # recovery from an expired token (#132).
+        self._last_iot_relogin: float = -IOT_RELOGIN_MIN_INTERVAL
+        self._leak_hubs: dict[str, dict[str, Any]] = {}
+        self._sno_to_sensor_id: dict[tuple[str, int], str] = {}
+        # (hub_device_id, sno) -> thermo device_id. The hub's multiSync thermo
+        # frames name their sub-device by slot only, so this is what turns an
+        # ee34/0x08 frame into a reading on the right entity (#151).
+        self._sno_to_thermo_id: dict[tuple[str, int], str] = {}
+        # device_id -> epoch seconds the last applied frame was produced, from
+        # the frame's own bytes 9-12. Compared against the BFF reading's
+        # lastTime so the 5-minute account poll can't overwrite a fresher
+        # frame with the cloud's older copy of it (#151).
+        self._thermo_frame_ts: dict[str, int] = {}
+        self._bff_last_time_seen = {}
+        # Last time the account device list was re-checked for newly added
+        # devices (#101). Seeded to "now" so the first re-check waits a full
+        # interval rather than firing right after setup discovery.
+        self._last_rediscovery_check: float = time.monotonic()
+        # Per-device queued button presses (supports multiple presses per tick)
+        self._pending_button_presses: dict[str, int] = {}
+        self._bff_poll_unsub: CALLBACK_TYPE | None = None
+        self._bff_poll_task: asyncio.Task[None] | None = None
+        # Standalone water-detector (H5054) leak polling (issue #62).
+        self._wd_poll_unsub: CALLBACK_TYPE | None = None
+        # Probe thermometers (H5192) are pull devices: nothing arrives
+        # unless we ask. The timer only runs while at least one device has
+        # its live-polling switch on, so an idle thermometer is left alone.
+        self._probe_poll_unsub: CALLBACK_TYPE | None = None
+        self._probe_polling_enabled: set[str] = set()
+        # Periodic per-device MQTT status re-query (see async_publish_status_query
+        # docstring) — devices don't reliably push spontaneously; this is what the
+        # Govee app itself does while its device list is on screen.
+        self._status_poll_unsub: CALLBACK_TYPE | None = None
+        # One sweep at a time: the connect-time sweep and the timer's must not
+        # interleave, or the blame below could land on the wrong device.
+        self._status_sweep_running = False
+        # Device whose status query is the last thing published, held for
+        # MQTT_STATUS_QUERY_SPACING after the publish. A session that drops
+        # while this is set is blamed on that device (issue #195).
+        self._status_query_in_flight: str | None = None
+        # One status query at a time, sweep or not (see async_request_status),
+        # and when each device last got one outside the sweep.
+        self._status_query_lock = asyncio.Lock()
+        self._status_request_last: dict[str, float] = {}
+        # Per-device count of sessions AWS closed right after its query; at
+        # MQTT_STATUS_QUERY_QUARANTINE_STRIKES the device joins the quarantine
+        # and is left out of every later sweep until the entry reloads.
+        self._status_query_strikes: dict[str, int] = {}
+        self._status_query_quarantine: set[str] = set()
+        # SKUs blamed for a drop since a status query last outlived its
+        # window. Once MQTT_STATUS_QUERY_ACCOUNT_REFUSAL_SKUS different ones
+        # are in it, AWS IoT is refusing status queries for the whole account,
+        # not for one device, and the sweep stops until the entry reloads.
+        self._status_query_unanswered_skus: set[str] = set()
+        self._status_queries_refused = False
+        # True while _async_update_data runs (kettle follow-up reads wait).
+        self._poll_in_progress = False
+        # Last seen lastTime per detector — warnMessage is only called when the
+        # device has freshly reported (or is currently wet), keeping the account
+        # API request count low.
+        self._water_leak_last_time: dict[str, int] = {}
+        # Device-side time of each BFF thermometer's latest reading (#258).
+        self._bff_last_measurement: dict[str, datetime] = {}
+        # Bumped per detector when the user clears its leak alert, so a poll
+        # tick already in flight drops the reading it took before the clear.
+        self._water_leak_clear_gen: dict[str, int] = {}
+        # PII-free census of the last BFF device-list response (#87 diagnostics):
+        # which SKUs the BFF returned and whether they carry leak-discovery
+        # fields. Empty until the first _discover_leak_sensors() call.
+        self._bff_device_census: list[dict[str, Any]] = []
+        # PII-free structural skeleton of the raw BFF response — distinguishes
+        # "leak sensors absent" from "present under an unexpected shape" (#87).
+        self._bff_response_skeleton: Any = None
+        # Redacted per-device BFF scalar values (deviceSettings + lastDeviceData)
+        # — reveals which fields the BFF carries per device (battery, signal,
+        # temp/humidity, air-quality) for SKUs beyond leak+thermo sensors (#114).
+        self._bff_device_values: list[dict[str, Any]] = []
+
+        # LAN (UDP) transport (issue #57). Auto-enabled when a device answers
+        # the discovery scan AND its scan MAC correlates to a known device_id;
+        # there is no enable toggle. ``_lan_client`` stays None when LAN is
+        # disabled, degraded, or nothing correlated — every LAN path keys off it.
+        self._lan_client: GoveeLanClient | None = None
+        # Correlated LAN devices keyed by coordinator device_id.
+        self._lan_devices: dict[str, LanDeviceInfo] = {}
+        # device_ids bound via a manual write-only CONF_LAN_TARGETS override
+        # (issue #164) — firmware that accepts LAN writes but never answers a
+        # devStatus read, even from its own subnet (not a VLAN artifact — a
+        # scan reply not crossing VLANs is the separate, non-write-only case
+        # the bare device_id=ip form of the same override already covers).
+        # The read-health gate and write-confirm readback are skipped for
+        # these; the periodic LAN read poll excludes them too so they are
+        # never miss-demoted back out of _lan_devices.
+        self._lan_write_only: set[str] = set()
+        # Scan records that matched no device_id (counted for diagnostics).
+        self._lan_unmatched: list[Mapping[str, Any]] = []
+        # Consecutive solicited-read misses per device, for demotion (LAN-011).
+        self._lan_read_misses: dict[str, int] = {}
+        # Consecutive LAN write-confirm failures (value mismatch / no reply) per
+        # device. Drives WRITE suppression only — never transport health, which
+        # is read-driven — so a device that reports a write late never flaps the
+        # lan_connectivity sensor off (#57, the value_mismatch flap).
+        self._lan_write_misses: dict[str, int] = {}
+        # Monotonic deadline until which LAN write *attempts* are skipped for a
+        # device whose recent writes did not confirm. Reads keep using LAN (the
+        # sensor stays Connected); writes fall straight to MQTT/REST without
+        # paying the verify-by-read confirm timeout each time (#57).
+        self._lan_write_suppressed_until: dict[str, float] = {}
+        # Monotonic timestamp of the last LAN rescan, for throttling (LAN-011).
+        self._last_lan_rescan: float = 0.0
+        # Set by async_shutdown so a setup retry still in flight never opens a
+        # socket after unload.
+        self._lan_closed = False
+        # Wait before the next LAN setup retry while no client is running;
+        # doubles after each empty retry (see LAN_SETUP_RETRY_MAX_INTERVAL).
+        self._lan_retry_interval: float = LAN_RESCAN_INTERVAL
+        # Startup discovery steps that failed or timed out in this session.
+        # While non-empty, the orphan cleanup in __init__.py must not treat
+        # entities of not-yet-discovered devices as stale.
+        self._startup_steps_failed: set[str] = set()
+
+    @property
+    def devices(self) -> dict[str, GoveeDevice]:
+        """Get all discovered devices."""
+        return self._devices
+
+    @property
+    def api_rate_limit_remaining(self) -> int:
+        """Return API rate limit remaining."""
+        return self._api_client.rate_limit_remaining
+
+    @property
+    def api_rate_limit_total(self) -> int:
+        """Return API rate limit total."""
+        return self._api_client.rate_limit_total
+
+    @property
+    def api_rate_limit_reset(self) -> int:
+        """Return API rate limit reset time."""
+        return self._api_client.rate_limit_reset
+
+    @property
+    def api_requests_last_24h(self) -> int:
+        """Requests spent in the trailing 24 hours (hourly resolution)."""
+        return self._api_client.requests_last_24h
+
+    @property
+    def api_requests_today(self) -> int:
+        """Requests spent since UTC midnight."""
+        return self._api_client.requests_today
+
+    @property
+    def api_requests_per_hour(self) -> float:
+        """Mean requests/hour over the history held."""
+        return self._api_client.requests_per_hour
+
+    @property
+    def mqtt_client(self) -> GoveeAwsIotClient | None:
+        """Return MQTT client instance."""
+        return self._mqtt_client
+
+    @property
+    def api_client(self) -> GoveeApiClient:
+        """Return the REST API client (diagnostics reads its raw captures)."""
+        return self._api_client
+
+    @property
+    def scene_cache_count(self) -> int:
+        """Return number of devices with cached scenes."""
+        return self._scene_cache.scene_cache_count
+
+    @property
+    def diy_scene_cache_count(self) -> int:
+        """Return number of devices with cached DIY scenes."""
+        return self._scene_cache.diy_scene_cache_count
+
+    @property
+    def mqtt_connected(self) -> bool:
+        """Return True if MQTT client is connected."""
+        return self._mqtt_client is not None and self._mqtt_client.connected
+
+    @property
+    def mqtt_last_message_ts(self) -> datetime | None:
+        """UTC timestamp of the last inbound MQTT state message, or None."""
+        if self._mqtt_client is None:
+            return None
+        return self._mqtt_client.last_message_ts
+
+    @property
+    def mqtt_connected_since(self) -> datetime | None:
+        """UTC time the current MQTT session became connected, or None."""
+        if self._mqtt_client is None:
+            return None
+        return self._mqtt_client.connected_since
+
+    def mqtt_last_receive_for(self, device_id: str) -> datetime | None:
+        """UTC timestamp of the last inbound MQTT message for a device, or None."""
+        if self._mqtt_client is None:
+            return None
+        return self._mqtt_client.last_message_ts_for(device_id)
+
+    def is_ble_available(self, device_id: str) -> bool:
+        """Return True if a BLE transport is active for this device."""
+        return device_id in self._ble_devices
+
+    # ------------------------------------------------------------------ #
+    # Transport health (per-device connectivity tracking)
+    # ------------------------------------------------------------------ #
+
+    def _ensure_transport_health(self, device_id: str) -> None:
+        """Initialize transport-health entries for a device if missing."""
+        self._transport.ensure(device_id)
+
+    def get_transport_health(
+        self,
+        device_id: str,
+        transport: TransportKind,
+    ) -> TransportHealth | None:
+        """Return health for (device, transport), or None if untracked."""
+        return self._transport.get(device_id, transport)
+
+    def device_reachable(self, device_id: str) -> bool:
+        """Whether any transport says the device is there (#242).
+
+        The cloud's online flag, a healthy LAN or BLE transport, or an AWS IoT
+        message from the device within REACHABLE_PUSH_WINDOW. The flag alone
+        lags (or stays false) for some devices that answer fine locally or
+        over MQTT; Govee's "Device is offline" reply clears it at once.
+        """
+        state = self._states.get(device_id)
+        if state is None:
+            return False
+        if state.online:
+            return True
+        for kind in ("lan", "ble"):
+            health = self._transport.get(device_id, kind)
+            if health is not None and health.is_available:
+                return True
+        device = self._devices.get(device_id)
+        if device is not None and device.sku == "H6104" and self._ble_write_eligible(device_id):
+            return True
+        last = self.mqtt_last_receive_for(device_id)
+        return last is not None and (dt_util.utcnow() - last).total_seconds() <= REACHABLE_PUSH_WINDOW
+
+    def _record_transport_success(
+        self,
+        device_id: str,
+        transport: TransportKind,
+    ) -> None:
+        """Stamp a successful inbound transport use (data received)."""
+        self._transport.record_success(device_id, transport)
+
+    def _record_transport_send(
+        self,
+        device_id: str,
+        transport: TransportKind,
+    ) -> None:
+        """Stamp a successful outbound transport use (command sent)."""
+        self._transport.record_send(device_id, transport)
+
+    def _record_transport_failure(
+        self,
+        device_id: str,
+        transport: TransportKind,
+        reason: str,
+    ) -> None:
+        """Stamp a failed transport use."""
+        self._transport.record_failure(device_id, transport, reason)
+
+    def _note_lan_write_miss(self, device_id: str) -> None:
+        """Account a LAN write-confirm failure; suppress writes if persistent (#57).
+
+        A verify-by-read failure — the device answered with a different value, or
+        did not answer within ``LAN_WRITE_CONFIRM_TIMEOUT`` — does NOT mean LAN is
+        down. The UDP datagram was sent; on a value mismatch a ``devStatus`` even
+        came back, which is direct proof the transport is alive. It almost always
+        means a freshly-powered controller is reporting its pre-command state
+        late. So this NEVER touches transport health (health is read-driven: the
+        solicited poll read and unsolicited pushes own it). Flipping the ``lan``
+        transport unavailable on confirm misses is exactly the flap users
+        reported — the lan_connectivity sensor dropping to Disconnected the
+        instant a device was turned on.
+
+        Instead it counts consecutive write-confirm failures and, after
+        ``LAN_WRITE_SUPPRESS_THRESHOLD`` of them, suppresses LAN write *attempts*
+        for ``LAN_WRITE_SUPPRESS_SECONDS`` so the device's writes fall straight to
+        MQTT/REST without each paying the confirm timeout — while LAN reads keep
+        working and the sensor stays Connected. A confirmed write
+        (:meth:`_clear_lan_write_misses`) or the cooldown expiry re-arms LAN
+        writes, so a device that begins confirming again is picked back up. (A
+        ``send_failed`` OSError remains a hard, immediate transport failure — that
+        path is genuine LAN unreachability, not a confirm race.)
+        """
+        misses = self._lan_write_misses.get(device_id, 0) + 1
+        self._lan_write_misses[device_id] = misses
+        if misses >= LAN_WRITE_SUPPRESS_THRESHOLD:
+            self._lan_write_suppressed_until[device_id] = time.monotonic() + LAN_WRITE_SUPPRESS_SECONDS
+            _LOGGER.debug(
+                "Govee LAN: suppressing LAN write attempts for %s after %d "
+                "unconfirmed writes — writes use MQTT/REST for %ds; LAN reads "
+                "and the connectivity sensor are unaffected",
+                device_id,
+                misses,
+                LAN_WRITE_SUPPRESS_SECONDS,
+            )
+
+    def _clear_lan_write_misses(self, device_id: str) -> None:
+        """Re-arm LAN writes for a device (confirmed write): reset streak + cooldown."""
+        self._lan_write_misses.pop(device_id, None)
+        self._lan_write_suppressed_until.pop(device_id, None)
+
+    def _lan_writes_suppressed(self, device_id: str) -> bool:
+        """Whether LAN write *attempts* are currently in cooldown for a device (#57).
+
+        Returns ``True`` while the device is inside its post-failure cooldown, so
+        :meth:`_try_lan_command` skips the LAN write (and its confirm-read wait)
+        and falls straight to MQTT/REST. When the cooldown has elapsed it re-arms
+        the device (clearing the streak) and returns ``False`` so the next command
+        probes the LAN write path again. Reads are never affected.
+        """
+        deadline = self._lan_write_suppressed_until.get(device_id)
+        if deadline is None:
+            return False
+        if time.monotonic() >= deadline:
+            self._clear_lan_write_misses(device_id)
+            return False
+        return True
+
+    def lan_write_suppressed(self, device_id: str) -> bool:
+        """Read-only view of LAN write suppression for diagnostics (issue #57).
+
+        Unlike :meth:`_lan_writes_suppressed` this never re-arms an expired
+        cooldown, so a diagnostics download cannot mutate runtime state. ``True``
+        means LAN reads are healthy but the device's writes are currently routed
+        to MQTT/REST because recent LAN writes did not confirm.
+        """
+        deadline = self._lan_write_suppressed_until.get(device_id)
+        return deadline is not None and time.monotonic() < deadline
+
+    def _refresh_mqtt_health(self) -> None:
+        """Propagate MQTT client connection state to per-device health."""
+        self._transport.refresh_mqtt_for_devices(
+            self._devices,
+            connected=self.mqtt_connected,
+            client_configured=self._mqtt_client is not None,
+        )
+
+    def _refresh_ble_staleness(self) -> None:
+        """Mark BLE unavailable for devices whose last advertisement is stale."""
+        self._transport.refresh_ble_staleness(
+            self._devices,
+            set(self._ble_devices.keys()),
+            {
+                did
+                for did, client in self._ble_devices.items()
+                if client.supports_readback is True and client.is_connected is True
+            },
+        )
+
+    def _refresh_lan_staleness(self) -> None:
+        """Mark LAN unavailable for non-LAN or stale-read devices (issue #57).
+
+        LAN-active = currently correlated in ``self._lan_devices`` (answered the
+        scan and matched a device_id). Everything else gets ``no_lan_presence``;
+        a correlated device whose last applied read is stale gets ``stale_lan``.
+        Runs AFTER :meth:`_refresh_lan_reads` so a read applied this cycle has
+        already stamped success and the device is not falsely marked stale.
+        """
+        self._transport.refresh_lan_staleness(self._devices, set(self._lan_devices))
+
+    @property
+    def states(self) -> dict[str, GoveeDeviceState]:
+        """Get current states for all devices."""
+        return self._states
+
+    @property
+    def leak_sensors(self) -> dict[str, GoveeLeakSensor]:
+        """Get all discovered leak sensors."""
+        return self._leak_sensors
+
+    @property
+    def leak_states(self) -> dict[str, GoveeLeakSensorState]:
+        """Get current leak states (device_id -> state)."""
+        return self._leak_states
+
+    @property
+    def bff_device_census(self) -> list[dict[str, Any]]:
+        """PII-free census of the last BFF device-list response (diagnostics)."""
+        return self._bff_device_census
+
+    @property
+    def bff_response_skeleton(self) -> Any:
+        """PII-free structural skeleton of the last raw BFF response."""
+        return self._bff_response_skeleton
+
+    @property
+    def bff_device_values(self) -> list[dict[str, Any]]:
+        """Redacted per-device BFF scalar values for diagnostics (#114)."""
+        return self._bff_device_values
+
+    @property
+    def discovery_incomplete(self) -> bool:
+        """True when a startup discovery step failed or timed out this session.
+
+        The orphan cleanup uses this to keep entities of devices that a
+        failed BFF/account step would otherwise have discovered.
+        """
+        return bool(self._startup_steps_failed)
+
+    @property
+    def hub_device_ids(self) -> set[str]:
+        """IDs of the gateway devices this entry registers (leak and thermo hubs)."""
+        ids = {sensor.hub_device_id for sensor in self._leak_sensors.values() if sensor.hub_device_id}
+        ids.update(hub_id for hub_id in self._bff_thermo_hubs if hub_id)
+        return ids
+
+    @property
+    def lan_active_count(self) -> int:
+        """Devices currently correlated to a LAN address (diagnostics)."""
+        return len(self._lan_devices)
+
+    @property
+    def lan_unmatched_count(self) -> int:
+        """LAN scan replies that matched no device ID (diagnostics)."""
+        return len(self._lan_unmatched)
+
+    def _note_sensor_reading_change(
+        self,
+        device_id: str,
+        new_state: GoveeDeviceState,
+        existing_state: GoveeDeviceState,
+    ) -> None:
+        """Stamp the reading-change time when temp/humidity actually changes.
+
+        The Cloud API does not expose the device-side reading time, so the
+        semantic is last *change*, not last confirmation. First reading stamps
+        too (device not yet in the map).
+        """
+        if (
+            new_state.sensor_temperature is None
+            and new_state.sensor_temperature_2 is None
+            and new_state.sensor_humidity is None
+        ):
+            return
+        reading_changed = (
+            new_state.sensor_temperature != existing_state.sensor_temperature
+            or new_state.sensor_temperature_2 != existing_state.sensor_temperature_2
+            or new_state.sensor_humidity != existing_state.sensor_humidity
+        )
+        if reading_changed or device_id not in self._sensor_reading_changed_at:
+            self._sensor_reading_changed_at[device_id] = dt_util.utcnow()
+
+    def bff_last_measurement_at(self, device_id: str) -> datetime | None:
+        """When the device itself last took the reading the account data carries (#258).
+
+        From the BFF ``lastTime``: the device's own clock, unlike
+        :meth:`sensor_reading_changed_at`, so a thermometer that stopped
+        uploading shows its real age.
+        """
+        return self._bff_last_measurement.get(device_id)
+
+    def _note_bff_last_measurement(self, device_id: str, sensor: dict[str, Any]) -> None:
+        """Record a BFF entry's ``lastTime`` (epoch ms, or s on some SKUs)."""
+        last_time = sensor.get("last_time")
+        if isinstance(last_time, bool) or not isinstance(last_time, int) or last_time <= 0:
+            return
+        seconds = last_time / 1000 if last_time > 10**11 else last_time
+        try:
+            self._bff_last_measurement[device_id] = datetime.fromtimestamp(seconds, timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return
+
+    def sensor_reading_changed_at(self, device_id: str) -> datetime | None:
+        """When the device's temp/humidity reading last changed (#83).
+
+        Semantic is last *change*, not last poll — the Cloud API does not
+        expose the device-side reading time. Returns None until a reading
+        has been seen.
+        """
+        return self._sensor_reading_changed_at.get(device_id)
+
+    def device_data_last_updated(self, device_id: str) -> datetime | None:
+        """Most recent time any transport delivered data for this device.
+
+        Max of ``last_success_ts`` across cloud_api / mqtt / ble — surfaces
+        the device's overall data freshness ("All Data Last Updated") as a
+        diagnostic TIMESTAMP. Returns None until a transport has succeeded.
+        """
+        latest: datetime | None = None
+        for kind in TRANSPORT_KINDS:
+            health = self._transport.get(device_id, kind)
+            if health is None or health.last_success_ts is None:
+                continue
+            if latest is None or health.last_success_ts > latest:
+                latest = health.last_success_ts
+        return latest
+
+    def device_last_command_sent(self, device_id: str) -> datetime | None:
+        """Most recent time a command was sent to this device, any transport.
+
+        Max of ``last_send_ts`` across cloud_api / mqtt / ble — the outbound
+        counterpart to ``device_data_last_updated``. Returns None until a
+        command has been sent.
+        """
+        latest: datetime | None = None
+        for kind in TRANSPORT_KINDS:
+            health = self._transport.get(device_id, kind)
+            if health is None or health.last_send_ts is None:
+                continue
+            if latest is None or health.last_send_ts > latest:
+                latest = health.last_send_ts
+        return latest
+
+    @property
+    def has_iot_credentials(self) -> bool:
+        """Whether AWS IoT credentials are configured (MQTT path enabled)."""
+        return self._iot_credentials is not None
+
+    @property
+    def openapi_events_client(self) -> GoveeOpenApiEventClient | None:
+        """The OpenAPI event-subscription client, for diagnostics."""
+        return self._openapi_events_client
+
+    @property
+    def device_topic_count(self) -> int:
+        """Number of devices with a resolved MQTT publish topic."""
+        return len(self._device_topics)
+
+    def has_device_topic(self, device_id: str) -> bool:
+        """Whether the device has its own MQTT publish topic, for diagnostics (#222)."""
+        return device_id in self._device_topics
+
+    @property
+    def mqtt_missed_pushes_since_connect(self) -> int:
+        """Gateway readings that reached the cloud but not this MQTT session (#222)."""
+        return self._mqtt_missed_pushes_since_connect
+
+    @property
+    def gateway_route_count(self) -> int:
+        """Number of devices reachable through a gateway's command topic (#135)."""
+        return len(self._gateway_routes)
+
+    def gateway_route(self, device_id: str) -> dict[str, str] | None:
+        """The gateway command route for a device, if it has one.
+
+        Gateway-attached BLE devices (e.g. an H5901 Smart Water Timer behind an
+        H5044) ignore commands published to their own topic — the packet has to
+        be relayed through the gateway (issue #135).
+        """
+        return self._gateway_routes.get(device_id)
+
+    def consume_button_press(self, device_id: str) -> bool:
+        """Consume one pending button press for device_id. Returns True if consumed."""
+        count = self._pending_button_presses.get(device_id, 0)
+        if count > 0:
+            if count == 1:
+                del self._pending_button_presses[device_id]
+            else:
+                self._pending_button_presses[device_id] = count - 1
+            return True
+        return False
+
+    def get_device(self, device_id: str) -> GoveeDevice | None:
+        """Get device by ID."""
+        return self._devices.get(device_id)
+
+    def get_state(self, device_id: str) -> GoveeDeviceState | None:
+        """Get current state for a device."""
+        return self._states.get(device_id)
+
+    def is_bff_thermometer(self, device_id: str) -> bool:
+        """Return True if this device is a BFF-discovered thermo-hygrometer.
+
+        These battery/gateway-bridged sensors report ``online`` as an
+        unreliable liveness flag that flaps false between infrequent uploads,
+        so entity availability must not gate on it (issue #97).
+        """
+        return device_id in self._bff_thermometer_ids
+
+    def account_temperature_unit(self, device_id: str) -> str | None:
+        """Return the account's display unit for a device, if Govee told us.
+
+        ``"fahrenheit"`` / ``"celsius"`` when the BFF device list carried a
+        ``fahOpen`` flag for this device, otherwise None (caller falls back to
+        the SKU allowlist). Same contract as the heater ``unit`` metadata, so it
+        feeds ``resolve_fahrenheit_conversion`` unchanged (issue #157).
+        """
+        fah_open = self._display_fahrenheit.get(device_id)
+        if fah_open is None:
+            return None
+        return "fahrenheit" if fah_open else "celsius"
+
+    def is_water_detector(self, device_id: str) -> bool:
+        """Return True if this device is a standalone water detector (H5054).
+
+        Like the BFF thermometers, these are sleepy gateway-bridged sensors that
+        report ``online: false`` at poll time, so entity availability must not
+        gate on ``online`` (issues #62, #145).
+        """
+        return any(d.device_id == device_id for d in self._water_detectors)
+
+    def is_bff_leak_sensor(self, device_id: str) -> bool:
+        """Return True if BFF/hub discovery owns this device's moisture entity.
+
+        Compared on the colon-stripped form because Govee is not consistent
+        about device-ID formatting between the Developer API and the BFF list
+        (see ``fetch_water_detector_states``).
+
+        Reflects the live roster only. Persisting the answer would make it
+        monotone-true, and a device that leaves the hub would then end up with
+        no moisture entity at all.
+        """
+        target = normalize_device_id(device_id)
+        return any(normalize_device_id(sensor_id) == target for sensor_id in self._leak_sensors)
+
+    def record_segment_color(self, device_id: str, segment_index: int, rgb: tuple[int, int, int]) -> None:
+        """Note a segment's colour so a later whole-device write can restore it.
+
+        Called both when a segment command is dispatched and by the segment
+        entities as they restore on startup. That second path matters: this
+        tracking is in-memory, so without it the first main-panel write after a
+        restart would have nothing to replay and would silently leave the ring
+        wiped (issue #131).
+        """
+        self._segment_colors.setdefault(device_id, {})[segment_index] = rgb
+
+    async def async_reassert_segments(self, device_id: str, *, wrote_black: bool = False) -> None:
+        """Re-send the segments' last known colours after a whole-device write.
+
+        On the two-zone Ceiling Light Pro fixtures (MAIN_LIGHT_TOGGLE_SKUS) the
+        whole-device colour/CCT/brightness channel drives the ENTIRE fixture —
+        main panel AND ring — so it wipes the ``segmentedColorRgb`` overlay the
+        ring actually uses. Confirmed on an H1270: setting a colour temperature
+        while the ring was red turned the ring warm-white too. Replaying the
+        tracked segment colours immediately afterwards restores the ring
+        without disturbing the main panel, which is what makes the two zones
+        independently controllable in practice rather than only in principle
+        (issue #131).
+
+        Segments are grouped by colour so a uniform ring costs a single call
+        rather than one per segment. No-op when nothing has been tracked yet —
+        notably right after a restart, since this is in-memory state.
+
+        Also a no-op while a power-off is in flight. Replaying segment colours
+        after a ``powerSwitch`` off would re-issue exactly the writes the
+        segment entities deliberately suppress (issue #16) and, on fixtures
+        where any light command wakes the main panel, would undo the power-off
+        entirely. Guarded here so every caller gets it, not just the one.
+
+        Segment commands ride neither the BLE nor the LAN dispatcher — both
+        only carry power, brightness and colour — so every call here goes to
+        REST and spends the API budget. Two guards keep that in proportion.
+
+        ``wrote_black`` says the whole-device write that triggered this was
+        itself black, which is the main-panel-off path. Only then can an
+        all-black ring be left alone: the write drives the whole fixture, so a
+        dark ring ends up dark either way. It is NOT safe to skip on colour
+        alone — after a write that turns the panel on, the ring is showing the
+        panel's colour, and skipping would leave it lit (issue #131).
+
+        The second guard is the API budget. A many-coloured ring costs one call
+        per distinct colour on every main-panel toggle, so an automation
+        toggling the panel against a varied ring can walk into the daily cap
+        and take the whole integration down with it. Below the reserve the ring
+        is left stale until the next segment write, which is the better
+        failure: a stale ring is a nuisance, a spent quota is an outage.
+        """
+        if self.is_power_off_pending(device_id):
+            return
+
+        tracked = self._segment_colors.get(device_id)
+        if not tracked:
+            return
+
+        if wrote_black and all(rgb == (0, 0, 0) for rgb in tracked.values()):
+            return
+
+        by_color: dict[tuple[int, int, int], list[int]] = {}
+        for index, rgb in tracked.items():
+            by_color.setdefault(rgb, []).append(index)
+
+        if self.api_rate_limit_remaining - len(by_color) < _REASSERT_RATE_LIMIT_RESERVE:
+            _LOGGER.warning(
+                "Skipping segment re-assert for %s: %d API calls remaining, "
+                "%d needed for %d distinct segment colours. The ring may show "
+                "the main panel's colour until the next segment command",
+                device_id,
+                self.api_rate_limit_remaining,
+                len(by_color),
+                len(by_color),
+            )
+            return
+
+        for rgb, indices in by_color.items():
+            r, g, b = rgb
+            await self.async_control_device(
+                device_id,
+                SegmentColorCommand(
+                    segment_indices=tuple(sorted(indices)),
+                    color=RGBColor(r=r, g=g, b=b),
+                ),
+            )
+
+    def is_power_off_pending(self, device_id: str) -> bool:
+        """Return True if a power-off command is in flight for this device.
+
+        Segment entities use this to avoid racing with a concurrent power-off.
+        """
+        return device_id in self._pending_power_off
+
+    # ------------------------------------------------------------------ #
+    # BLE direct transport
+    # ------------------------------------------------------------------ #
+
+    def setup_ble_subscriptions(self) -> list[Any]:
+        """Subscribe to BLE advertisements via the BleAdvertisementHandler.
+
+        Returns the list of unsubscribe callables to pass to
+        ``entry.async_on_unload``. No-op when HAS_BLUETOOTH is False.
+        """
+        return self._ble_handler.setup_subscriptions()
+
+    @callback
+    def _handle_ble_advertisement(self, service_info: Any) -> None:
+        """Compatibility delegate — tests still call this directly."""
+        self._ble_handler.handle_advertisement(service_info)
+
+    async def _run_startup_step(self, coro: Awaitable[None], name: str) -> None:
+        """Run a fallible startup discovery step, bounded and failure-isolated.
+
+        The account/BFF endpoints these steps call can hang (a stuck socket read
+        with no server response). Left unbounded, a single hang lets Home
+        Assistant cancel the *entire* config-entry setup — the traceback in
+        issue #146 is exactly this: a ``CancelledError`` raised inside
+        ``_discover_leak_sensors``' BFF GET, which the method's ``except
+        Exception`` can't catch (``CancelledError`` is a ``BaseException``), so
+        setup dies and every entity goes offline.
+
+        Bound each step with its own timeout and swallow timeouts/errors so the
+        integration still loads; the feature degrades to the next poll cycle. A
+        genuine outer cancel (HA shutting the entry down) still propagates,
+        because ``asyncio.timeout`` only converts *its own* deadline into a
+        ``TimeoutError`` — an externally-injected cancel re-raises as
+        ``CancelledError`` past the ``except`` clauses below.
+        """
+        try:
+            async with asyncio.timeout(STARTUP_STEP_TIMEOUT):
+                await coro
+        except TimeoutError:
+            self._startup_steps_failed.add(name)
+            _LOGGER.warning(
+                "Startup step %r did not complete within %ss; continuing without "
+                "it (it will retry on the next poll)",
+                name,
+                STARTUP_STEP_TIMEOUT,
+            )
+        except Exception as err:  # noqa: BLE001
+            self._startup_steps_failed.add(name)
+            _LOGGER.warning("Startup step %r failed (%s); continuing without it", name, err)
+
+    async def _async_setup(self) -> None:
+        """Set up the coordinator - discover devices and start MQTT.
+
+        Called automatically by async_config_entry_first_refresh().
+        """
+        # Discover devices
+        await self._discover_devices()
+
+        # Start MQTT client if credentials available
+        if self._iot_credentials:
+            await self._start_mqtt()
+            # Fetch device-specific MQTT topics for publishing commands. Bounded:
+            # it hits the legacy + BFF device lists and must not hang setup (#146).
+            await self._run_startup_step(self._fetch_device_topics(), "fetch device topics")
+            # Devices are largely poll-triggered responders on their own MQTT
+            # topic, not autonomous pushers (see async_publish_status_query).
+            # The initial query itself is fired from _on_mqtt_connected, not
+            # here: _start_mqtt only spawns the connection-loop task and
+            # returns immediately, so a query attempted at this point would
+            # see client.connected still False (the TLS handshake and
+            # CONNACK/SUBACK haven't completed yet) and silently no-op. Arm
+            # the recurring timer here regardless, as a backstop independent
+            # of when the connection actually lands.
+            self._schedule_status_poll()
+
+        # OpenAPI event subscription — needs only the API key (no account
+        # login), so it runs regardless of IoT credentials. Failure-isolated:
+        # a broker hiccup must never fail setup (the client retries forever).
+        await self._start_openapi_events()
+
+        if self._iot_credentials:
+            await self._async_load_leak_mqtt_stamps()
+
+        # Discover leak sensors via BFF API (requires email/password). Bounded so
+        # a hung BFF call degrades to polling instead of cancelling setup (#146).
+        await self._run_startup_step(self._discover_leak_sensors(), "discover leak sensors")
+
+        # Discover BFF-only thermo-hygrometers (H5301) that the Developer API
+        # omits (issue #86). Also requires email/password.
+        await self._run_startup_step(self._discover_bff_thermometers(), "discover BFF thermometers")
+
+        # Standalone water detectors (H5054) deliver their trip only via the
+        # account warnMessage history — start the dedicated leak poll (issue #62).
+        if self._water_detectors and self._iot_credentials:
+            await self._run_startup_step(self._poll_water_detectors(), "poll water detectors")
+            self._schedule_water_detector_poll()
+
+        # LAN (UDP) transport is opened LAST, after every fallible discovery /
+        # login step above, so a partially-built setup can never strand a bound
+        # :4002 socket — if one of those steps raises ConfigEntryNotReady the LAN
+        # client is never opened, and any failure inside _async_setup_lan after
+        # the socket opens stops the client before propagating (#57, blocking #5).
+        await self._async_setup_lan()
+
+    def _resolve_lan_overrides(self) -> dict[str, LanDeviceInfo]:
+        """Manual ``device_id=ip[!]`` overrides from ``CONF_LAN_TARGETS`` (#164).
+
+        Bypasses scan/devStatus discovery for a device pinned this way,
+        binding it straight to the given IP. Also (re)populates
+        :attr:`_lan_write_only` from any ``!``-suffixed entries — called once
+        per setup/rescan cycle, so it is the single source of truth for which
+        devices are write-only at any given moment (a user can remove the
+        ``!`` and a later rescan un-marks the device).
+
+        An override naming a ``device_id`` this account doesn't have (typo,
+        removed device) is skipped with a debug log rather than raising —
+        the same "one bad entry never blocks the rest" contract as
+        ``expand_lan_targets``.
+        """
+        raw_targets = self._config_entry.options.get(CONF_LAN_TARGETS, "")
+        overrides = parse_lan_device_overrides(raw_targets if isinstance(raw_targets, str) else "")
+        now = time.monotonic()
+        resolved: dict[str, LanDeviceInfo] = {}
+        self._lan_write_only = set()
+        for device_id, (ip, write_only) in overrides.items():
+            device = self._devices.get(device_id)
+            if device is None:
+                _LOGGER.debug(
+                    "Ignoring %s override for unknown device_id %r",
+                    CONF_LAN_TARGETS,
+                    device_id,
+                )
+                continue
+            resolved[device_id] = LanDeviceInfo(
+                device_id=device_id,
+                ip=ip,
+                mac=device_id,
+                sku=device.sku,
+                firmware="",
+                last_correlated_ts=now,
+            )
+            if write_only:
+                self._lan_write_only.add(device_id)
+        return resolved
+
+    async def _async_setup_lan(self, *, retry: bool = False) -> None:
+        """Set up the LAN (UDP) transport — the LAST step of coordinator setup.
+
+        Auto-enables the local UDP transport (issue #57) when at least one
+        device answers the LAN discovery scan AND its scan MAC correlates to a
+        known ``device_id``. There is no enable toggle: correlation IS the gate.
+        The only LAN option is ``CONF_LAN_TARGETS`` (extra cross-VLAN unicast
+        targets); setting it to the literal ``"off"`` (case-insensitive) is the
+        rollback escape hatch that skips LAN setup entirely, leaving
+        ``self._lan_client`` ``None`` so every LAN path is bypassed.
+
+        Opened LAST in :meth:`_async_setup` (after every fallible discovery /
+        login step) and, once the client's socket is bound, wrapped so any
+        subsequent failure stops the client before the exception propagates — a
+        partially-built setup must never strand a bound socket (blocking #5).
+        The discovery scan and ``async_start`` degrade cleanly (never raise into
+        setup) when port :4002 is held by another local-control app.
+
+        LAN-011 fills in the runtime read/rescan/health wiring; this method only
+        owns the lifecycle (open LAST, correlate, leak-proof teardown).
+
+        Args:
+            retry: ``True`` when called from the poll's throttled setup retry;
+                the user-facing warnings were already logged by the first
+                attempt, so repeats drop to debug.
+        """
+        raw_targets = self._config_entry.options.get(CONF_LAN_TARGETS, "")
+        # Rollback escape hatch: an explicit "off" disables LAN with no socket
+        # work, so a user can opt out of the auto-enabled transport entirely.
+        if isinstance(raw_targets, str) and raw_targets.strip().lower() == "off":
+            _LOGGER.debug("Govee LAN transport disabled via %s='off'", CONF_LAN_TARGETS)
+            return
+        # Every attempt (setup or the poll's retry) starts the rescan throttle,
+        # so a failed attempt is retried after LAN_RESCAN_INTERVAL, not per poll.
+        self._last_lan_rescan = time.monotonic()
+
+        # Tolerate a stale / invalid targets option: a bad cross-VLAN entry must
+        # not break LAN setup, let alone the integration. Fall back to no extras.
+        try:
+            extra_targets = expand_lan_targets(raw_targets if isinstance(raw_targets, str) else "")
+        except LanTargetError as err:
+            _LOGGER.log(
+                logging.DEBUG if retry else logging.WARNING,
+                "Ignoring invalid %s option (%r): %s",
+                CONF_LAN_TARGETS,
+                raw_targets,
+                err,
+            )
+            extra_targets = []
+
+        interface_ips = await async_get_lan_interface_ips(self.hass)
+        # Auto-derived per-subnet broadcast(s): reach newer devices that ignore
+        # the multicast scan but answer a directed broadcast (issue #57).
+        broadcast_targets = await async_get_lan_broadcast_addresses(self.hass)
+
+        # The discovery scan must never raise into setup: an OSError (port :4002
+        # held by another local-control app without SO_REUSEPORT) means "no LAN
+        # data", so degrade cleanly to MQTT/REST.
+        try:
+            scan = await async_scan_lan_devices(
+                interface_ips=interface_ips,
+                extra_targets=extra_targets,
+                broadcast_targets=broadcast_targets,
+            )
+        except OSError as err:
+            _LOGGER.log(
+                logging.DEBUG if retry else logging.INFO,
+                "Govee LAN discovery scan could not bind, LAN disabled: %s",
+                err,
+            )
+            return
+
+        # A poll's setup retry can still be scanning when the entry unloads.
+        if self._lan_closed:
+            return
+        client = GoveeLanClient(self._on_lan_dev_status)
+        await client.async_start(interface_ips)
+        if not client.available or self._lan_closed:
+            # Clean degrade: the :4002 bind failed (held by a non-sharing app),
+            # or the entry unloaded meanwhile. Release whatever it grabbed and
+            # stay LAN-disabled (client None).
+            await client.async_stop()
+            return
+
+        # From here the client owns a bound socket. ANY failure must stop it
+        # before propagating so a partially-built setup never strands the bind
+        # (blocking #5) — even though the steps below are not expected to raise.
+        try:
+            matched, unmatched = correlate_scan(scan, set(self._devices), time.monotonic())
+            # Manual device_id=ip[!] overrides (#164) fill in devices scan
+            # correlation can never reach on a segmented network — its reply
+            # is multicast and can't cross the VLAN boundary back to us. A
+            # fresh scan match still wins over a possibly-stale manual entry.
+            for device_id, info in self._resolve_lan_overrides().items():
+                matched.setdefault(device_id, info)
+            if not matched:
+                # Auto-enable gate not met: the scan answered but nothing
+                # correlated to a device_id, and no override filled the gap.
+                # Don't hold sockets for nothing — stop the client and stay
+                # disabled.
+                _LOGGER.debug(
+                    "Govee LAN: scan answered but no device correlated " "(%d unmatched) — LAN disabled",
+                    len(unmatched),
+                )
+                await client.async_stop()
+                return
+            self._lan_devices = matched
+            self._lan_unmatched = list(unmatched)
+            # Stamp the rescan throttle at setup so the first periodic rescan
+            # waits a full LAN_RESCAN_INTERVAL from here — independent of host
+            # uptime — rather than firing a redundant rescan on the next poll
+            # (which a 0.0 sentinel would on a long-uptime host).
+            self._last_lan_rescan = time.monotonic()
+            # Promote the client only after correlation succeeds.
+            self._lan_client = client
+        except Exception:
+            await client.async_stop()
+            raise
+
+        _LOGGER.info(
+            "Govee LAN transport enabled for %d device(s) (%d unmatched scan " "record(s))",
+            len(self._lan_devices),
+            len(self._lan_unmatched),
+        )
+
+    @callback
+    def _on_lan_dev_status(self, src_ip: str, status: LanDevStatus) -> None:
+        """Apply an unsolicited LAN ``devStatus`` push, guarded by source IP.
+
+        Injected into :class:`GoveeLanClient` as its ``on_dev_status`` callback.
+        A ``devStatus`` reply carries no device identity, so the only key is the
+        datagram source IP — which a DHCP reassignment can silently re-point at a
+        different device (critic blocking #3). The push is applied ONLY when the
+        source IP reverse-resolves to exactly one correlated device whose
+        correlation is still fresh (within ``LAN_CORRELATION_TTL_SECONDS``); any
+        ambiguity (unknown IP, stale correlation, or two devices sharing one IP)
+        skips the push and requests a re-correlation so the next poll fixes the
+        map, rather than clobbering a guessed device. The mode-aware overlay and
+        the optimistic-grace guard live in :meth:`_apply_lan_read`, shared with
+        the solicited poll path.
+
+        Args:
+            src_ip: The datagram's source IP address.
+            status: The parsed LAN ``devStatus`` snapshot.
+        """
+        device_id = self._lan_device_id_for_ip(src_ip)
+        if device_id is None:
+            # Unknown or ambiguous source IP: a DHCP reassignment may have left
+            # the IP->device map stale. Re-correlate before trusting it again and
+            # do NOT apply to a guessed device — fall back to cloud (blocking #3).
+            self._request_lan_rescan()
+            return
+        info = self._lan_devices[device_id]
+        if (time.monotonic() - info.last_correlated_ts) >= LAN_CORRELATION_TTL_SECONDS:
+            # Correlation too old to trust this IP mapping; re-correlate first
+            # and skip — a stale map could route this reply to the wrong device.
+            self._request_lan_rescan()
+            return
+        # Unsolicited push: notify HA only when a value actually changed.
+        self._apply_lan_read(device_id, status)
+
+    def _lan_device_id_for_ip(self, src_ip: str) -> str | None:
+        """Reverse-resolve a LAN source IP to its correlated ``device_id``.
+
+        Returns the single correlated ``device_id`` currently mapped to
+        ``src_ip``, or ``None`` when no device maps to it (unknown IP) or more
+        than one does (ambiguous, e.g. a botched DHCP lease) — the only safe
+        answer is to skip LAN for that datagram (blocking #3).
+        """
+        matches = [device_id for device_id, info in self._lan_devices.items() if info.ip == src_ip]
+        return matches[0] if len(matches) == 1 else None
+
+    @callback
+    def _request_lan_rescan(self) -> None:
+        """Force the next LAN rescan to bypass its throttle (blocking #3).
+
+        Called from the unsolicited-push path when a ``devStatus`` arrives from an
+        IP that is unknown or whose correlation has gone stale: a DHCP
+        reassignment may have invalidated the IP<->device map, so the next poll
+        must re-correlate immediately rather than wait out ``LAN_RESCAN_INTERVAL``.
+        Idempotent (it only clears the throttle timestamp), so a burst of
+        unknown-IP pushes can never trigger a rescan flood.
+
+        Uses ``-inf`` rather than ``0.0`` so ``now - self._last_lan_rescan``
+        always exceeds ``LAN_RESCAN_INTERVAL`` regardless of host uptime:
+        ``time.monotonic()`` counts seconds since boot, so on a freshly-booted
+        Home Assistant host (monotonic < ``LAN_RESCAN_INTERVAL``) a ``0.0``
+        sentinel still reads as throttled and would silently swallow the forced
+        rescan — the DHCP re-correlation of blocking #3 would never fire.
+        """
+        self._last_lan_rescan = float("-inf")
+
+    def _in_optimistic_grace(self, existing_state: GoveeDeviceState) -> bool:
+        """Return ``True`` while a device is inside its optimistic grace window.
+
+        A control command that just fired marks the state ``source`` as
+        ``optimistic`` and stamps ``last_optimistic_update``; for a short window
+        (two poll intervals, capped at ``OPTIMISTIC_GRACE_CAP_SECONDS``) a slower
+        authoritative read — the cloud poll or a solicited LAN read — must not
+        overwrite the in-flight power/brightness and flip-flop the UI. Extracted
+        so the cloud poll and the LAN overlay share one definition (issue #57).
+        """
+        if existing_state.source != "optimistic":
+            return False
+        optimistic_ts = existing_state.last_optimistic_update
+        if optimistic_ts is None:
+            return False
+        poll_seconds = self.update_interval.total_seconds() if self.update_interval is not None else 60.0
+        grace_window = min(2 * poll_seconds, OPTIMISTIC_GRACE_CAP_SECONDS)
+        return (time.monotonic() - optimistic_ts) < grace_window
+
+    def _apply_lan_read(self, device_id: str, status: LanDevStatus, *, notify: bool = True) -> None:
+        """Overlay a parsed LAN ``devStatus`` onto a device's existing state.
+
+        Additive and abortable: a device with no existing state returns without
+        raising, so a stray reply can never strand or corrupt state. Brightness is
+        rescaled from the LAN 0-100 domain into the device's native range BEFORE
+        the overlay (``state.brightness`` is device-native), and the overlay
+        honours the optimistic grace window so a solicited read cannot clobber an
+        in-flight command. The mode-aware / {0,0,0}-sentinel / colour-vs-CT
+        mutual-exclusion guards live in
+        :meth:`GoveeDeviceState.update_from_lan`.
+
+        Args:
+            device_id: The correlated device to overlay.
+            status: The parsed LAN ``devStatus`` reply.
+            notify: When ``True`` (the unsolicited-push path) call
+                ``async_set_updated_data`` only if a value actually changed (BFF
+                churn-avoidance). The solicited poll path passes ``False`` and
+                mutates in place, letting ``_async_update_data`` return
+                ``self._states`` so HA fires listeners without a re-entrant
+                ``async_set_updated_data`` (critic advisory).
+        """
+        existing = self._states.get(device_id)
+        if existing is None:
+            return
+
+        device = self._devices.get(device_id)
+        brightness_range = device.brightness_range if device is not None else (0, 100)
+        native_brightness = (
+            lan_brightness_to_device(status.brightness_0_100, brightness_range)
+            if status.brightness_0_100 is not None
+            else None
+        )
+        overlay = _LanReadOverlay(
+            on=status.on,
+            brightness=native_brightness,
+            color=status.color,
+            color_temp_kelvin=status.color_temp_kelvin,
+        )
+
+        before = (
+            existing.power_state,
+            existing.brightness,
+            existing.color,
+            existing.color_temp_kelvin,
+            existing.online,
+        )
+        existing.update_from_lan(overlay, skip_power_brightness=self._in_optimistic_grace(existing))
+        # A devStatus reply reaching here is a confirmed inbound read — proof of
+        # life — so stamp LAN read success (read => success). This is the read
+        # half of the LAN recording asymmetry (see refresh_lan_staleness): the
+        # write half lives in the LAN control tier. Recording here keeps the
+        # device LAN-available so the very next _refresh_lan_staleness pass
+        # leaves it active instead of demoting it to stale_lan.
+        self._record_transport_success(device_id, "lan")
+        self._transport.record_read(device_id, "lan")
+        # NOTE: a confirmed inbound READ proves the transport is alive (recorded
+        # above) but says nothing about whether WRITES land, so it must NOT reset
+        # the write-miss streak — only a confirmed write
+        # (:meth:`_clear_lan_write_misses`) or the suppression cooldown does that
+        # (#57). Resetting here would let a polling device whose writes never
+        # confirm pay the verify-by-read timeout on every single command forever.
+        after = (
+            existing.power_state,
+            existing.brightness,
+            existing.color,
+            existing.color_temp_kelvin,
+            existing.online,
+        )
+        if notify and before != after:
+            self.async_set_updated_data(self._states)
+
+    async def _refresh_lan_reads(self) -> None:
+        """Solicit a ``devStatus`` from each correlated LAN device and overlay it.
+
+        Sends one batched query to every correlated device's current IP and
+        overlays each reply onto the FRESH cloud state in place — no re-entrant
+        ``async_set_updated_data``: ``_async_update_data`` returns ``self._states``
+        so HA fires listeners. A device that answers resets its miss counter; a
+        device silent for ``LAN_READ_MISS_DEMOTE_THRESHOLD`` consecutive polls is
+        demoted out of the LAN map so reads AND writes fall back to MQTT/REST
+        until a rescan re-promotes it.
+        """
+        if self._lan_client is None or not self._lan_devices:
+            return
+
+        ip_to_device = {
+            info.ip: device_id
+            for device_id, info in self._lan_devices.items()
+            # Write-only devices (#164) never answer a read — polling them
+            # would just accumulate misses and demote them straight back out
+            # of _lan_devices every LAN_READ_MISS_DEMOTE_THRESHOLD cycles.
+            if info.ip and device_id not in self._lan_write_only
+        }
+        if not ip_to_device:
+            return
+
+        replies = await self._lan_client.async_read_batch(list(ip_to_device))
+
+        demoted: list[str] = []
+        for ip, device_id in ip_to_device.items():
+            status = replies.get(ip)
+            if status is not None:
+                # Mutate in place (notify=False) — see _apply_lan_read.
+                self._apply_lan_read(device_id, status, notify=False)
+                self._lan_read_misses[device_id] = 0
+            else:
+                misses = self._lan_read_misses.get(device_id, 0) + 1
+                self._lan_read_misses[device_id] = misses
+                if misses >= LAN_READ_MISS_DEMOTE_THRESHOLD:
+                    demoted.append(device_id)
+
+        for device_id in demoted:
+            self._lan_devices.pop(device_id, None)
+            self._lan_read_misses.pop(device_id, None)
+            self._lan_write_misses.pop(device_id, None)
+            self._lan_write_suppressed_until.pop(device_id, None)
+            _LOGGER.debug(
+                "Govee LAN: demoting %s after %d consecutive read misses — reads "
+                "and writes fall back to MQTT/REST until a rescan re-promotes it",
+                device_id,
+                LAN_READ_MISS_DEMOTE_THRESHOLD,
+            )
+
+    def _lan_client_running(self) -> bool:
+        """Return whether a LAN client is running (re-read after an await)."""
+        return self._lan_client is not None
+
+    async def _async_maybe_rescan_lan(self) -> None:
+        """Re-scan + re-correlate LAN devices on a throttled cadence (issue #57).
+
+        Mirrors :meth:`_async_maybe_rediscover_devices`' monotonic throttle. A
+        rescan re-promotes devices demoted by read-misses, picks up newly added
+        devices, and — critically — re-correlates IP<->device_id mappings so a
+        DHCP IP reassignment cannot leave the read path pointed at the wrong
+        device (blocking #3). Never raises: a scan hiccup must not fail the poll.
+        :meth:`_request_lan_rescan` can clear the throttle so an unknown-IP push
+        forces the next call to run.
+
+        When setup left LAN off (nothing answered or correlated yet, or the
+        :4002 bind failed), the full LAN setup is retried instead, so lights
+        whose Wi-Fi came up after Home Assistant still get local control
+        without a reload. The retry starts at ``LAN_RESCAN_INTERVAL`` and
+        doubles after each empty attempt up to ``LAN_SETUP_RETRY_MAX_INTERVAL``;
+        success resets it, and an options change reloads the entry, which
+        starts over. ``"off"`` is honoured by :meth:`_async_setup_lan` itself.
+        """
+        now = time.monotonic()
+        interval = LAN_RESCAN_INTERVAL if self._lan_client is not None else self._lan_retry_interval
+        if now - self._last_lan_rescan < interval:
+            return
+        self._last_lan_rescan = now
+
+        if self._lan_client is None:
+            try:
+                await self._async_setup_lan(retry=True)
+            except Exception as err:  # noqa: BLE001 — never fail the poll
+                _LOGGER.debug("Govee LAN setup retry failed: %s", err)
+            if not self._lan_client_running():
+                # Still nothing: back off so a cloud-only install isn't scanned
+                # every five minutes forever.
+                self._lan_retry_interval = min(self._lan_retry_interval * 2, LAN_SETUP_RETRY_MAX_INTERVAL)
+            else:
+                self._lan_retry_interval = LAN_RESCAN_INTERVAL
+            return
+
+        raw_targets = self._config_entry.options.get(CONF_LAN_TARGETS, "")
+        try:
+            extra_targets = expand_lan_targets(raw_targets if isinstance(raw_targets, str) else "")
+        except LanTargetError:
+            extra_targets = []
+
+        try:
+            interface_ips = await async_get_lan_interface_ips(self.hass)
+            broadcast_targets = await async_get_lan_broadcast_addresses(self.hass)
+            # Scan through the running client's own :4002 socket: a second
+            # socket on :4002 would split unicast replies with it on Linux.
+            scan = await self._lan_client.async_scan(
+                interface_ips=interface_ips,
+                extra_targets=extra_targets,
+                broadcast_targets=broadcast_targets,
+            )
+        except OSError as err:
+            _LOGGER.debug("Govee LAN rescan could not bind/scan: %s", err)
+            return
+
+        matched, unmatched = correlate_scan(scan, set(self._devices), now)
+        # Re-apply manual overrides each rescan too (#164) — a fresh scan
+        # match still wins for any device_id it actually found.
+        for device_id, info in self._resolve_lan_overrides().items():
+            matched.setdefault(device_id, info)
+        self._merge_lan_correlation(matched, unmatched)
+
+    def _merge_lan_correlation(
+        self,
+        matched: dict[str, LanDeviceInfo],
+        unmatched: list[Mapping[str, Any]],
+    ) -> None:
+        """Merge a fresh LAN correlation into the live device map (blocking #3).
+
+        Fresh matches are authoritative for IP<->device_id and reset the
+        read-miss counter (re-promoting demoted devices). A previously-correlated
+        device that did NOT answer this scan is kept (a transient scan miss;
+        read-miss demotion handles a real drop) UNLESS its old IP is now claimed
+        by a DIFFERENT device — that stale mapping is invalidated and dropped so a
+        DHCP reassignment can never misroute a future read (blocking #3 (b)).
+        """
+        claimed_ips = {info.ip for info in matched.values() if info.ip}
+        rebuilt: dict[str, LanDeviceInfo] = {}
+        for device_id, info in self._lan_devices.items():
+            if device_id in matched:
+                continue  # superseded by the fresh correlation below
+            if info.ip and info.ip in claimed_ips:
+                # Old IP now belongs to a different device — drop the stale map.
+                self._lan_read_misses.pop(device_id, None)
+                self._lan_write_misses.pop(device_id, None)
+                self._lan_write_suppressed_until.pop(device_id, None)
+                continue
+            rebuilt[device_id] = info
+        for device_id, info in matched.items():
+            rebuilt[device_id] = info
+            self._lan_read_misses[device_id] = 0
+        self._lan_devices = rebuilt
+        self._lan_unmatched = list(unmatched)
+
+    async def _discover_devices(self) -> None:
+        """Discover all devices from Govee API."""
+        try:
+            devices = await self._api_client.get_devices()
+
+            _LOGGER.debug(
+                "API returned %d devices (enable_groups=%s)",
+                len(devices),
+                self._enable_groups,
+            )
+
+            for device in devices:
+                _LOGGER.debug(
+                    "Device: %s (%s) type=%s is_group=%s",
+                    device.name,
+                    device.device_id,
+                    device.device_type,
+                    device.is_group,
+                )
+                # Log capabilities for debugging segment issues
+                for cap in device.capabilities:
+                    _LOGGER.debug(
+                        "  Capability: type=%s instance=%s params=%s",
+                        cap.type,
+                        cap.instance,
+                        cap.parameters,
+                    )
+
+                # Filter group devices unless enabled
+                if device.is_group and not self._enable_groups:
+                    _LOGGER.debug(
+                        "Skipping group device: %s (device_id=%s) because enable_groups=False",
+                        device.name,
+                        device.device_id,
+                    )
+                    continue
+
+                if self._iot_credentials and device.sku.upper() in MQTT_COLOR_SKUS:
+                    # #240: the Platform API omits colorRgb for these SKUs; colour is sent over AWS IoT.
+                    device = device.with_synthetic_color_rgb()
+
+                _LOGGER.debug("Adding device to coordinator: %s", device.device_id)
+                self._devices[device.device_id] = device
+                # Create empty state for each device
+                self._states[device.device_id] = GoveeDeviceState.create_empty(device.device_id)
+                self._ensure_transport_health(device.device_id)
+
+            _LOGGER.debug(
+                "Discovered %d Govee devices (enable_groups=%s)",
+                len(self._devices),
+                self._enable_groups,
+            )
+
+            # Clean up scene caches for devices no longer discovered
+            self._scene_cache.cleanup_stale(set(self._devices))
+
+            # Scene cache is populated lazily via async_get_scenes() / async_get_diy_scenes()
+            # during entity setup, avoiding rate limit pressure at startup
+
+        except GoveeAuthError as err:
+            # Home Assistant starts its own reauth flow for this exception.
+            raise ConfigEntryAuthFailed("Invalid API key") from err
+        except GoveeApiError as err:
+            raise UpdateFailed(f"Failed to discover devices: {err}") from err
+
+    async def _async_maybe_rediscover_devices(self) -> None:
+        """Re-check the account device list and reload when new devices appear.
+
+        Device discovery is otherwise one-shot at setup, so a device added to
+        the Govee account after Home Assistant started stays invisible until a
+        manual reload (issue #101). Here we re-fetch the device list on a slow
+        cadence (``DEVICE_REDISCOVERY_INTERVAL``, to respect the API rate
+        limits); if any genuinely new device id appears, we schedule a config
+        entry reload, which re-runs the existing, tested discovery + platform
+        setup so the new entities are created.
+
+        Only additions trigger a reload — removals stay tied to reload/restart
+        and the existing orphan-cleanup pass, to keep entity churn minimal. The
+        method never raises: a discovery hiccup must not fail the state poll.
+        """
+        now = time.monotonic()
+        if now - self._last_rediscovery_check < DEVICE_REDISCOVERY_INTERVAL:
+            return
+        self._last_rediscovery_check = now
+
+        try:
+            devices = await self._api_client.get_devices()
+        except Exception as err:
+            # Non-fatal: the regular state poll continues on the known devices.
+            _LOGGER.debug("Periodic device re-discovery failed: %s", err)
+            return
+
+        # Apply the same group filter discovery uses, so a group device left
+        # disabled doesn't look "new" on every pass and reload-loop.
+        candidate_ids = {device.device_id for device in devices if not (device.is_group and not self._enable_groups)}
+        new_ids = candidate_ids - set(self._devices)
+        if not new_ids:
+            return
+
+        _LOGGER.info(
+            "Detected %d new Govee device(s) since startup (%s) — reloading the " "integration to add them (#101)",
+            len(new_ids),
+            ", ".join(sorted(new_ids)),
+        )
+        self.hass.config_entries.async_schedule_reload(self._config_entry.entry_id)
+
+    async def _start_mqtt(self) -> None:
+        """Start MQTT client for real-time updates."""
+        if not self._iot_credentials or self._shut_down:
+            return
+
+        self._mqtt_client = GoveeAwsIotClient(
+            credentials=self._iot_credentials,
+            on_state_update=self._on_mqtt_state_update,
+            on_give_up=self._on_mqtt_give_up,
+            on_connected=self._on_mqtt_connected,
+            on_disconnected=self._on_mqtt_disconnected,
+        )
+
+        if self._mqtt_client.available:
+            try:
+                await self._mqtt_client.async_start()
+                _LOGGER.debug("MQTT client started for real-time updates")
+                # The disconnect repair is cleared by _on_mqtt_connected once
+                # a session is actually up, not when the task is spawned.
+            except Exception as err:
+                _LOGGER.warning("MQTT client failed to start: %s", err)
+                async_create_mqtt_issue(self.hass, self._config_entry, str(err))
+        else:
+            _LOGGER.warning("MQTT library not available")
+
+    async def _start_openapi_events(self) -> None:
+        """Start the OpenAPI event-subscription client (issues #114, #118).
+
+        Subscribes to Govee's official event push channel with just the API
+        key. Every push lands in a diagnostics ring buffer (to capture event
+        shapes for new SKUs); known events are applied to device state.
+        """
+        try:
+            self._openapi_events_client = GoveeOpenApiEventClient(
+                api_key=self._api_client.api_key,
+                on_event=self._on_openapi_event,
+            )
+            await self._openapi_events_client.async_start()
+        except Exception as err:  # noqa: BLE001 — never fail setup for this
+            _LOGGER.warning("OpenAPI event channel failed to start: %s", err)
+            self._openapi_events_client = None
+
+    @callback
+    def _on_openapi_event(
+        self,
+        device_id: str,
+        sku: str,
+        instance: str,
+        state_list: list[dict[str, Any]],
+    ) -> None:
+        """Apply a devices.capabilities.event push from the OpenAPI channel.
+
+        Only well-understood events mutate state; everything else is already
+        captured in the client's diagnostics ring buffer for later decoding.
+
+        waterFullEvent semantics (Govee docs / govee2mqtt #145): fires with
+        value=1 when the bucket is full OR pulled out. Edge-triggered with no
+        documented "cleared" counterpart — confirmed live in #118 across two
+        pull→re-insert cycles: Govee never sends a cleared event, so the
+        latch is ended by the Clear Water Alert button (``clear_water_full``)
+        and survives restarts via the sensor's RestoreEntity plumbing
+        (``restore_water_full``). A value of 0 (if ever sent) is applied too,
+        and the developer-poll preserve block keeps the last event value
+        across polls. This replaces the BFF deviceSettings ``waterFull``
+        field, which turned out to be the app's "Full Bucket Alert"
+        notification *setting*, not live tank state (issue #118).
+        """
+        device = self._devices.get(device_id)
+        if device is None:
+            _LOGGER.debug("OpenAPI event for unknown device %s (%s)", device_id, sku)
+            return
+
+        value: int | None = None
+        for entry in state_list:
+            if isinstance(entry, dict) and entry.get("value") is not None:
+                try:
+                    value = int(entry["value"])
+                except (TypeError, ValueError):
+                    continue
+                break
+        if value is None:
+            return
+
+        if instance == "waterFullEvent":
+            state = self._get_or_create_state(device_id)
+            state.water_full = bool(value)
+            self._water_full_changed_at[device_id] = dt_util.utcnow()
+            _LOGGER.debug("Water tank full event for %s (%s): %s", device_id, sku, bool(value))
+            self.async_set_updated_data(self._states)
+            return
+
+        # bodyAppearedEvent fires for BOTH transitions on presence sensors:
+        # value 1 = Presence, 2 = Absence (Govee Subscribe Device Event docs,
+        # issue #124). SKU-locked to presence sensors — the H5054 water
+        # detector shares this instance but means "leak" (see below).
+        if instance == "bodyAppearedEvent" and device.supports_presence_event:
+            state = self._get_or_create_state(device_id)
+            state.presence = value == 1
+            _LOGGER.debug(
+                "Presence event for %s (%s): %s",
+                device_id,
+                sku,
+                "present" if value == 1 else "absent",
+            )
+            self.async_set_updated_data(self._states)
+            return
+
+        # H5054 water detectors reuse the same bodyAppearedEvent instance to
+        # report a leak trip: value 1 = LEAKED (wet), 2 = UN_LEAKED (dry),
+        # mirroring the presence 1/2 encoding (issue #138). This is the
+        # real-time path; the warnMessage BFF poll remains the fallback that
+        # backstops missed pushes and covers the initial state.
+        if instance == "bodyAppearedEvent" and device.supports_water_leak_event:
+            state = self._get_or_create_state(device_id)
+            state.water_leak = value == 1
+            _LOGGER.debug(
+                "Water-leak event for %s (%s): %s",
+                device_id,
+                sku,
+                "wet" if value == 1 else "dry",
+            )
+            self.async_set_updated_data(self._states)
+
+    def _get_or_create_state(self, device_id: str) -> GoveeDeviceState:
+        """Return the device's state object, creating an empty one if needed."""
+        state = self._states.get(device_id)
+        if state is None:
+            state = GoveeDeviceState.create_empty(device_id)
+            self._states[device_id] = state
+        return state
+
+    def water_full_changed_at(self, device_id: str) -> datetime | None:
+        """When the water-tank-full alert last changed (#118).
+
+        Stamped on every ``waterFullEvent`` push and on every manual clear —
+        exposed as the sensor's ``changed_at`` attribute so users can build
+        their own time-based automations. Returns None until an event or
+        clear has been seen.
+
+        Args:
+            device_id: Device identifier.
+
+        Returns:
+            UTC timestamp of the last event/clear, or None.
+        """
+        return self._water_full_changed_at.get(device_id)
+
+    @callback
+    def clear_water_full(self, device_id: str) -> None:
+        """Clear the latched water-tank-full alert (user action, #118).
+
+        Govee never pushes a "cleared" waterFullEvent (confirmed live across
+        two pull→re-insert cycles), so the user acknowledges the alert via
+        the Clear Water Alert button after emptying/re-inserting the tank.
+        A later value=1 event re-latches the sensor.
+
+        Args:
+            device_id: Device identifier.
+        """
+        state = self._get_or_create_state(device_id)
+        state.water_full = False
+        self._water_full_changed_at[device_id] = dt_util.utcnow()
+        _LOGGER.debug("Water-tank-full alert cleared for %s (user action, #118)", device_id)
+        self.async_set_updated_data(self._states)
+
+    @callback
+    def restore_water_full(self, device_id: str, is_full: bool, changed_at: datetime | None) -> None:
+        """Restore the water-tank-full latch across HA restarts (#118).
+
+        Applied only when the live value is still None — a live event that
+        landed before entity-add must win over the restored snapshot. Does
+        NOT notify listeners: this runs during entity add and the entity
+        writes its own first state.
+
+        Args:
+            device_id: Device identifier.
+            is_full: Restored alert state (True = tank full/pulled).
+            changed_at: Restored ``changed_at`` timestamp, if it survived.
+        """
+        state = self._get_or_create_state(device_id)
+        if state.water_full is not None:
+            return
+        state.water_full = is_full
+        if changed_at is not None:
+            self._water_full_changed_at.setdefault(device_id, changed_at)
+
+    def schedule_account_login_retry(self) -> None:
+        """Arm the next background retry of a setup login that failed transiently.
+
+        Called by the entry setup once the first refresh succeeded, so a setup
+        that ends in ConfigEntryNotReady never leaves a timer behind (the
+        retried setup logs in again itself).
+        """
+        if self._login_retry_unsub:
+            self._login_retry_unsub()
+            self._login_retry_unsub = None
+        if self._shut_down:
+            return
+        delay = self._login_retry_delay
+        self._login_retry_delay = min(delay * 2, ACCOUNT_LOGIN_RETRY_MAX_INTERVAL)
+        self._login_retry_unsub = async_call_later(self.hass, delay, self._account_login_retry_callback)
+
+    async def _account_login_retry_callback(self, _now: Any = None) -> None:
+        """Timer callback: retry the account login once."""
+        self._login_retry_unsub = None
+        await self._async_retry_account_login()
+
+    async def _async_retry_account_login(self) -> None:
+        """Retry an account login that failed at setup with a network error.
+
+        A network or DNS error at boot used to leave real-time updates off
+        until the next restart. This retries on a backing-off timer while the
+        failure stays network-level: success stores the credentials and
+        reloads the entry so MQTT, device topics and the account-only sensors
+        all start. Any other outcome (bad password, 2FA, login refused, a
+        malformed answer after the password was accepted) stores the failure
+        marker, raises the repair and stops retrying, since it would fail the
+        same way again and repeated logins trip Govee's 2FA hardening.
+        """
+        if self._iot_credentials:
+            return
+        email = self._config_entry.data.get(CONF_EMAIL)
+        password = self._config_entry.data.get(CONF_PASSWORD)
+        if not email or not password:
+            return
+
+        credentials: GoveeIotCredentials | None = None
+        error: Exception | None = None
+        try:
+            async with GoveeAuthClient(hass=self.hass) as auth_client:
+                credentials = await auth_client.login(
+                    email,
+                    password,
+                    client_id=_derive_client_id(email),
+                )
+        except Exception as err:  # noqa: BLE001 - classified below
+            error = err
+
+        if self._shut_down:
+            # The entry unloaded (reload, reconfigure, removal) while the login
+            # was in flight. Whatever came back belongs to a dead coordinator:
+            # writing a marker or a repair, or reloading, would act on the new
+            # entry with a stale result, or resurrect a removed one.
+            return
+        if isinstance(error, Govee2FARequiredError):
+            _LOGGER.warning(
+                "Govee account requires email verification (2FA). Use Reconfigure to "
+                "enter a verification code; continuing with polling-only mode"
+            )
+            self._persist_login_failed(LOGIN_FAILED_2FA)
+            self._async_create_iot_reauth_issue("mqtt_2fa_required")
+            # The setup-time "sign-in failed" repair offers a retry that would
+            # only hit 2FA again; the 2FA repair replaces it.
+            async_delete_mqtt_issue(self.hass, self._config_entry)
+            return
+        if error is not None and is_connection_error(error):
+            _LOGGER.debug("Account login retry failed, will try again in %ds: %s", int(self._login_retry_delay), error)
+            self.schedule_account_login_retry()
+            return
+        if error is not None or credentials is None:
+            _LOGGER.warning("Failed to get MQTT credentials: %s", error)
+            self._persist_login_failed(str(error))
+            async_create_mqtt_issue(self.hass, self._config_entry, f"account sign-in failed: {error}")
+            return
+
+        _LOGGER.debug("Account login succeeded on retry; reloading to start real-time updates")
+        self._persist_refreshed_credentials(credentials)
+        self.hass.config_entries.async_schedule_reload(self._config_entry.entry_id)
+
+    def _persist_login_failed(self, reason: str) -> None:
+        """Store the login-failure marker so later setups skip the login."""
+        new_data = dict(self._config_entry.data)
+        new_data[KEY_IOT_LOGIN_FAILED] = reason
+        self.hass.config_entries.async_update_entry(self._config_entry, data=new_data)
+
+    async def _async_refresh_iot_credentials(self) -> bool:
+        """Log in again to replace an account token the BFF has stopped accepting.
+
+        The token obtained at setup is cached in ``entry.data`` and reused
+        indefinitely — nothing ever refreshed it, and the stored
+        ``refresh_token`` was never used at all. When it eventually expires,
+        every BFF call fails while MQTT keeps working (it authenticates with
+        long-lived certificates, not this token), so the integration looks
+        healthy while battery levels and gateway-bridged readings quietly stop
+        (issue #132).
+
+        Re-logging in with the stored credentials is the recovery. Throttled to
+        one attempt per ``IOT_RELOGIN_MIN_INTERVAL`` so a persistent failure
+        can't hammer Govee's login endpoint — repeated logins are also what
+        triggers their 2FA hardening, which would turn a recoverable problem
+        into one needing the user.
+
+        Returns:
+            True when new credentials were obtained and stored.
+        """
+        email = self._config_entry.data.get(CONF_EMAIL)
+        password = self._config_entry.data.get(CONF_PASSWORD)
+        if not email or not password:
+            # API-key-only setup: nothing to log in with, and no BFF data was
+            # ever expected. Nothing to recover.
+            return False
+        if self._relogin_disabled:
+            return False
+
+        now = time.monotonic()
+        interval = min(IOT_RELOGIN_MIN_INTERVAL * 2**self._relogin_rejections, IOT_RELOGIN_MAX_INTERVAL)
+        if (now - self._last_iot_relogin) < interval:
+            _LOGGER.debug("Skipping IoT re-login: attempted too recently")
+            return False
+        self._last_iot_relogin = now
+
+        _LOGGER.info("Account token rejected by the BFF — logging in again (#132)")
+        try:
+            async with GoveeAuthClient(hass=self.hass) as auth_client:
+                credentials = await auth_client.login(
+                    email,
+                    password,
+                    client_id=_derive_client_id(email),
+                )
+        except Govee2FARequiredError:
+            # Can't be solved here — a verification code needs the user. Say so
+            # once, loudly, instead of failing every poll in silence.
+            _LOGGER.warning(
+                "Account token expired and re-login needs email verification. "
+                "Use Reconfigure to enter a new verification code; "
+                "battery levels and gateway-bridged sensor readings stay "
+                "unavailable until then."
+            )
+            self._relogin_disabled = True
+            self._persist_login_failed(LOGIN_FAILED_2FA)
+            self._async_create_iot_reauth_issue("mqtt_2fa_required")
+            return False
+        except (GoveeAuthError, Govee2FACodeInvalidError) as err:
+            self._relogin_disabled = True
+            self._persist_login_failed(str(err))
+            _LOGGER.warning(
+                "Account token expired and re-login was rejected: %s. "
+                "Use Reconfigure to update the account credentials.",
+                err,
+            )
+            self._async_create_iot_reauth_issue("mqtt_token_expired")
+            return False
+        except GoveeLoginRejectedError as err:
+            # Any non-200 answer lands here, outages included: back off, never latch.
+            self._relogin_rejections += 1
+            _LOGGER.warning("Account re-login was rejected: %s", err)
+            return False
+        except Exception as err:
+            self._relogin_rejections += 1
+            _LOGGER.warning("Account re-login failed: %s", err)
+            return False
+
+        self._relogin_rejections = 0
+        self._iot_credentials = credentials
+        self._persist_refreshed_credentials(credentials)
+        ir.async_delete_issue(self.hass, DOMAIN, f"mqtt_token_expired_{self._config_entry.entry_id}")
+        _LOGGER.info("Account token refreshed — BFF data should resume")
+        # Hand the new material to the transport that authenticates with it.
+        # A running client restarts only if cert/key/topic actually changed;
+        # a client that never started (login failed at boot) starts now.
+        if self._mqtt_client is not None:
+            await self._mqtt_client.async_restart(credentials)
+        else:
+            await self._start_mqtt()
+        return True
+
+    def _persist_refreshed_credentials(self, credentials: GoveeIotCredentials) -> None:
+        """Store refreshed credentials in ``entry.data`` so a reload reuses them.
+
+        Mirrors ``_persist_iot_credentials`` in ``__init__.py``; kept here
+        rather than imported to avoid a circular import between the coordinator
+        and the integration entry point.
+        """
+        new_data = dict(self._config_entry.data)
+        new_data[KEY_IOT_CREDENTIALS] = dataclasses.asdict(credentials)
+        new_data.pop(KEY_IOT_LOGIN_FAILED, None)
+        self.hass.config_entries.async_update_entry(self._config_entry, data=new_data)
+
+    def _async_create_iot_reauth_issue(self, translation_key: str) -> None:
+        """Surface a repair when only the user can restore BFF access."""
+        ir.async_create_issue(
+            self.hass,
+            DOMAIN,
+            f"{translation_key}_{self._config_entry.entry_id}",
+            is_fixable=False,
+            severity=ir.IssueSeverity.WARNING,
+            translation_key=translation_key,
+            translation_placeholders={"entry_title": self._config_entry.title},
+        )
+
+    async def _async_bff_call(
+        self,
+        operation: Callable[[GoveeAuthClient, str], Awaitable[Any]],
+        description: str,
+    ) -> Any:
+        """Run a BFF call, re-logging in once if the token has expired (#132).
+
+        ``operation`` receives an open client and the current token, so a
+        caller that also needs client-side extras (the diagnostics census, the
+        gateway routes) can collect them before the client closes.
+
+        A ``GoveeAuthError`` here means the token was rejected — either as an
+        HTTP 401 or as the in-body error envelope Govee returns with HTTP 200
+        (see ``_raise_for_bff_status``). Both are recoverable by logging in
+        again, so that is tried exactly once; anything the retry raises reaches
+        the caller's own error handling unchanged.
+        """
+        if not self._iot_credentials:
+            return None
+
+        try:
+            async with GoveeAuthClient(hass=self.hass) as auth_client:
+                return await operation(auth_client, self._iot_credentials.token)
+        except GoveeAuthError as err:
+            _LOGGER.debug("BFF %s rejected the token: %s", description, err)
+
+        credentials = self._iot_credentials if await self._async_refresh_iot_credentials() else None
+        if credentials is None:
+            return None
+
+        async with GoveeAuthClient(hass=self.hass) as auth_client:
+            return await operation(auth_client, credentials.token)
+
+    async def _fetch_device_topics(self) -> None:
+        """Fetch device-specific MQTT topics from undocumented Govee API.
+
+        These topics are required for publishing commands (ptReal, etc).
+        Device targeting via payload alone doesn't work - AWS IoT requires
+        publishing to the device's specific topic.
+        """
+        if not self._iot_credentials:
+            return
+
+        async def _op(auth_client: GoveeAuthClient, token: str) -> None:
+            self._device_topics = await auth_client.fetch_device_topics(token)
+            # Gateway-attached BLE devices only act on commands published to
+            # their gateway's topic, not their own (#135).
+            self._gateway_routes = auth_client.gateway_routes()
+            _LOGGER.debug(
+                "Fetched MQTT topics for %d devices (%d via a gateway)",
+                len(self._device_topics),
+                len(self._gateway_routes),
+            )
+
+        try:
+            await self._async_bff_call(_op, "device topics")
+        except GoveeApiError as err:
+            _LOGGER.warning("Failed to fetch device topics: %s", err)
+            # Continue without device topics - ptReal commands won't work
+            # but the integration can still function with polling
+        except Exception as err:
+            _LOGGER.warning("Unexpected error fetching device topics: %s", err)
+
+    async def _discover_leak_sensors(self) -> None:
+        """Discover leak sensor sub-devices via BFF API.
+
+        Reuses the app2 IoT token (already obtained for MQTT) to call the
+        BFF device list endpoint. No additional login required.
+        """
+        if not self._iot_credentials:
+            return
+
+        async def _op(auth_client: GoveeAuthClient, token: str) -> Any:
+            result = await auth_client.fetch_bff_leak_sensors(token)
+            # Capture the PII-free census + skeleton before the client
+            # closes (#87).
+            self._bff_device_census = auth_client.bff_device_census()
+            self._bff_response_skeleton = auth_client.bff_response_skeleton()
+            self._bff_device_values = auth_client.bff_device_values()
+            return result
+
+        try:
+            # A short-lived auth client per call, consistent with
+            # _fetch_device_topics(). The hass= param shares HA's managed
+            # aiohttp.ClientSession, so no new TCP connections are created.
+            fetched = await self._async_bff_call(_op, "leak-sensor list")
+            if fetched is None:
+                return
+            sensor_data, hub_data, thermo_readings = fetched
+
+            self._leak_hubs = hub_data
+            for sensor in sensor_data:
+                leak_sensor = GoveeLeakSensor(
+                    device_id=sensor["device_id"],
+                    name=sensor["name"],
+                    sku=sensor["sku"],
+                    hub_device_id=sensor["hub_device_id"],
+                    sno=sensor["sno"],
+                    hw_version=sensor.get("hw_version", ""),
+                    sw_version=sensor.get("sw_version", ""),
+                )
+                self._leak_sensors[leak_sensor.device_id] = leak_sensor
+
+                # Initialize state from BFF data
+                state = GoveeLeakSensorState()
+                state.battery = sensor.get("battery")
+                state.online = sensor.get("online", True)
+                state.gateway_online = sensor.get("gateway_online", True)
+                state.last_wet_time = sensor.get("last_wet_time")
+                state.read = sensor.get("read", True)
+                self._leak_states[leak_sensor.device_id] = state
+
+                self._sno_to_sensor_id[(leak_sensor.hub_device_id, leak_sensor.sno)] = leak_sensor.device_id
+
+            if self._leak_sensors:
+                _LOGGER.debug(
+                    "Discovered %d leak sensors across %d hubs",
+                    len(self._leak_sensors),
+                    len({s.hub_device_id for s in self._leak_sensors.values()}),
+                )
+
+            # Track which Developer-API thermometers (e.g. H5110 via H5151/H5044)
+            # the BFF list carries a reading for. We DON'T apply the BFF value:
+            # the BFF `tem`/`hum` scale varies by gateway/firmware (tenths vs
+            # hundredths) and a fixed divisor mis-scaled humidity 10x (#102).
+            # The BFF call is kept purely as a *tickle* — it nudges Govee's cloud
+            # to refresh the Developer `/device/state` reading, which the regular
+            # poll then picks up correctly (and with the right °C/°F handling).
+            # This set only gates whether the 5-min tickle poll runs (#83).
+            self._thermo_bff_devices = set(thermo_readings) & set(self._devices)
+            if self._thermo_bff_devices:
+                _LOGGER.debug(
+                    "BFF tickle enabled for %d thermometer device(s); readings " "come from the Developer API poll",
+                    len(self._thermo_bff_devices),
+                )
+
+            # Battery is the one BFF field we DO apply for these thermometers:
+            # the Developer API never exposes it, and unlike tem/hum it's a plain
+            # 0-100 int with no gateway-dependent scale (#83 follow-up).
+            self._apply_bff_thermo_battery(thermo_readings)
+
+            # Start the 5-min BFF poll if we have leak sensors OR thermometers
+            # whose readings we refresh via the BFF tickle (#83) — or a battery
+            # reading that simply hasn't arrived yet, which is the only thing
+            # that would ever create the battery entity (issue #132).
+            if self._leak_sensors or self._thermo_bff_devices or self._battery_candidate_devices():
+                self._schedule_bff_poll()
+
+        except Exception as err:
+            _LOGGER.warning("Failed to discover leak sensors: %s", err)
+            # Non-fatal: integration continues without leak sensors
+
+    def _record_local_command(
+        self,
+        device_id: str,
+        sku: str,
+        transport: str,
+        command: DeviceCommand,
+        *,
+        delivered: bool,
+        detail: str | None = None,
+    ) -> None:
+        """Mirror a LAN/MQTT/BLE send into the diagnostics command history.
+
+        Best-effort: diagnostics must never be able to break a control write.
+        """
+        try:
+            self._api_client.record_local_command(
+                device_id,
+                sku,
+                transport,
+                command.to_api_payload(),
+                delivered=delivered,
+                detail=detail,
+            )
+        except Exception:  # pragma: no cover - defensive
+            _LOGGER.debug("Could not record %s command for %s", transport, device_id)
+
+    def _battery_candidate_devices(self) -> set[str]:
+        """Devices that could still gain a battery reading from the BFF.
+
+        The BFF is the only source of battery for gateway-bridged thermometers
+        (#83). If the first discovery pass came back without a reading for one —
+        a transient hiccup, or a hub that hadn't reported yet — nothing else
+        would ever look again, and the battery entity would never be created
+        (issue #132, H5109 behind an H5042). Keeping these in scope lets the
+        5-min poll retry.
+        """
+        candidates: set[str] = set()
+        for device_id, device in self._devices.items():
+            if not device.is_thermometer:
+                continue
+            if device.device_type in MAINS_POWERED_DEVICE_TYPES or device.sku.upper() in MAINS_POWERED_BATTERY_SKUS:
+                continue
+            state = self._states.get(device_id)
+            if state is None or state.battery is None:
+                candidates.add(device_id)
+        return candidates
+
+    def _apply_bff_thermo_battery(
+        self,
+        thermo_readings: dict[str, dict[str, Any]],
+        *,
+        allow_reload: bool = False,
+    ) -> None:
+        """Apply BFF-reported battery to devices.
+
+        The Developer API doesn't expose battery for BLE-bridged sensors (e.g.
+        H5110 via an H5151/H5044 gateway), but the BFF ``deviceSettings``
+        carries it. Unlike the BFF ``tem``/``hum`` (scale varies by gateway —
+        used only as a tickle, #102), battery is a plain 0-100 int, so it's
+        safe to store. Devices whose BFF entry omits a value are left
+        untouched, so no entity shows a stale reading (issues #83, #118).
+
+        Battery is skipped for mains-powered devices — both by device_type and
+        by an explicit SKU list (the H5106 air-quality monitor reports a bogus
+        ``battery: 100`` while plugged in but doesn't carry a mains device_type)
+        — so they don't surface a misleading 100% battery sensor (issues #125,
+        #114).
+
+        ``sensor.py`` only creates ``GoveeThermoBatterySensor`` once, at
+        platform setup, when ``state.battery is not None`` at that instant. If
+        the BFF call this method's data came from failed or was still in
+        flight at startup (issue #132 — a transient hiccup coincident with the
+        restart an update triggers), the entity is silently skipped forever;
+        the periodic BFF poll would keep refreshing ``state.battery`` with
+        nothing to show it. When ``allow_reload`` is set (the periodic-poll
+        call site, never the initial-discovery one — entities don't exist yet
+        during discovery, so there's nothing to have missed), a device that
+        gains its first-ever battery reading after startup schedules one
+        reload, mirroring the newly-added-leak-sensor handling above.
+        """
+        newly_battery_capable: list[str] = []
+        for dev_id in set(thermo_readings) & set(self._devices):
+            state = self._states.get(dev_id)
+            if state is None:
+                continue
+            device = self._devices.get(dev_id)
+            reading = thermo_readings[dev_id]
+
+            battery = reading.get("battery")
+            if battery is not None and (
+                device is None
+                or (
+                    device.device_type not in MAINS_POWERED_DEVICE_TYPES
+                    and device.sku.upper() not in MAINS_POWERED_BATTERY_SKUS
+                )
+            ):
+                if state.battery is None:
+                    newly_battery_capable.append(dev_id)
+                try:
+                    state.battery = int(battery)
+                except (TypeError, ValueError):
+                    pass
+
+        if allow_reload and newly_battery_capable and not self._battery_reload_scheduled:
+            self._battery_reload_scheduled = True
+            _LOGGER.info(
+                "Battery reading now available for %d thermometer(s) that had "
+                "none at startup (%s) — reloading the integration to add the "
+                "sensor (#132)",
+                len(newly_battery_capable),
+                ", ".join(sorted(newly_battery_capable)),
+            )
+            self.hass.config_entries.async_schedule_reload(self._config_entry.entry_id)
+
+            # NOTE: the BFF ``deviceSettings.waterFull`` field is deliberately
+            # NOT applied here anymore. It is the app's "Full Bucket Alert"
+            # notification *setting* (0/1 toggle), not live tank state —
+            # applying it produced a permanent false "Problem" for users with
+            # the alert enabled (issues #118, #114; confirmed against the
+            # H7150 manual and govee2mqtt's DeviceSettings schema). Live tank
+            # state now comes from the OpenAPI waterFullEvent push
+            # (_on_openapi_event).
+
+    def _note_display_unit(self, device_id: str, sensor: dict[str, Any]) -> None:
+        """Record the account's ``fahOpen`` display preference for a device.
+
+        Only stored when Govee actually reported the flag — a missing value must
+        stay missing so the SKU allowlist keeps its say (issue #157).
+        """
+        fah_open = sensor.get("fah_open")
+        if isinstance(fah_open, bool):
+            self._display_fahrenheit[device_id] = fah_open
+
+    def _bff_reading_is_stale(self, device_id: str, sensor: dict[str, Any]) -> bool:
+        """Whether a BFF reading is older than the frame already applied (#151).
+
+        Returns False whenever the question can't be answered — no frame seen
+        for this device, or no ``lastTime`` in the payload — so the only
+        behaviour that changes is the one case we can prove is stale.
+        """
+        frame_ts = self._thermo_frame_ts.get(device_id)
+        if frame_ts is None:
+            return False
+        last_time = sensor.get("last_time")
+        if not isinstance(last_time, int) or last_time <= 0:
+            return False
+        # lastTime is epoch milliseconds; the frame stamp is epoch seconds.
+        return (last_time // 1000) <= frame_ts
+
+    def _note_thermo_slot(self, device_id: str, sensor: dict[str, Any]) -> None:
+        """Map a gateway slot to this thermometer so its frames can be routed.
+
+        The hub's multiSync thermo frames carry only the slot (``sno``), never
+        the sub-device id, so without this pairing a decoded reading has
+        nowhere to go (issue #151). Registered for every BFF-listed
+        thermometer, including ones still on the Developer poll — the frame
+        path is a reading source, not an ownership claim.
+        """
+        hub_device_id = sensor.get("hub_device_id") or ""
+        sno = sensor.get("sno")
+        if not hub_device_id or not isinstance(sno, int) or isinstance(sno, bool):
+            return
+        self._sno_to_thermo_id[(hub_device_id, sno)] = device_id
+
+    def _note_bff_push_evidence(self, device_id: str, sensor: dict[str, Any]) -> None:
+        """Count a gateway reading the cloud got while this MQTT session got nothing (#222).
+
+        The hub pushes each bridged thermometer reading on the account topic
+        before the cloud copy reaches the BFF list. A reading newer than the
+        last one seen and than the session's start, with no inbound message
+        since connect, is a push Govee sent that this session did not deliver.
+        The first sighting of a device only seeds the comparison.
+        """
+        last_time = sensor.get("last_time")
+        if isinstance(last_time, bool) or not isinstance(last_time, int) or last_time <= 0:
+            return
+        previous = self._bff_last_time_seen.get(device_id)
+        self._bff_last_time_seen[device_id] = last_time
+        if previous is None or last_time <= previous:
+            return
+        sno = sensor.get("sno")
+        if not sensor.get("hub_device_id") or not isinstance(sno, int) or isinstance(sno, bool):
+            return
+        client = self._mqtt_client
+        since = client.connected_since if client is not None and client.connected else None
+        if since is None or client is None or client.inbound_total > self._mqtt_inbound_at_connect:
+            return
+        seconds = last_time / 1000 if last_time > 10**11 else last_time
+        if seconds <= since.timestamp():
+            return
+        self._mqtt_missed_pushes_since_connect += 1
+
+    async def _async_check_missed_pushes(self) -> None:
+        """Handle a silent session proven by missed gateway pushes; the one-shot timer may be long gone (#222)."""
+        if self._mqtt_missed_pushes_since_connect < MQTT_SILENT_MIN_MISSED_PUSHES:
+            return
+        client = self._mqtt_client
+        if client is None or not client.connected or client.inbound_total > self._mqtt_inbound_at_connect:
+            return
+        since = client.connected_since
+        if since is None or (datetime.now(timezone.utc) - since).total_seconds() < MQTT_SILENT_CHECK_DELAY:
+            return
+        await self._async_handle_silent_session(self._missed_pushes_evidence())
+
+    def _missed_pushes_evidence(self) -> str:
+        return f"while {self._mqtt_missed_pushes_since_connect} gateway readings reached the cloud"
+
+    async def _discover_bff_thermometers(self) -> None:
+        """Discover thermo-hygrometers (H5301) via the BFF device list (issue #86).
+
+        These battery WiFi sensors are absent from the Developer API
+        ``/user/devices`` list, so capability-based discovery never sees them and
+        they "don't show up". The account-login BFF list returns them; we
+        synthesize a thermometer ``GoveeDevice`` for each and inject it into
+        ``self._devices`` (before platform setup) so the existing temperature /
+        humidity sensor entities attach. Reuses the app2 IoT token, like
+        ``_discover_leak_sensors``. Non-fatal on error.
+        """
+        if not self._iot_credentials:
+            return
+
+        async def _op(auth_client: GoveeAuthClient, token: str) -> Any:
+            result = await auth_client.fetch_bff_thermo_hygrometers(token)
+            # Refresh the PII-free census so a diagnostics download shows the
+            # thermo-hygro SKU flags even when no leak sensors are present.
+            self._bff_device_census = auth_client.bff_device_census()
+            self._bff_response_skeleton = auth_client.bff_response_skeleton()
+            self._bff_device_values = auth_client.bff_device_values()
+            return result
+
+        try:
+            sensors = await self._async_bff_call(_op, "thermo-hygrometer list")
+            if sensors is None:
+                return
+
+            for sensor in sensors:
+                device_id = sensor["device_id"]
+                if not device_id:
+                    continue
+
+                self._note_display_unit(device_id, sensor)
+                self._note_thermo_slot(device_id, sensor)
+                self._note_bff_last_measurement(device_id, sensor)
+
+                # A device already discovered via the Developer API (e.g. the
+                # H5179 WiFi thermometer, #141) whose live reading only comes
+                # from the BFF lastDeviceData — the Developer poll returns empty
+                # strings. Route it through the BFF path (owns its state, skips
+                # the futile Developer poll via _bff_thermometer_ids) instead of
+                # synthesizing a duplicate device.
+                #
+                # Only hand the device over once the BFF has actually produced a
+                # reading, though. Some gateway-bridged units are listed with an
+                # empty lastDeviceData (issue #151), and claiming those would
+                # silence a Developer poll that does work, leaving the sensor
+                # permanently unknown. _refresh_bff_thermometers takes over later
+                # if a reading does show up.
+                if device_id in self._devices:
+                    if (
+                        sensor.get("temperature") is None
+                        and sensor.get("temperature_2") is None
+                        and sensor.get("humidity") is None
+                    ):
+                        _LOGGER.debug(
+                            "BFF thermo %s (%s) has no reading — leaving it on the " "Developer API poll (issue #151)",
+                            sensor.get("name", device_id),
+                            sensor.get("sku", "?"),
+                        )
+                        self._bff_thermo_pending.add(device_id)
+                        continue
+                    self._bff_thermometer_ids.add(device_id)
+                    state = self._states.get(device_id) or GoveeDeviceState.create_empty(device_id)
+                    state.online = sensor.get("online", state.online)
+                    if sensor.get("temperature") is not None:
+                        state.sensor_temperature = sensor.get("temperature")
+                    if sensor.get("temperature_2") is not None:
+                        state.sensor_temperature_2 = sensor.get("temperature_2")
+                    if sensor.get("humidity") is not None:
+                        state.sensor_humidity = sensor.get("humidity")
+                    if sensor.get("battery") is not None:
+                        state.battery = sensor.get("battery")
+                    self._states[device_id] = state
+                    if state.sensor_temperature is not None or state.sensor_humidity is not None:
+                        self._sensor_reading_changed_at[device_id] = dt_util.utcnow()
+                    continue
+
+                if sensor["sku"] in PROBE_THERMOMETER_BFF_SKUS:
+                    self._devices[device_id] = GoveeDevice.synthetic_probe_thermometer(
+                        device_id=device_id,
+                        sku=sensor["sku"],
+                        name=sensor["name"],
+                    )
+                    # Membership here buys three things at once: the
+                    # Developer poll skips the device (it 404s on this SKU),
+                    # the availability mixin ignores the flapping online
+                    # flag, and readings count as already-Celsius.
+                    self._bff_thermometer_ids.add(device_id)
+                    state = GoveeDeviceState.create_empty(device_id)
+                    state.online = sensor.get("online", True)
+                    self._states[device_id] = state
+                    self._ensure_transport_health(device_id)
+                    continue
+
+                hub_device_id = sensor.get("hub_device_id", "")
+                device = GoveeDevice.synthetic_thermometer(
+                    device_id=device_id,
+                    sku=sensor["sku"],
+                    name=sensor["name"],
+                    hub_device_id=hub_device_id,
+                )
+                self._devices[device_id] = device
+                self._bff_thermometer_ids.add(device_id)
+                if hub_device_id:
+                    self._bff_thermo_hubs[hub_device_id] = {
+                        "sku": sensor.get("hub_sku", ""),
+                    }
+
+                state = GoveeDeviceState.create_empty(device_id)
+                state.online = sensor.get("online", True)
+                state.sensor_temperature = sensor.get("temperature")
+                state.sensor_temperature_2 = sensor.get("temperature_2")
+                state.sensor_humidity = sensor.get("humidity")
+                state.battery = sensor.get("battery")
+                self._states[device_id] = state
+                self._ensure_transport_health(device_id)
+                if state.sensor_temperature is not None or state.sensor_humidity is not None:
+                    self._sensor_reading_changed_at[device_id] = dt_util.utcnow()
+
+            if self._bff_thermometer_ids or self._bff_thermo_pending:
+                _LOGGER.debug(
+                    "Discovered %d BFF thermo-hygrometers (issue #86)",
+                    len(self._bff_thermometer_ids),
+                )
+                # Reuse the 5-min BFF poll loop to refresh readings — also for
+                # the devices still on the Developer poll, so one of them can be
+                # promoted the moment the BFF starts reporting (#151).
+                self._schedule_bff_poll()
+
+        except Exception as err:
+            _LOGGER.warning("Failed to discover BFF thermo-hygrometers: %s", err)
+            # Non-fatal: integration continues without these sensors.
+
+    async def _refresh_bff_thermometers(self) -> None:
+        """Refresh temp/humidity readings for BFF thermo-hygrometers (issue #86)."""
+        if not self._iot_credentials:
+            return
+        if not self._bff_thermometer_ids and not self._bff_thermo_pending:
+            return
+
+        try:
+            sensors = await self._async_bff_call(
+                lambda client, token: client.fetch_bff_thermo_hygrometers(token),
+                "thermo-hygrometer refresh",
+            )
+        except Exception as err:
+            _LOGGER.debug("BFF thermo-hygrometer refresh failed: %s", err)
+            return
+        if sensors is None:
+            return
+
+        changed = False
+        for sensor in sensors:
+            device_id = sensor["device_id"]
+            self._note_display_unit(device_id, sensor)
+            self._note_bff_last_measurement(device_id, sensor)
+            self._note_bff_push_evidence(device_id, sensor)
+
+            # A device parked on the Developer poll because the BFF had nothing
+            # for it (#151) takes over here as soon as a reading appears.
+            if device_id in self._bff_thermo_pending:
+                if (
+                    sensor.get("temperature") is None
+                    and sensor.get("temperature_2") is None
+                    and sensor.get("humidity") is None
+                ):
+                    continue
+                _LOGGER.debug(
+                    "BFF now reports %s — taking over its readings from the " "Developer API poll (issue #151)",
+                    sensor.get("name", device_id),
+                )
+                self._bff_thermo_pending.discard(device_id)
+                self._bff_thermometer_ids.add(device_id)
+
+            # Probe thermometers never take part in this refresh. It
+            # rebuilds state from create_empty() and copies only
+            # temp/humidity/battery, which would drop ``probes`` every five
+            # minutes — the readings only the MQTT frames carry. Their BFF
+            # entry has no reading to offer anyway.
+            #
+            # Gated on the SKU in the payload rather than on the device
+            # object: this runs before discovery has necessarily put the
+            # device in the registry, and the payload is the same source
+            # discovery itself reads.
+            if sensor.get("sku") in PROBE_THERMOMETER_BFF_SKUS:
+                continue
+
+            existing = self._states.get(device_id)
+            if existing is None:
+                continue
+            new_state = GoveeDeviceState.create_empty(device_id)
+            new_state.online = sensor.get("online", True)
+
+            # The gateway's own MQTT frame reaches us before the cloud's copy
+            # of the same reading does — measured at ~8 minutes on an H5310
+            # via H5044. Inside that window this poll still returns the
+            # PREVIOUS hour's value, so applying it overwrote a fresh frame
+            # with a stale reading for ~5 minutes of every hour: an hourly
+            # sawtooth that reads as a sensor fault, and a burst of state
+            # writes for a value that had not actually changed (#151).
+            #
+            # Both sides timestamp their reading device-side — the frame in
+            # its bytes 9-12, the BFF as lastTime — so they are directly
+            # comparable. A reading no newer than the last frame we applied is
+            # the cloud catching up, not new information. Devices without a
+            # frame (no gateway, or none seen yet) are unaffected, as are
+            # accounts whose BFF omits lastTime.
+            if self._bff_reading_is_stale(device_id, sensor):
+                _LOGGER.debug(
+                    "Ignoring BFF reading for %s: not newer than the frame " "already applied (#151)",
+                    sensor.get("name", device_id),
+                )
+                new_state.sensor_temperature = existing.sensor_temperature
+                new_state.sensor_temperature_2 = existing.sensor_temperature_2
+                new_state.sensor_humidity = existing.sensor_humidity
+                new_state.battery = sensor.get("battery") if sensor.get("battery") is not None else existing.battery
+                self._states[device_id] = new_state
+                continue
+
+            # Preserve last good reading when the BFF omits it this cycle —
+            # battery WiFi sensors upload infrequently.
+            new_state.sensor_temperature = (
+                sensor.get("temperature") if sensor.get("temperature") is not None else existing.sensor_temperature
+            )
+            new_state.sensor_temperature_2 = (
+                sensor.get("temperature_2")
+                if sensor.get("temperature_2") is not None
+                else existing.sensor_temperature_2
+            )
+            # A probe plugged in after startup has no entity yet: the sensor
+            # platform only creates one when a reading is already present.
+            # Reload once so it appears, mirroring the late-battery path (#150).
+            if (
+                existing.sensor_temperature_2 is None
+                and new_state.sensor_temperature_2 is not None
+                and not self._probe2_reload_scheduled
+            ):
+                self._probe2_reload_scheduled = True
+                _LOGGER.info(
+                    "Second temperature probe now reporting for %s — reloading "
+                    "the integration to add its sensor (#150)",
+                    sensor.get("name", device_id),
+                )
+                self.hass.config_entries.async_schedule_reload(self._config_entry.entry_id)
+            new_state.sensor_humidity = (
+                sensor.get("humidity") if sensor.get("humidity") is not None else existing.sensor_humidity
+            )
+            new_state.battery = sensor.get("battery") if sensor.get("battery") is not None else existing.battery
+            self._note_sensor_reading_change(device_id, new_state, existing)
+            self._states[device_id] = new_state
+            self._record_transport_success(device_id, "cloud_api")
+            # Only a value change warrants pushing an HA update — skip the churn
+            # when a 5-min poll returns the same reading (#86). `online` is
+            # ignored here: the availability mixin doesn't gate on it.
+            if (
+                new_state.sensor_temperature != existing.sensor_temperature
+                or new_state.sensor_humidity != existing.sensor_humidity
+                or new_state.battery != existing.battery
+            ):
+                changed = True
+
+        if changed:
+            self.async_set_updated_data(self._states)
+        await self._async_check_missed_pushes()
+
+    def register_leak_hubs(self) -> None:
+        """Register each leak sensor's hub as a device.
+
+        Leak sensors set ``via_device=(DOMAIN, hub_device_id)``; HA requires
+        the referenced device to exist before the child entity is added,
+        otherwise HA logs a deprecation warning (will error in 2025.12).
+
+        Called from leak-sensor platforms ``async_setup_entry`` so hubs are
+        registered AFTER the integration's orphaned-device cleanup pass
+        (which would otherwise remove a hub that has no entities yet).
+        Idempotent: ``async_get_or_create`` returns the existing entry.
+        """
+        if not self._leak_sensors:
+            return
+        device_reg = dr.async_get(self.hass)
+        # Group sensors by hub so we can infer hub model from children.
+        sensors_by_hub: dict[str, list[GoveeLeakSensor]] = {}
+        for sensor in self._leak_sensors.values():
+            if sensor.hub_device_id:
+                sensors_by_hub.setdefault(sensor.hub_device_id, []).append(sensor)
+
+        for hub_id, hub_sensors in sensors_by_hub.items():
+            hub_meta = self._leak_hubs.get(hub_id, {})
+            # Prefer SKU from BFF if present; otherwise infer from child SKUs.
+            # H5058 leak sensors are paired with the H5043 Wi-Fi hub.
+            child_skus = {s.sku for s in hub_sensors}
+            if hub_meta.get("sku"):
+                model = hub_meta["sku"]
+            elif "H5058" in child_skus:
+                model = "H5043"
+            else:
+                model = None
+            name = hub_meta.get("name") or "Govee Leak Sensor Hub"
+            device_reg.async_get_or_create(
+                config_entry_id=self._config_entry.entry_id,
+                identifiers={(DOMAIN, hub_id)},
+                manufacturer="Govee",
+                model=model,
+                name=name,
+            )
+
+    def register_thermo_hubs(self) -> None:
+        """Register gateway hubs bridging BFF thermo-hygrometers (#86).
+
+        Thermo entities set ``via_device=(DOMAIN, hub_device_id)`` (e.g. H5310
+        via H5044); HA requires the referenced hub device to exist first.
+        Called from the sensor platform ``async_setup_entry`` after orphan
+        cleanup. Idempotent via ``async_get_or_create``.
+        """
+        if not self._bff_thermo_hubs:
+            return
+        device_reg = dr.async_get(self.hass)
+        for hub_id, meta in self._bff_thermo_hubs.items():
+            if not hub_id:
+                continue
+            device_reg.async_get_or_create(
+                config_entry_id=self._config_entry.entry_id,
+                identifiers={(DOMAIN, hub_id)},
+                manufacturer="Govee",
+                model=meta.get("sku") or None,
+                name=meta.get("sku") or "Govee Gateway",
+            )
+
+    async def _async_load_leak_mqtt_stamps(self) -> None:
+        """Attach the leak MQTT stamps shared by every load of this integration.
+
+        Loaded from disk once per Home Assistant run, then kept in hass.data so
+        an entry reload reuses the live dict (including a delayed save that has
+        not reached disk yet). A storage failure only loses the stamps, which
+        falls back to the pre-fix behaviour (a possible false wet), never a
+        failed setup.
+        """
+        try:
+            cached = self.hass.data.get(_LEAK_MQTT_DATA_KEY)
+            if cached is None:
+                store: Store[dict[str, dict[str, float]]] = Store(
+                    self.hass, LEAK_MQTT_STORE_VERSION, LEAK_MQTT_STORE_KEY
+                )
+                raw = await store.async_load()
+                stamps = {
+                    str(sensor_id): {
+                        kind: float(at)
+                        for kind, at in entry.items()
+                        if kind in ("wet", "dry") and isinstance(at, (int, float)) and not isinstance(at, bool)
+                    }
+                    for sensor_id, entry in (raw or {}).items()
+                    if isinstance(entry, dict)
+                }
+                cached = self.hass.data.setdefault(_LEAK_MQTT_DATA_KEY, (store, stamps))
+            self._leak_mqtt_store, self._leak_mqtt_at = cached
+        except Exception as err:  # noqa: BLE001 - never fail setup over this
+            _LOGGER.debug("Could not load leak MQTT stamps: %s", err)
+
+    @callback
+    def _record_leak_mqtt(self, sensor_id: str, is_wet: bool) -> None:
+        """Stamp an MQTT wet or dry report for the BFF fallback (see LEAK_MQTT_STORE_KEY)."""
+        self._leak_mqtt_at.setdefault(sensor_id, {})["wet" if is_wet else "dry"] = time.time()
+        if self._leak_mqtt_store is not None:
+            stamps = self._leak_mqtt_at
+            self._leak_mqtt_store.async_delay_save(
+                lambda: {k: dict(v) for k, v in stamps.items()}, LEAK_MQTT_SAVE_DELAY
+            )
+
+    def _schedule_bff_poll(self) -> None:
+        """Schedule the next BFF poll in 5 minutes."""
+        if self._bff_poll_unsub:
+            self._bff_poll_unsub()
+            self._bff_poll_unsub = None
+        if self._shut_down:
+            return
+        self._bff_poll_unsub = async_call_later(self.hass, BFF_POLL_INTERVAL, self._bff_poll_callback)
+
+    async def _bff_poll_callback(self, _now: Any = None) -> None:
+        """Callback for periodic BFF polling."""
+        await self._poll_bff_leak_state()
+        # Refresh thermo-hygrometer readings on the same cadence (issue #86).
+        await self._refresh_bff_thermometers()
+        # Re-schedule next poll
+        self._schedule_bff_poll()
+
+    async def _poll_bff_leak_state(self) -> None:
+        """Poll BFF API for updated leak sensor + thermometer state.
+
+        Called every 5 minutes and after MQTT events. Reuses the app2 IoT token
+        from initial login. The BFF device-list call also tickles Govee's cloud
+        into refreshing the Developer-API readings for BLE-bridged thermometers
+        and carries their live ``lastDeviceData`` value (#83).
+        """
+        if not self._iot_credentials:
+            return
+        if not self._leak_sensors and not self._thermo_bff_devices and not self._battery_candidate_devices():
+            return
+
+        try:
+            # Short-lived auth client, consistent with _fetch_device_topics()
+            # and _discover_leak_sensors(). hass= reuses HA's aiohttp session.
+            fetched = await self._async_bff_call(
+                lambda client, token: client.fetch_bff_leak_sensors(token),
+                "leak-sensor poll",
+            )
+        except Exception as err:
+            _LOGGER.debug("BFF poll failed: %s", err)
+            return
+        if fetched is None:
+            return
+        sensor_data, _hub_data, thermo_readings = fetched
+
+        # Pick up leak sensors added to a hub after startup (issue #101). These
+        # are BFF-only sub-devices, so they never appear in the Developer-API
+        # /user/devices list that _async_maybe_rediscover_devices watches — the
+        # only way to notice them is here, in the BFF poll. A genuinely new
+        # sensor id schedules a reload, which re-runs the tested discovery +
+        # platform setup so its entities are created without a manual reload.
+        if not self._bff_reload_scheduled:
+            new_leak_ids = {s["device_id"] for s in sensor_data if s.get("device_id")} - set(self._leak_sensors)
+            if new_leak_ids:
+                self._bff_reload_scheduled = True
+                _LOGGER.info(
+                    "Detected %d new leak sensor(s) on a hub since startup (%s) "
+                    "— reloading the integration to add them (#101)",
+                    len(new_leak_ids),
+                    ", ".join(sorted(new_leak_ids)),
+                )
+                self.hass.config_entries.async_schedule_reload(self._config_entry.entry_id)
+                return
+
+        # Refresh BLE-bridged thermometer battery from the BFF data (#83). The
+        # tem/hum are still discarded (scale varies, #102) — battery only.
+        # allow_reload=True: this is the periodic poll, after platform setup
+        # has already run, so a device gaining its first battery reading here
+        # needs a reload to get its sensor entity created (#132).
+        self._apply_bff_thermo_battery(thermo_readings, allow_reload=True)
+
+        # Update state for each known sensor
+        now_s = time.time()
+        now_ms = int(now_s * 1000)
+        for sensor in sensor_data:
+            device_id = sensor["device_id"]
+            state = self._leak_states.get(device_id)
+            if state is None:
+                continue
+
+            state.battery = sensor.get("battery")
+            state.online = sensor.get("online", True)
+            state.gateway_online = sensor.get("gateway_online", True)
+            bff_wet_time = sensor.get("last_wet_time")
+            if bff_wet_time and (state.last_wet_time is None or bff_wet_time > state.last_wet_time):
+                state.last_wet_time = bff_wet_time
+            state.read = sensor.get("read", True)
+
+            # Fallback wet detection: if BFF shows a recent leak event
+            # within the poll window but MQTT never reported wet during that
+            # period, force it on. This covers MQTT disconnects or lost packets.
+            # Skip it only when MQTT itself reported this leak wet (no earlier
+            # than LEAK_MQTT_SKEW_MARGIN before the cloud's time) and later
+            # reported it dry: the leak was already shown and has ended. The
+            # dry report must also be later than the cloud's last wet, or a
+            # wet, dry, wet flap whose second wet frame was lost would read as
+            # ended while the sensor is wet. The stamps outlive an entry
+            # reload, which resets last_mqtt_wet_at. A dry report alone never
+            # skips it, nor does an older MQTT leak.
+            last_wet = sensor.get("last_wet_time") or 0
+            age_ms = now_ms - last_wet if last_wet > 0 else float("inf")
+            poll_window_ms = BFF_POLL_INTERVAL * 1000
+            mqtt_wet_age = now_s - state.last_mqtt_wet_at
+            mqtt_at = self._leak_mqtt_at.get(device_id, {})
+            mqtt_wet_ms = mqtt_at.get("wet", 0.0) * 1000
+            mqtt_dry_ms = mqtt_at.get("dry", 0.0) * 1000
+            mqtt_saw_it_end = mqtt_wet_ms >= last_wet - LEAK_MQTT_SKEW_MARGIN * 1000 and mqtt_dry_ms > max(
+                mqtt_wet_ms, last_wet
+            )
+
+            if age_ms < poll_window_ms and mqtt_wet_age > BFF_POLL_INTERVAL and not mqtt_saw_it_end:
+                sensor_obj = self._leak_sensors.get(device_id)
+                sensor_name = sensor_obj.name if sensor_obj else device_id
+                _LOGGER.warning(
+                    "BFF fallback: Govee cloud reports a leak on '%s' %ds ago "
+                    "that MQTT never reported (no wet in the last %ds and none it saw end) — forcing wet",
+                    sensor_name,
+                    int(age_ms / 1000),
+                    BFF_POLL_INTERVAL,
+                )
+                state.is_wet = True
+
+        # The BFF device-list call above already tickled Govee's cloud into
+        # refreshing the Developer `/device/state` reading for these BLE-bridged
+        # thermometers; the regular Developer poll picks up the fresh, correctly
+        # scaled value. We deliberately do NOT apply the BFF `tem`/`hum` here —
+        # its scale varies by gateway and a fixed divisor over-scaled humidity
+        # 10x on every BFF cycle (#102). Only battery is applied (above), since
+        # it's plain 0-100 and absent from the Developer API (#83).
+
+        # Notify leak sensor entities only (avoids churning unrelated
+        # light / switch entities that also subscribe to the coordinator).
+        async_dispatcher_send(self.hass, f"{DOMAIN}_leak_update")
+
+    @property
+    def _water_detectors(self) -> list[GoveeDevice]:
+        """Developer-API devices that expose a standalone water-leak event.
+
+        These (H5054) appear in the regular device list but have no MQTT topic
+        and no pollable event state — their trip is fetched separately via the
+        account warnMessage history (issue #62).
+        """
+        return [d for d in self._devices.values() if not d.is_group and d.supports_water_leak_event]
+
+    @property
+    def _water_detector_poll_interval(self) -> int:
+        """Configured leak-poll interval (seconds) for standalone detectors.
+
+        Read per tick so the value is picked up on the reload that follows an
+        options change. Out-of-range or non-numeric values (e.g. hand-edited
+        options) fall back to the default rather than arming a bad timer.
+        """
+        raw = self._config_entry.options.get(CONF_WATER_DETECTOR_POLL_INTERVAL, DEFAULT_WATER_DETECTOR_POLL_INTERVAL)
+        try:
+            interval = int(raw)
+        except (TypeError, ValueError):
+            return DEFAULT_WATER_DETECTOR_POLL_INTERVAL
+        if not (MIN_WATER_DETECTOR_POLL_INTERVAL <= interval <= MAX_WATER_DETECTOR_POLL_INTERVAL):
+            return DEFAULT_WATER_DETECTOR_POLL_INTERVAL
+        return interval
+
+    def _schedule_water_detector_poll(self) -> None:
+        """Schedule the next standalone water-detector leak poll."""
+        if self._wd_poll_unsub:
+            self._wd_poll_unsub()
+            self._wd_poll_unsub = None
+        if self._shut_down:
+            return
+        self._wd_poll_unsub = async_call_later(
+            self.hass,
+            self._water_detector_poll_interval,
+            self._water_detector_poll_callback,
+        )
+
+    async def _water_detector_poll_callback(self, _now: Any = None) -> None:
+        """Periodic callback: poll water detectors, then re-arm the timer."""
+        await self._poll_water_detectors()
+        self._schedule_water_detector_poll()
+
+    async def _poll_water_detectors(self) -> None:
+        """Poll standalone water detectors (H5054) for online + leak state.
+
+        One BFF ``device/list`` GET per tick yields online/gateway/battery/
+        lastTime. ``warnMessage`` (one POST per detector) is only called when a
+        detector has freshly reported (``last_time`` advanced) or is currently
+        wet (to detect the user clearing the alert) — keeping the account-API
+        request count near one call per tick in steady state (issue #62).
+        """
+        detectors = self._water_detectors
+        if not detectors or not self._iot_credentials:
+            return
+
+        device_ids = {d.device_id for d in detectors}
+        sku_by_id = {d.device_id: d.sku for d in detectors}
+
+        # Through _async_bff_call so an expired account token is replaced by a
+        # re-login (#132) instead of failing every tick in silence.
+        async def _op(auth_client: GoveeAuthClient, token: str) -> bool:
+            states = await auth_client.fetch_water_detector_states(token, device_ids)
+            changed = False
+            for device_id, info in states.items():
+                state = self._states.get(device_id)
+                if state is None:
+                    continue
+
+                clear_gen = self._water_leak_clear_gen.get(device_id, 0)
+                online = bool(info.get("online", True)) and bool(info.get("gateway_online", True))
+                last_time = info.get("last_time") or 0
+                prev_time = self._water_leak_last_time.get(device_id, 0)
+
+                # Only hit warnMessage when there's something new to learn:
+                # a fresh report, or a currently-wet sensor that may have
+                # been cleared in the app.
+                if last_time > prev_time or state.water_leak:
+                    try:
+                        is_wet = await auth_client.fetch_leak_warning(token, device_id, sku_by_id[device_id])
+                    except Exception as err:  # noqa: BLE001
+                        _LOGGER.debug("warnMessage poll failed for %s: %s", device_id, err)
+                        is_wet = bool(state.water_leak)
+                    # A clear that landed while warnMessage was in flight
+                    # wins; the next tick reads the alert again.
+                    if self._water_leak_clear_gen.get(device_id, 0) == clear_gen and state.water_leak != is_wet:
+                        state.water_leak = is_wet
+                        changed = True
+                if last_time and self._water_leak_clear_gen.get(device_id, 0) == clear_gen:
+                    self._water_leak_last_time[device_id] = last_time
+
+                if state.online != online:
+                    state.online = online
+                    changed = True
+                # Battery (%) rides along in the same BFF device/list poll —
+                # surface it so the H5054 gets a battery sensor (issue #145).
+                battery = info.get("battery")
+                if battery is not None and state.battery != battery:
+                    state.battery = battery
+                    changed = True
+                state.source = "api"
+                _LOGGER.debug(
+                    "Water-detector %s: online=%s water_leak=%s battery=%s " "last_time=%s",
+                    device_id,
+                    online,
+                    state.water_leak,
+                    state.battery,
+                    last_time,
+                )
+            return changed
+
+        try:
+            changed = bool(await self._async_bff_call(_op, "water-detector poll"))
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("Water-detector poll failed: %s", err)
+            return
+
+        if changed:
+            self.async_update_listeners()
+
+    async def async_clear_water_leak(self, device_id: str) -> bool:
+        """Mark a standalone water detector's leak alerts read (user action).
+
+        A detector's trip latches until its ``LeakageAlert`` is read (issue
+        #62). This sends the same ``warnLifted`` request as the Govee app's
+        "Read" button, so the alert can be acknowledged from Home Assistant,
+        then drops the latched state at once rather than on the next poll. A
+        detector that is still wet raises a new alert and latches again.
+
+        Args:
+            device_id: Device identifier.
+
+        Returns:
+            True once Govee has accepted the request; False when the device is
+            not a standalone detector, account login is not configured, or
+            Govee rejected or could not be reached.
+        """
+        device = next((d for d in self._water_detectors if d.device_id == device_id), None)
+        if device is None or not self._iot_credentials:
+            return False
+        sku = device.sku
+
+        async def _op(auth_client: GoveeAuthClient, token: str) -> bool:
+            return await auth_client.lift_leak_warning(token, device_id, sku)
+
+        try:
+            lifted = await self._async_bff_call(_op, "leak warning lift")
+        except GoveeApiError as err:
+            _LOGGER.debug("Clearing the leak alert for %s failed: %s", device_id, err)
+            return False
+        if not lifted:
+            return False
+
+        # Forget the last report time so the next tick reads warnMessage again
+        # and confirms Govee marked the alert read, and invalidate any tick
+        # already in flight.
+        self._water_leak_clear_gen[device_id] = self._water_leak_clear_gen.get(device_id, 0) + 1
+        self._water_leak_last_time.pop(device_id, None)
+        state = self._states.get(device_id)
+        if state is not None and state.water_leak:
+            state.water_leak = False
+            self.async_update_listeners()
+        _LOGGER.debug("Leak alert cleared for %s (user action, warnLifted)", device_id)
+        return True
+
+    @callback
+    def _handle_leak_event(self, state_data: dict[str, Any]) -> None:
+        """Handle a decoded leak event from MQTT multiSync message."""
+        hub_id = state_data["hub_device_id"]
+        sno = state_data["sensor_slot"]
+        is_wet = state_data["is_wet"]
+
+        sensor_id = self._sno_to_sensor_id.get((hub_id, sno))
+        if not sensor_id:
+            _LOGGER.debug(
+                "Leak event for unknown sensor: hub=%s slot=%d wet=%s",
+                hub_id,
+                sno,
+                is_wet,
+            )
+            return
+
+        state = self._leak_states.get(sensor_id)
+        if state is None:
+            return
+
+        prev_wet = state.is_wet
+        state.is_wet = is_wet
+
+        if is_wet:
+            state.last_mqtt_wet_at = time.time()
+            state.last_wet_time = int(time.time() * 1000)
+        self._record_leak_mqtt(sensor_id, is_wet)
+
+        sensor = self._leak_sensors.get(sensor_id)
+        if sensor is not None and sensor.sku.upper() in LEAK_DUAL_PROBE_SKUS:
+            if not is_wet:
+                # Aggregate-dry frame is authoritative: clear both probes
+                # even if this particular frame did not carry probe bytes.
+                state.upper_probe_wet = False
+                state.lower_probe_wet = False
+            else:
+                if "upper_probe_wet" in state_data:
+                    state.upper_probe_wet = state_data["upper_probe_wet"]
+                if "lower_probe_wet" in state_data:
+                    state.lower_probe_wet = state_data["lower_probe_wet"]
+
+        if prev_wet != is_wet:
+            sensor_name = sensor.name if sensor else sensor_id
+            _LOGGER.debug(
+                "Leak sensor '%s' changed: %s -> %s",
+                sensor_name,
+                "wet" if prev_wet else "dry",
+                "wet" if is_wet else "dry",
+            )
+
+        async_dispatcher_send(self.hass, f"{DOMAIN}_leak_update")
+        self._schedule_bff_leak_poll()
+
+    @callback
+    def _handle_probe_frame(self, device_id: str, state_data: dict[str, Any]) -> None:
+        """Merge a decoded probe-thermometer frame into device state.
+
+        Merges per probe and per field: a ``0x24`` reply carries only core and
+        ambient, a ``0x12`` reply only the four limits, and a status frame all
+        six. Replacing the entry instead of merging would blank whichever half
+        the current frame did not carry, so the values are folded into the
+        existing :class:`ProbeReading`.
+        """
+        device = self._devices.get(device_id)
+        if device is None:
+            return
+
+        state = self._states.get(device_id) or GoveeDeviceState.create_empty(device_id)
+        probes = dict(state.probes)
+        changed = False
+
+        for probe, fields in state_data.get("probes", {}).items():
+            current = probes.get(probe, ProbeReading())
+            merged = dataclasses.replace(
+                current,
+                **{k: v for k, v in fields.items() if k in _PROBE_READING_FIELDS},
+            )
+            if merged != current:
+                probes[probe] = merged
+                changed = True
+
+        state.probes = probes
+        # A frame is proof of life. The BFF ``online`` flag sits at false for
+        # this SKU permanently, so it must not be believed here.
+        state.online = True
+        self._states[device_id] = state
+
+        if changed or device_id not in self._sensor_reading_changed_at:
+            self._sensor_reading_changed_at[device_id] = dt_util.utcnow()
+
+        self._ensure_transport_health(device_id)
+        self._record_transport_success(device_id, "mqtt")
+        self.async_set_updated_data(self._states)
+
+    @property
+    def _probe_poll_interval(self) -> int:
+        """Configured probe-poll interval in seconds, clamped to sane bounds."""
+        raw = self._config_entry.options.get(CONF_PROBE_POLL_INTERVAL, DEFAULT_PROBE_POLL_INTERVAL)
+        try:
+            interval = int(raw)
+        except (TypeError, ValueError):
+            return DEFAULT_PROBE_POLL_INTERVAL
+        if not (MIN_PROBE_POLL_INTERVAL <= interval <= MAX_PROBE_POLL_INTERVAL):
+            return DEFAULT_PROBE_POLL_INTERVAL
+        return interval
+
+    def set_probe_polling(self, device_id: str, enabled: bool) -> None:
+        """Arm or disarm live polling for one probe thermometer.
+
+        Driven by the per-device switch entity. Enabling fires one immediate
+        read burst for that device (temperatures and limits, whatever the
+        shared tick) so the entities populate right away instead of staying
+        unknown until the first tick.
+        """
+        if enabled:
+            self._probe_polling_enabled.add(device_id)
+            self._config_entry.async_create_background_task(
+                self.hass, self._poll_probe_thermometers(only_device_id=device_id), name="govee_probe_poll_now"
+            )
+            self._schedule_probe_poll()
+        else:
+            self._probe_polling_enabled.discard(device_id)
+            if not self._probe_polling_enabled and self._probe_poll_unsub:
+                self._probe_poll_unsub()
+                self._probe_poll_unsub = None
+
+    def is_probe_polling(self, device_id: str) -> bool:
+        """Return True while live polling is armed for this device."""
+        return device_id in self._probe_polling_enabled
+
+    def _schedule_probe_poll(self, delay: float | None = None) -> None:
+        """Schedule the next probe read, replacing any pending timer.
+
+        Args:
+            delay: Seconds until the sweep; defaults to the configured interval.
+        """
+        if self._probe_poll_unsub:
+            self._probe_poll_unsub()
+            self._probe_poll_unsub = None
+        if self._shut_down:
+            return
+        self._probe_poll_unsub = async_call_later(
+            self.hass, self._probe_poll_interval if delay is None else delay, self._probe_poll_callback
+        )
+
+    async def _probe_poll_callback(self, _now: Any = None) -> None:
+        """Timer callback: run the sweep as a tracked task so unload can cancel it."""
+        self._probe_poll_task = self._config_entry.async_create_background_task(
+            self.hass, self._run_probe_sweep(), name="govee_probe_poll"
+        )
+
+    async def _run_probe_sweep(self) -> None:
+        """Sweep every armed probe, then re-arm so sweeps start one interval apart.
+
+        The sweep is paced (PROBE_PACKET_SPACING between packets) and can take
+        a while on a many-probe device; the next timer is shortened by the time
+        it took, but never below one packet spacing.
+        """
+        started = time.monotonic()
+        await self._poll_probe_thermometers()
+        if self._probe_polling_enabled:
+            elapsed = time.monotonic() - started
+            self._schedule_probe_poll(max(PROBE_PACKET_SPACING, self._probe_poll_interval - elapsed))
+
+    async def _poll_probe_thermometers(self, only_device_id: str | None = None) -> None:
+        """Read current values (and, every sixth sweep, limits) from armed probes.
+
+        One read per probe: the per-probe ``0x24`` reply is the only response
+        that could be provoked. The six-value status frame arrives unprompted
+        on power-on and when an app session opens; no request was found that
+        triggers it. Per device every temperature read goes out first, so a
+        slow answer cannot starve a later probe; the limits reads (two more
+        small packets per probe, rarely changing) follow only on ticks where
+        ``tick % PROBE_LIMITS_READ_EVERY == 0``, which includes the first.
+        Packets are PROBE_PACKET_SPACING seconds apart, because a probe
+        answers only the first of several back-to-back requests (#266). After
+        each wait the sweep stops if MQTT dropped, and skips a device that was
+        disarmed meanwhile.
+
+        Args:
+            only_device_id: Read just this device, limits included, without
+                advancing the shared tick (the immediate read on arming).
+        """
+        if not self._probe_polling_enabled:
+            return
+        client = self.mqtt_client
+        if client is None or not client.connected:
+            return
+
+        if only_device_id is None:
+            read_limits = self._probe_poll_tick % PROBE_LIMITS_READ_EVERY == 0
+            self._probe_poll_tick += 1
+            targets = list(self._probe_polling_enabled)
+        else:
+            read_limits = True
+            targets = [only_device_id]
+
+        first_packet = True
+        for device_id in targets:
+            device = self._devices.get(device_id)
+            if device is None:
+                continue
+            probes = probes_for_sku(device.sku)
+            packets = [build_probe_read_packet(probe) for probe in probes]
+            if read_limits:
+                packets.extend(build_limits_read_packet(probe) for probe in probes)
+            for packet in packets:
+                if not first_packet:
+                    await asyncio.sleep(PROBE_PACKET_SPACING)
+                    client = self.mqtt_client
+                    if client is None or not client.connected:
+                        return
+                    if device_id not in self._probe_polling_enabled:
+                        break
+                first_packet = False
+                await self._ble_manager.async_send_ble_packet(device_id, device.sku, packet)
+
+    @property
+    def _mqtt_status_poll_interval(self) -> int:
+        """Configured MQTT status-poll interval (seconds), clamped to bounds.
+
+        Read per tick so the value is picked up on the reload that follows an
+        options change. ``MQTT_STATUS_POLL_OFF`` (0) is the documented way to
+        turn the re-query off and is returned as-is; any other out-of-range or
+        non-numeric value (e.g. hand-edited options) falls back to the default
+        rather than arming a bad timer.
+        """
+        raw = self._config_entry.options.get(CONF_MQTT_STATUS_INTERVAL, DEFAULT_MQTT_STATUS_INTERVAL)
+        try:
+            interval = int(raw)
+        except (TypeError, ValueError):
+            return DEFAULT_MQTT_STATUS_INTERVAL
+        if interval == MQTT_STATUS_POLL_OFF:
+            return MQTT_STATUS_POLL_OFF
+        if not (MIN_MQTT_STATUS_INTERVAL <= interval <= MAX_MQTT_STATUS_INTERVAL):
+            return DEFAULT_MQTT_STATUS_INTERVAL
+        return interval
+
+    @property
+    def _status_poll_tick(self) -> int:
+        """Seconds between two ticks of the status timer.
+
+        POWER_MONITORING_STATUS_INTERVAL if there is a power-monitoring
+        outlet to query, else the configured interval.
+        """
+        if any(device.supports_power_monitoring for device in self._devices.values()):
+            return POWER_MONITORING_STATUS_INTERVAL
+        return self._mqtt_status_poll_interval
+
+    @property
+    def _mqtt_status_poll_enabled(self) -> bool:
+        """False when the user set the re-query interval to 0 (off)."""
+        return self._mqtt_status_poll_interval != MQTT_STATUS_POLL_OFF
+
+    @property
+    def _mqtt_status_poll_targets(self) -> list[str]:
+        """Device IDs eligible for the periodic MQTT status re-query.
+
+        Any device with a known device-specific MQTT topic — anything the
+        coordinator could also publish a command to. Groups have no topic of
+        their own and are excluded, as is any device quarantined because AWS
+        IoT closed the session right after querying it (issue #195), and any
+        device whose SKU is known outright to do that
+        (MQTT_STATUS_QUERY_EXCLUDED_SKUS) without needing to learn it the
+        quarantine's way, one strike at a time.
+        """
+        return [
+            device_id
+            for device_id, device in self._devices.items()
+            if not device.is_group
+            and device_id in self._device_topics
+            and device_id not in self._status_query_quarantine
+            and device.sku not in MQTT_STATUS_QUERY_EXCLUDED_SKUS
+        ]
+
+    @property
+    def mqtt_status_queries_refused(self) -> bool:
+        """Whether the sweep stopped because AWS IoT refuses every status query.
+
+        True once the session dropped right after queries to
+        MQTT_STATUS_QUERY_ACCOUNT_REFUSAL_SKUS different SKUs with none
+        answered in between; for diagnostics.
+        """
+        return self._status_queries_refused
+
+    @property
+    def mqtt_status_query_strikes(self) -> list[dict[str, Any]]:
+        """Devices blamed for an AWS IoT session drop, for diagnostics (#195).
+
+        One entry per device the session dropped right after querying: its
+        id (redacted by diagnostics), SKU, strike count, and whether it has
+        reached the quarantine. Empty when every sweep has been clean.
+        """
+        census: list[dict[str, Any]] = []
+        for device_id, strikes in self._status_query_strikes.items():
+            device = self._devices.get(device_id)
+            census.append(
+                {
+                    "device_id": device_id,
+                    "sku": device.sku if device else None,
+                    "strikes": strikes,
+                    "quarantined": device_id in self._status_query_quarantine,
+                }
+            )
+        return census
+
+    def _schedule_status_poll(self) -> None:
+        """Schedule the next MQTT status re-query, replacing any pending timer.
+
+        Arms nothing when the option is 0 (off); a pending timer is still
+        cancelled so a reload that turned the feature off leaves no tick behind.
+        """
+        if self._status_poll_unsub:
+            self._status_poll_unsub()
+            self._status_poll_unsub = None
+        if not self._mqtt_status_poll_enabled or self._shut_down:
+            return
+        self._status_poll_unsub = async_call_later(self.hass, self._status_poll_tick, self._status_poll_callback)
+
+    async def _status_poll_callback(self, _now: Any = None) -> None:
+        """Periodic callback: re-query the devices that are due, then re-arm.
+
+        Every device once per configured interval; power-monitoring outlets
+        on every tick in between.
+        """
+        if time.monotonic() >= self._next_full_status_sweep:
+            await self._poll_mqtt_status()
+        else:
+            await self._poll_mqtt_status(power_monitoring_only=True)
+        self._schedule_status_poll()
+
+    async def _poll_mqtt_status(self, power_monitoring_only: bool = False) -> None:
+        """Publish a status query to every device's own MQTT topic.
+
+        See ``GoveeAwsIotClient.async_publish_status_query`` for why this
+        exists — without it, devices that don't autonomously push (most of
+        them, per the Android app reverse-engineering) go stale the moment
+        nobody has asked in a while. Queries go out one device at a time,
+        MQTT_STATUS_QUERY_SPACING apart, rather than in a burst: AWS IoT
+        answers a publish it refuses by closing the whole session, and with
+        the queries spaced out a drop lands inside one device's window, so
+        ``_on_mqtt_disconnected`` can blame — and eventually quarantine — that
+        device instead of the sweep taking push state down for every device
+        on every reconnect (issue #195). They are fire-and-forget (QoS 0), so
+        the loop never waits on a broker acknowledgement. The sweep stops as
+        soon as the session is gone: the reconnect runs its own. A no-op when
+        the option is 0 (off) or another sweep is still in progress. With
+        ``power_monitoring_only``, only power-monitoring outlets are queried.
+        """
+        if not self._mqtt_status_poll_enabled or self._status_queries_refused:
+            return
+        client = self._mqtt_client
+        if client is None or not client.connected:
+            return
+        if self._status_sweep_running:
+            _LOGGER.debug("MQTT status sweep still in progress; not starting another")
+            return
+
+        self._status_sweep_running = True
+        targets = self._mqtt_status_poll_targets
+        if power_monitoring_only:
+            targets = [device_id for device_id in targets if self._devices[device_id].supports_power_monitoring]
+        else:
+            # Half a tick early, so that timer jitter doesn't push the next
+            # full sweep out by a whole tick
+            self._next_full_status_sweep = (
+                time.monotonic() + self._mqtt_status_poll_interval - self._status_poll_tick / 2
+            )
+        try:
+            for device_id in targets:
+                # mypy narrowed ``connected`` to True at the guard above and
+                # does not see the awaits in between invalidating that.
+                if not client.connected:
+                    break  # type: ignore[unreachable]
+                topic = self._device_topics.get(device_id)
+                if not topic:
+                    continue
+                # Serialised with async_request_status, so a drop is charged
+                # to the device whose query was in flight.
+                async with self._status_query_lock:
+                    self._status_query_in_flight = device_id
+                    try:
+                        await client.async_publish_status_query(topic)
+                        self._mqtt_queries_since_connect += 1
+                        await asyncio.sleep(MQTT_STATUS_QUERY_SPACING)
+                        if client.connected:
+                            # The session outlived this query's window, so AWS
+                            # IoT is not refusing status queries account-wide.
+                            self._status_query_unanswered_skus.clear()
+                    finally:
+                        self._status_query_in_flight = None
+        finally:
+            self._status_sweep_running = False
+
+    async def async_set_probe_limits(
+        self,
+        device_id: str,
+        probe: int,
+        *,
+        core_max: float | None = None,
+        core_min: float | None = None,
+        ambient_max: float | None = None,
+        ambient_min: float | None = None,
+    ) -> bool:
+        """Write one or more alarm limits of a probe, carrying the rest over.
+
+        Register 0x12 has no partial update, so the three unchanged values come
+        from state. A value that is still unknown goes out as the sentinel,
+        which is how the device represents "no limit" — it reports all four
+        that way when nothing is set, and the Govee app clearing an alarm puts
+        them back to it. Passing None for a limit therefore clears it.
+        """
+        device = self._devices.get(device_id)
+        state = self._states.get(device_id)
+        if device is None or state is None:
+            return False
+
+        current = state.probes.get(probe, ProbeReading())
+        limits = ProbeLimits(
+            core_max=core_max if core_max is not None else current.core_max,
+            core_min=core_min if core_min is not None else current.core_min,
+            ambient_max=(ambient_max if ambient_max is not None else current.ambient_max),
+            ambient_min=(ambient_min if ambient_min is not None else current.ambient_min),
+        )
+
+        packet = build_limits_write_packet(probe, limits)
+        sent = await self._ble_manager.async_send_ble_packet(device_id, device.sku, packet)
+        if not sent:
+            return False
+
+        # Read back rather than trusting the write: the device acknowledges the
+        # packet, not the stored value.
+        await self._ble_manager.async_send_ble_packet(device_id, device.sku, build_limits_read_packet(probe))
+        return True
+
+    @callback
+    def _handle_thermo_frame(self, state_data: dict[str, Any]) -> None:
+        """Apply a decoded gateway thermometer frame (issue #151).
+
+        This is the live reading source for a gateway-bridged thermometer. It
+        matters most where nothing else works: when Govee leaves
+        ``deviceExt.lastDeviceData`` empty for the sub-device, the BFF path has
+        no value to serve and the Developer poll returns nothing either, so the
+        entity sits at ``unknown`` indefinitely. It also beats the BFF value on
+        freshness even when that path does work — the reporter measured the
+        H5044 pushing hourly at hh:56 with the cloud copy landing 5-7 minutes
+        later, and this frame IS that push.
+
+        The decode yields canonical °C, so the value is converted into whatever
+        unit the entity will read it back in rather than claiming ownership of
+        the device. That keeps this coexisting with the Developer poll — both
+        writers leave ``sensor_temperature`` in one consistent unit, and an
+        account whose poll works does not lose it if the gateway goes quiet.
+        """
+        hub_id = state_data["hub_device_id"]
+        sno = state_data["sensor_slot"]
+
+        device_id = self._sno_to_thermo_id.get((hub_id, sno))
+        if not device_id:
+            _LOGGER.debug(
+                "Thermo frame for unmapped sensor: hub=%s slot=%d temp=%.1f°C",
+                hub_id,
+                sno,
+                state_data["temperature_c"],
+            )
+            return
+
+        device = self._devices.get(device_id)
+        if device is None:
+            return
+
+        state = self._states.get(device_id) or GoveeDeviceState.create_empty(device_id)
+        previous_temperature = state.sensor_temperature
+
+        state.sensor_temperature = self._thermo_frame_temperature(device_id, device.sku, state_data["temperature_c"])
+        if state_data.get("battery") is not None:
+            state.battery = state_data["battery"]
+        # The frame is proof of life from the sub-device itself. Govee's own
+        # ``online`` flag flaps false between the hourly uploads (#97), so a
+        # frame arriving is the better signal.
+        state.online = True
+        self._states[device_id] = state
+
+        # Last *change*, not last confirmation — same semantic as the poll
+        # path's _note_sensor_reading_change (#83). The first frame stamps too.
+        if previous_temperature != state.sensor_temperature or device_id not in self._sensor_reading_changed_at:
+            self._sensor_reading_changed_at[device_id] = dt_util.utcnow()
+
+        frame_ts = state_data.get("frame_ts")
+        if isinstance(frame_ts, int):
+            self._thermo_frame_ts[device_id] = frame_ts
+
+        self._ensure_transport_health(device_id)
+        self._record_transport_success(device_id, "mqtt")
+
+        _LOGGER.debug(
+            "Thermo frame applied to %s: %.1f°C (stored %.1f) battery=%s",
+            device.name,
+            state_data["temperature_c"],
+            state.sensor_temperature,
+            state.battery,
+        )
+        self.async_set_updated_data(self._states)
+
+    def _thermo_frame_temperature(self, device_id: str, sku: str, celsius: float) -> float:
+        """Put a decoded °C reading into the unit the entity expects.
+
+        The temperature sensor converts °F→°C for SKUs in
+        FAHRENHEIT_REPORTING_SKUS — which includes the H5310 — unless the
+        device is BFF-owned, in which case it trusts the stored value as °C.
+        Writing raw °C into the first case would surface a pool at 24.9 °C as
+        -4 °C, so the value is pre-converted to match (the same round-tripping
+        the BFF read path does, #96/#83).
+        """
+        if self.is_bff_thermometer(device_id):
+            return celsius
+
+        api_unit = self._config_entry.options.get(
+            CONF_API_TEMPERATURE_UNIT,
+            DEFAULT_API_TEMPERATURE_UNIT,
+        )
+        unit_hint = self.account_temperature_unit(device_id)
+        if resolve_fahrenheit_conversion(sku, api_unit, unit_hint):
+            return celsius * (9.0 / 5.0) + 32.0
+        return celsius
+
+    def _store_frame_temperature_in_entity_unit(self, device_id: str, sku: str, state: GoveeDeviceState) -> None:
+        """Rewrite a just-decoded frame temperature from °C into the entity's unit.
+
+        The frame decoders store °C, but the temperature sensor converts °F→°C
+        for any device the account or the SKU allowlist marks as Fahrenheit
+        (the H5106 is on it), so an unconverted reading of 19.0 °C surfaces as
+        -7 °C, or 19 °F on a Fahrenheit display (issue #200). Same round-trip
+        :meth:`_thermo_frame_temperature` gives the pool-thermometer frames.
+        """
+        if state.sensor_temperature is not None:
+            state.sensor_temperature = round(
+                self._thermo_frame_temperature(device_id, sku, state.sensor_temperature), 1
+            )
+
+    @callback
+    def _handle_button_press(self, state_data: dict[str, Any]) -> None:
+        """Handle a button press event from MQTT multiSync message."""
+        sensor_id = state_data["device_id"]
+
+        if sensor_id not in self._leak_sensors:
+            _LOGGER.debug("Button press for unknown sensor: %s", sensor_id)
+            return
+
+        sensor = self._leak_sensors[sensor_id]
+        _LOGGER.debug("Button pressed on leak sensor '%s'", sensor.name)
+
+        self._pending_button_presses[sensor_id] = self._pending_button_presses.get(sensor_id, 0) + 1
+        async_dispatcher_send(self.hass, f"{DOMAIN}_leak_update")
+        self._schedule_bff_leak_poll()
+
+    @callback
+    def _on_mqtt_state_update(self, device_id: str, state_data: dict[str, Any]) -> None:
+        """Handle state update from MQTT.
+
+        Called from aiomqtt's async message loop, which runs on the HA event
+        loop. Safe to call async_set_updated_data() directly. The @callback
+        decorator documents this event-loop-only contract.
+        """
+        # Anything arriving means the session is not silent (#222).
+        self._note_mqtt_inbound()
+        if self._command_confirmer is not None:
+            self._command_confirmer.on_report(device_id, state_data)
+        # Handle leak sensor events (from multiSync messages)
+        if state_data.get("_leak_event"):
+            self._handle_leak_event(state_data)
+            return
+
+        # Handle gateway-bridged thermometer frames (issue #151)
+        if state_data.get("_probe_frame"):
+            self._handle_probe_frame(device_id, state_data)
+            return
+
+        if state_data.get("_thermo_frame"):
+            self._handle_thermo_frame(state_data)
+            return
+
+        # Handle button press events
+        if state_data.get("_button_press"):
+            self._handle_button_press(state_data)
+            return
+
+        if device_id not in self._devices:
+            _LOGGER.debug("MQTT update for unknown device: %s", device_id)
+            return
+
+        state = self._states.get(device_id)
+        if state is None:
+            state = GoveeDeviceState.create_empty(device_id)
+            self._states[device_id] = state
+
+        was_offline = not state.online
+        # Snapshot for change detection: a chatty hub or a fan reporting every
+        # second used to wake every entity of every device per frame. Only a
+        # frame that changed something notifies listeners (transport health is
+        # recorded either way; the "Last MQTT Received" sensor catches up on
+        # the next change or poll).
+        before = copy.deepcopy(state)
+
+        # Ceiling-fan combos (H1310/H1370) report the fan and the two lights
+        # as BLE-format frames in op.command, and their device-wide onOff is
+        # the unit's power rather than the light's (issue #181).
+        device = self._devices.get(device_id)
+        ceiling_fan = device is not None and device.supports_ceiling_fan
+
+        # Update state from MQTT data (also flips online back True — issue #68)
+        state.update_from_mqtt(state_data, ceiling_fan=ceiling_fan)
+        if ceiling_fan:
+            state.update_ceiling_fan_from_frames(self._op_frames_from(state_data))
+        # Ceiling Light Pro zones (H1252) report main panel / ring on-off only
+        # in an ``aa 30`` frame (issue #223).
+        if device is not None and device.sku.upper() in PTREAL_LIGHT_ZONE_SKUS:
+            state.update_light_zones_from_frames(self._op_frames_from(state_data))
+        # The H66A0 reports its mode in an ``aa 05`` frame; that real report
+        # replaces HA's optimistic DreamView flag (issue #213).
+        if device is not None and device.sku.upper() in DREAMVIEW_STATE_FROM_FRAMES_SKUS and device.supports_dreamview:
+            state.update_dreamview_from_frames(self._op_frames_from(state_data))
+        if device is not None and device.supports_pump_state:
+            frames = self._op_frames_from(state_data)
+            state.update_pump_state_from_frames(frames)
+            state.update_dehumidifier_mode_from_frames(frames)
+        # Frame-climate dehumidifiers (H7152, H7151 #283) carry live temperature/humidity
+        # only in these BLE-format status frames — no capability exists for
+        # either (issue #114 follow-up).
+        if device is not None and device.sku.upper() in FRAME_CLIMATE_DEHUMIDIFIER_SKUS:
+            if state.update_temperature_from_frames(self._op_frames_from(state_data)):
+                self._store_frame_temperature_in_entity_unit(device_id, device.sku, state)
+        # Smart outlets (H5086) carry live voltage/current/power/energy the
+        # same way — no capability exists for any of it (issue #200).
+        if device is not None and device.supports_power_monitoring:
+            state.update_power_monitoring_from_frames(self._op_frames_from(state_data), state_data.get("sta"))
+        # AQI monitors (H5106) carry live PM2.5 and a fresher temp/humidity
+        # pair the same way — no Developer API field for PM2.5 at all
+        # (issue #200).
+        if device is not None and device.supports_pm25_frame:
+            if state.update_pm25_from_frames(self._op_frames_from(state_data)):
+                self._store_frame_temperature_in_entity_unit(device_id, device.sku, state)
+        if device is not None and device.mqtt_outlet_count:
+            self._apply_outlet_mask(device, state, state_data.get("onOff"))
+        # H7175 kettles push their temperatures under ``sta``, and their mode,
+        # heating status and keep warm in frames.
+        if device is not None and device.decodes_kettle_frames:
+            self.kettles.on_push(device_id, state, state_data, self._op_frames_from(state_data))
+
+        if was_offline:
+            device = self._devices.get(device_id)
+            _LOGGER.debug(
+                "MQTT push restored online status for %s (was offline per cloud)",
+                device.name if device else device_id,
+            )
+
+        if device is not None and device.sku == "H6104":
+            # Newer device pushes win for fields they actually changed; keep
+            # BLE-only mode fields absent from this MQTT report.
+            fields = self._h6104_ble_fields.get(device_id, {})
+            for field in list(fields):
+                if getattr(state, field) != getattr(before, field):
+                    fields.pop(field)
+
+        # Confirmed push — record transport health and end the optimistic
+        # grace window for this device (state.update_from_mqtt also calls
+        # clear_optimistic_window, but recording MQTT health is our job).
+        self._record_transport_success(device_id, "mqtt")
+        self._transport.record_read(device_id, "mqtt")
+
+        # Update coordinator data and notify HA — only if something changed.
+        if state != before:
+            self.async_set_updated_data(self._states)
+
+        _LOGGER.debug(
+            "MQTT state applied for %s: power=%s, presence=%s (triSta=%s)",
+            device_id,
+            state.power_state,
+            state.presence,
+            state_data.get("triSta"),
+        )
+
+    @staticmethod
+    def _op_frames_from(state_data: dict[str, Any]) -> list[bytes]:
+        """Decoded ``op.command`` frames the MQTT client attached as hex."""
+        frames: list[bytes] = []
+        for entry in state_data.get("_op_frames", []) or []:
+            if not isinstance(entry, str):
+                continue
+            try:
+                frames.append(bytes.fromhex(entry))
+            except ValueError:
+                continue
+        return frames
+
+    @callback
+    def _on_mqtt_connected(self) -> None:
+        """A session is up and subscribed: clear the disconnect repair."""
+        async_delete_mqtt_issue(self.hass, self._config_entry)
+        self._arm_mqtt_silence_check()
+        # The MQTT status sensor and per-device connection-mode sensors read
+        # the client; nudge them now rather than on the next poll.
+        self.async_set_updated_data(self._states)
+        # Devices are poll-triggered responders (see async_publish_status_query)
+        # — query every device now that a session is actually confirmed live,
+        # rather than waiting up to a full _mqtt_status_poll_interval. This is
+        # the initial query for a fresh connection (a query attempted during
+        # _async_setup would race the handshake and lose — see the comment
+        # there) and also covers every later reconnect, so a drop-and-recover
+        # doesn't leave state stale for up to the full interval either.
+        # Skipped entirely when the user turned the re-query off (0).
+        if self._mqtt_status_poll_enabled:
+            self._config_entry.async_create_background_task(
+                self.hass,
+                self._poll_mqtt_status(),
+                name="govee_mqtt_connected_status_poll",
+            )
+
+    def _arm_mqtt_silence_check(self) -> None:
+        """Start the silent-session check for the session that just came up (#222)."""
+        client = self._mqtt_client
+        self._mqtt_queries_since_connect = 0
+        self._mqtt_missed_pushes_since_connect = 0
+        self._mqtt_silent_cleared = False
+        self._mqtt_inbound_at_connect = client.inbound_total if client is not None else 0
+        if self._mqtt_silence_unsub is not None:
+            self._mqtt_silence_unsub()
+            self._mqtt_silence_unsub = None
+        if self._shut_down:
+            return
+        self._mqtt_silence_unsub = async_call_later(self.hass, MQTT_SILENT_CHECK_DELAY, self._async_check_mqtt_silence)
+
+    def _note_mqtt_inbound(self) -> None:
+        """A message arrived: the session is not silent, so clear the watchdog state."""
+        self._mqtt_silent_reconnected = False
+        self._mqtt_silent_reported = False
+        # The repair outlives a reload (it is not persistent but the registry is
+        # per-run state of the old coordinator), so delete it idempotently, once
+        # per session rather than on every message (#282).
+        if not self._mqtt_silent_cleared:
+            self._mqtt_silent_cleared = True
+            async_delete_mqtt_silent_issue(self.hass, self._config_entry)
+
+    async def _async_check_mqtt_silence(self, _now: Any = None) -> None:
+        """Reconnect a silent session once, then raise the mqtt_silent repair (#222).
+
+        Silent means connected, not one inbound message since the session came
+        up, and either at least MQTT_SILENT_MIN_QUERIES status queries sent or
+        MQTT_SILENT_MIN_MISSED_PUSHES gateway readings that reached the cloud. A quiet
+        account with the re-query off, or one AWS IoT refuses status queries
+        for (#259), sends none, so it never counts as silent.
+        """
+        self._mqtt_silence_unsub = None
+        client = self._mqtt_client
+        if client is None or not client.connected:
+            return  # the next session re-arms the check
+        if client.inbound_total > self._mqtt_inbound_at_connect:
+            self._note_mqtt_inbound()
+            return
+        if self._mqtt_queries_since_connect >= MQTT_SILENT_MIN_QUERIES:
+            evidence = f"despite {self._mqtt_queries_since_connect} status queries"
+        elif self._mqtt_missed_pushes_since_connect >= MQTT_SILENT_MIN_MISSED_PUSHES:
+            evidence = self._missed_pushes_evidence()
+        else:
+            return
+        await self._async_handle_silent_session(evidence)
+
+    async def _async_handle_silent_session(self, evidence: str) -> None:
+        """Reconnect the silent session once, then raise the repair (#222).
+
+        Args:
+            evidence: Phrase naming what proved the silence, for the log.
+        """
+        if self._mqtt_silence_handling:
+            return
+        self._mqtt_silence_handling = True
+        try:
+            client = self._mqtt_client
+            if client is None:
+                return
+            minutes = MQTT_SILENT_CHECK_DELAY // 60
+            if not self._mqtt_silent_reconnected:
+                self._mqtt_silent_reconnected = True
+                _LOGGER.warning(
+                    "The AWS IoT session got no message in %d minutes %s; reconnecting once", minutes, evidence
+                )
+                # async_restart only reconnects for changed credentials.
+                await client.async_stop()
+                # An unload during the stop must not open a session on the dead coordinator.
+                if self._shut_down:
+                    return
+                await client.async_start()
+                return
+            if not self._mqtt_silent_reported:
+                self._mqtt_silent_reported = True
+                self._mqtt_silent_cleared = False
+                async_create_mqtt_silent_issue(self.hass, self._config_entry, minutes)
+        finally:
+            self._mqtt_silence_handling = False
+
+    @callback
+    def _on_mqtt_disconnected(self) -> None:
+        """A live session dropped: let status entities show it immediately."""
+        self._blame_status_query_for_drop()
+        self.async_set_updated_data(self._states)
+
+    def _blame_status_query_for_drop(self) -> None:
+        """Charge a session drop to the device whose status query is in flight.
+
+        AWS IoT closes the session, rather than answering, when it refuses a
+        publish — so a drop within MQTT_STATUS_QUERY_SPACING of a query is
+        that device's doing. The first strike is only logged: a network drop
+        can coincide with a sweep. At MQTT_STATUS_QUERY_QUARANTINE_STRIKES the
+        device is quarantined from every later sweep (until the entry
+        reloads), so the account subscription and the other devices' queries
+        survive it (issue #195).
+        """
+        device_id = self._status_query_in_flight
+        if device_id is None:
+            return
+        self._status_query_in_flight = None
+        strikes = self._status_query_strikes.get(device_id, 0) + 1
+        self._status_query_strikes[device_id] = strikes
+        device = self._devices.get(device_id)
+        label = f"{device.name} ({device.sku})" if device else device_id
+        self._status_query_unanswered_skus.add(device.sku if device else device_id)
+        if len(self._status_query_unanswered_skus) >= MQTT_STATUS_QUERY_ACCOUNT_REFUSAL_SKUS:
+            # Different models in a row and none answered: the account, not
+            # a device. Quarantining would only work through every device.
+            if not self._status_queries_refused:
+                self._status_queries_refused = True
+                _LOGGER.warning(
+                    "AWS IoT closed the MQTT session right after status queries to %d different "
+                    "models in a row (last: %s), with no status query answered in between, so it "
+                    "is refusing status queries for this account rather than for one device. "
+                    "Stopping the status re-query until the integration reloads; real-time updates "
+                    "stay up. Set the MQTT status re-query interval to 0 in the integration options "
+                    "to keep it off",
+                    len(self._status_query_unanswered_skus),
+                    label,
+                )
+            return
+        if strikes < MQTT_STATUS_QUERY_QUARANTINE_STRIKES:
+            _LOGGER.debug(
+                "AWS IoT session dropped right after the status query to %s (strike %d of %d)",
+                label,
+                strikes,
+                MQTT_STATUS_QUERY_QUARANTINE_STRIKES,
+            )
+            return
+        self._status_query_quarantine.add(device_id)
+        _LOGGER.warning(
+            "AWS IoT closed the MQTT session right after a status query to %s %d times; "
+            "leaving that device out of the status re-query until the integration reloads. "
+            "Other devices keep being queried and real-time updates stay up; please report "
+            "the model at https://github.com/lasswellt/govee-homeassistant/issues/195",
+            label,
+            strikes,
+        )
+
+    def _schedule_bff_leak_poll(self) -> None:
+        """Run one BFF leak-state poll, coalescing bursts.
+
+        Hubs push a multiSync frame per sensor per event; each used to spawn
+        its own HTTP poll, so a burst became that many concurrent Govee calls.
+        One pending poll covers every frame that arrived while it was queued.
+        """
+        if self._bff_poll_task is not None and not self._bff_poll_task.done():
+            return
+        self._bff_poll_task = self._config_entry.async_create_background_task(
+            self.hass, self._poll_bff_leak_state(), name="govee_bff_leak_poll"
+        )
+
+    def _on_mqtt_give_up(self, attempts: int, last_error: str) -> None:
+        """Called once by the MQTT client after MAX_RECONNECT_ATTEMPTS failures.
+
+        The client keeps retrying; this surfaces a repair so the user knows
+        real-time updates are down, and tries a throttled re-login in case
+        the account's certificate was rotated or revoked (a refreshed set
+        restarts the client via async_restart).
+        """
+        _LOGGER.warning(
+            "MQTT unhealthy after %d attempts (last error: %s) — surfacing repair",
+            attempts,
+            last_error,
+        )
+
+        async_create_mqtt_issue(
+            self.hass,
+            self._config_entry,
+            f"{attempts} reconnect attempts failed: {last_error}",
+        )
+
+        async def _surface() -> None:
+            await self._async_refresh_iot_credentials()
+
+        self._config_entry.async_create_background_task(self.hass, _surface(), name="govee_mqtt_give_up_issue")
+
+    @callback
+    def async_set_updated_data(self, data: dict[str, GoveeDeviceState]) -> None:
+        """Publish pushed or locally applied state without moving the cloud poll.
+
+        Home Assistant's version also cancels the pending poll and re-arms it a
+        full ``update_interval`` later. That suits a coordinator whose pushes
+        replace its poll; here the poll is the only source for devices with no
+        push channel, and every MQTT frame, gateway thermometer frame, LAN read
+        and OpenAPI event goes through this method. Once budget pacing or a
+        rate-limit back-off stretched the interval past the gap between pushes
+        (the MQTT status sweep alone answers every few minutes), the poll was
+        re-armed before it could ever fire, and the pacing that would shorten
+        the interval again only runs inside the poll: cloud-polled devices
+        froze until the entry reloaded (issue #214).
+
+        So a push never moves a poll that is already pending. It still arms
+        one when none is, on Home Assistant's own conditions (someone is
+        listening; ``_schedule_refresh`` checks the interval and
+        ``pref_disable_polling``), because a refresh that ends in
+        ConfigEntryAuthFailed leaves no poll armed, and until now the next
+        push was what brought it back.
+
+        The rest of the contract is unchanged: the data is published, a push
+        still counts as a successful update, and listeners are told. A
+        requested refresh waiting in its debouncer is left to run: a push
+        covers one device, the refresh all of them.
+        """
+        self.data = data
+        self.last_update_success = True
+        if self._listeners and self._unsub_refresh is None:
+            self._schedule_refresh()
+        self.async_update_listeners()
+
+    @property
+    def poll_in_progress(self) -> bool:
+        """Whether a whole-house poll is running."""
+        return self._poll_in_progress
+
+    def cloud_budget_tight(self) -> bool:
+        """Whether today's cloud requests are spent, or the configured cadence overspends.
+
+        Extra reads (a kettle's follow-ups, a heating kettle's every-cycle
+        poll) yield to the daily request budget (#204).
+        """
+        requests_today: object = self._api_client.requests_today
+        if isinstance(requests_today, int) and requests_today >= self._daily_request_budget:
+            return True
+        return poll_exceeds_budget(
+            requests_per_cycle=sum(1 for device in self._devices.values() if not device.is_group),
+            base_interval=int(self._original_update_interval.total_seconds()),
+            daily_budget=int(self._daily_request_budget),
+        )
+
+    def extra_cloud_read_allowed(self) -> bool:
+        """Whether a read outside the poll fits the rate limit and the daily budget."""
+        remaining: object = self._api_client.rate_limit_remaining
+        if self._rate_limited or (isinstance(remaining, int) and remaining < KETTLE_FOLLOWUP_MIN_REMAINING):
+            return False
+        return not self.cloud_budget_tight()
+
+    async def async_read_device(self, device_id: str) -> None:
+        """Read one device from the cloud now and notify listeners.
+
+        The whole-house poll keeps its schedule (listeners only).
+        """
+        device = self._devices.get(device_id)
+        if device is None:
+            return
+        # _fetch_device_state_bounded commits a fresh state itself.
+        result = await self._fetch_device_state_bounded(device_id, device)
+        if isinstance(result, GoveeDeviceState):
+            self.async_update_listeners()
+
+    def status_query_possible(self, device_id: str) -> bool:
+        """Whether a status query may go out to the device at all.
+
+        The same devices the sweep queries (``_mqtt_status_poll_targets``): MQTT
+        up, a topic known, not a group, the SKU not excluded and the device not
+        quarantined (#195), and AWS IoT not refusing status queries for the
+        whole account (#259).
+        """
+        client = self._mqtt_client
+        device = self._devices.get(device_id)
+        return (
+            client is not None
+            and client.connected
+            and device is not None
+            and not device.is_group
+            and device.sku not in MQTT_STATUS_QUERY_EXCLUDED_SKUS
+            and bool(self._device_topics.get(device_id))
+            and device_id not in self._status_query_quarantine
+            and not self._status_queries_refused
+        )
+
+    def status_query_throttled(self, device_id: str) -> bool:
+        """Whether the device had a status query less than REQUEST_STATUS_MIN_INTERVAL ago."""
+        last = self._status_request_last.get(device_id)
+        return last is not None and time.monotonic() - last < REQUEST_STATUS_MIN_INTERVAL
+
+    async def async_request_status(self, device_id: str, *, user: bool = False) -> bool:
+        """Ask a device to push its status over AWS IoT, if that may go out now.
+
+        The one path for status queries outside the sweep (``govee.request_status``,
+        its bursts and the kettle follow-ups). An MQTT publish, not a cloud
+        request. Queries are serialised with the sweep's and each holds the
+        in-flight marker for MQTT_STATUS_QUERY_SPACING, so a session drop is
+        charged to the device that caused it (#195) and the account sees at
+        most one query a second. A device gets at most one query per
+        REQUEST_STATUS_MIN_INTERVAL, whichever caller sent the last.
+
+        Args:
+            device_id: The device to query.
+            user: The user asked for it (the service): sent even with the
+                re-query option off, and waits its turn behind a query in
+                flight rather than being skipped.
+
+        Returns:
+            True if a query was sent.
+        """
+        if not user and not self._mqtt_status_poll_enabled:
+            return False
+        if not user and self._status_query_lock.locked():
+            return False
+        async with self._status_query_lock:
+            client = self._mqtt_client
+            if client is None or not self.status_query_possible(device_id) or self.status_query_throttled(device_id):
+                return False
+            self._status_request_last[device_id] = time.monotonic()
+            self._status_query_in_flight = device_id
+            try:
+                await client.async_publish_status_query(self._device_topics[device_id])
+                self._mqtt_queries_since_connect += 1
+                await asyncio.sleep(MQTT_STATUS_QUERY_SPACING)
+                if client.connected:
+                    # As in the sweep: the session outlived this query's window.
+                    self._status_query_unanswered_skus.clear()
+            finally:
+                if self._status_query_in_flight == device_id:
+                    self._status_query_in_flight = None
+            return True
+
+    async def _async_update_data(self) -> dict[str, GoveeDeviceState]:
+        """Fetch state for all devices (parallel).
+
+        Called by DataUpdateCoordinator on poll interval.
+        """
+        self._poll_in_progress = True
+        try:
+            return await self._async_poll_all()
+        finally:
+            self._poll_in_progress = False
+
+    async def _async_poll_all(self) -> dict[str, GoveeDeviceState]:
+        """The body of :meth:`_async_update_data`."""
+        # Pick up devices added to the account since setup (#101). Throttled and
+        # failure-isolated inside the method so it never disrupts the state poll.
+        await self._async_maybe_rediscover_devices()
+
+        if not self._devices:
+            return self._states
+
+        # Bluetooth proxies register their scanners after this integration
+        # sets up, so the advertisement callbacks are refused at setup time and
+        # BLE-capable devices would stay cloud-only until a manual reload.
+        self._ble_handler.enroll_from_cache()
+
+        # Devices the user has fully disabled cost a cloud request per poll and
+        # give nothing back. On an install where a batch of devices moved to
+        # another protocol, that is the largest slice of the daily API budget.
+        fully_disabled = self._devices_with_all_entities_disabled()
+        pollable = {
+            device_id: device for device_id, device in self._devices.items() if device_id not in fully_disabled
+        }
+        skipped = len(self._devices) - len(pollable)
+        if skipped:
+            _LOGGER.debug("Skipping %d device(s) with all entities disabled", skipped)
+
+        # Local readback must still run when REST is skipped for budget or
+        # MQTT freshness. Captured before the skips below; it runs after the
+        # cloud fetch so a slow UART read never delays the cloud state.
+        h6104_readback_ids = [did for did, dev in pollable.items() if dev.sku == "H6104"]
+
+        # Devices a local transport has already reported on more recently than
+        # one poll interval need no cloud read this cycle (see
+        # _locally_fresh_devices).
+        # Pacing is sized on the full pollable set, not what is left after the
+        # skip: the skip changes from cycle to cycle as devices' runs come due,
+        # and sizing on it would swing the interval with them.
+        pacing_size = len(pollable)
+        # Whether any device left could ever make a fresh cloud read. If none
+        # can (the device that drew a 429 was removed and only groups, H5054s or
+        # BFF thermometers remain), nothing would ever clear a 429 back-off.
+        has_cloud_readable = any(
+            not self._makes_no_cloud_read(device_id, device) for device_id, device in pollable.items()
+        )
+        locally_fresh = self._locally_fresh_devices(pollable)
+        if locally_fresh:
+            _LOGGER.debug(
+                "Skipping %d cloud read(s) covered by a fresher local reading",
+                len(locally_fresh),
+            )
+            pollable = {device_id: device for device_id, device in pollable.items() if device_id not in locally_fresh}
+
+        # Devices that have been off and unchanged for a while are asked
+        # about less often (see _idle_devices_to_skip) — but only on an install
+        # whose full cadence would overspend the daily budget. Under budget the
+        # user's configured interval applies to every device, as before.
+        if poll_exceeds_budget(
+            requests_per_cycle=pacing_size,
+            base_interval=int(self._original_update_interval.total_seconds()),
+            daily_budget=int(self._daily_request_budget),
+        ):
+            idle = self._idle_devices_to_skip(pollable)
+            if idle:
+                _LOGGER.debug("Holding back %d idle device(s) this cycle", len(idle))
+                pollable = {device_id: device for device_id, device in pollable.items() if device_id not in idle}
+
+        # Govee's own numbers get the last word: if the allowance left will
+        # not cover this cycle, wait for it to refill rather than spending
+        # the requests that would earn a 429. A deferred cycle is an empty one:
+        # it still runs the tail below, and does not re-pace over the interval
+        # the deferral just chose.
+        # While a 429 back-off is in force it owns the interval: the headers
+        # it came with are stale by the time it has been waited out, and
+        # deferring on them would double the wait.
+        deferred = bool(pollable) and not self._rate_limited and self._defer_for_rate_limit_headers(len(pollable))
+        if deferred:
+            pollable = {}
+
+        # Create tasks for parallel fetching. Each fetch carries its own
+        # deadline: a single timeout around the whole gather discarded every
+        # device's result as soon as one device was slow, so one unreachable
+        # bulb held the entire house's state hostage for that cycle.
+        # When local readings covered every device there is nothing to fetch, but
+        # the rest of the cycle (transport health, LAN rescan, pacing) still runs.
+        tasks = [self._fetch_device_state_bounded(device_id, device) for device_id, device in pollable.items()]
+
+        self._cycle_cached_ids = frozenset()
+        self._cycle_rate_limited = False
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        cached_ids = self._cycle_cached_ids
+
+        # The throttled helper skips duplicate UART queries.
+        await asyncio.gather(*(self._async_refresh_h6104_ble_status(did) for did in h6104_readback_ids))
+
+        # Process results. Held state handed back without a fresh cloud read
+        # (a 429, a group, ...) is kept but is not a successful update: it
+        # says nothing about whether the cloud is answering.
+        successful_updates = 0
+        outage_errors: list[Exception] = []
+        for device_id, result in zip(pollable.keys(), results):
+            if isinstance(result, GoveeDeviceState):
+                # Already committed by _fetch_device_state_bounded.
+                if device_id not in cached_ids:
+                    successful_updates += 1
+            elif isinstance(result, GoveeAuthError):
+                raise ConfigEntryAuthFailed("Invalid API key") from result
+            elif isinstance(result, Exception):
+                _LOGGER.debug(
+                    "Failed to fetch state for %s: %s",
+                    device_id,
+                    result,
+                )
+                # Keep previous state on error
+                if _is_outage_error(result):
+                    outage_errors.append(result)
+
+        # Clear rate limit issue and restore poll interval once real reads
+        # succeed in a cycle where no device was refused with a 429, or once
+        # no device is left that reads from the cloud at all.
+        if self._rate_limited and not self._cycle_rate_limited and (successful_updates > 0 or not has_cloud_readable):
+            self._rate_limited = False
+            self.update_interval = self._original_update_interval
+            _LOGGER.info(
+                "Rate limit cleared, restoring poll interval to %s",
+                self._original_update_interval,
+            )
+            async_delete_rate_limit_issue(self.hass, self._config_entry)
+
+        # Pace the next tick against what today's polling has already cost.
+        if not deferred:
+            self._apply_budget_pacing(pacing_size)
+
+        # Refresh transport-health snapshots tied to coordinator cadence.
+        self._refresh_mqtt_health()
+        self._refresh_ble_staleness()
+
+        # LAN overlay (issue #57): re-correlate (throttled) then overlay the
+        # fresh cloud state with the latest solicited devStatus reads. Runs AFTER
+        # the cloud fan-in so LAN overlays FRESH cloud objects, never the reverse,
+        # and mutates in place so the return below (or, during a total cloud
+        # outage, the UpdateFailed path) fires HA listeners without a
+        # re-entrant async_set_updated_data. Failure-isolated: a LAN hiccup must
+        # never fail the state poll.
+        try:
+            await self._async_maybe_rescan_lan()
+            await self._refresh_lan_reads()
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("Govee LAN read refresh failed: %s", err)
+        # Expire old health even when the rescan/read itself failed.
+        self._refresh_lan_staleness()
+
+        # Report a total cloud outage only AFTER local reads and health checks.
+        # Cloud-dependent entities still follow coordinator failure; a main
+        # light can use its independently refreshed LAN availability.
+        # Devices answered from held state (groups, H5054, BFF thermometers,
+        # not-found) say nothing either way and are left out of the count; a
+        # 429 proves the cloud answered, so it is never an outage.
+        cloud_results = sum(1 for device_id in pollable if device_id not in cached_ids)
+        if (
+            cloud_results
+            and successful_updates == 0
+            and not self._cycle_rate_limited
+            and len(outage_errors) == cloud_results
+        ):
+            if not self.last_update_success:
+                # HA notifies on the first failed refresh, but suppresses
+                # listeners on consecutive failures. Publish local state and
+                # health changes without declaring the cloud recovered.
+                self.async_update_listeners()
+            raise UpdateFailed(
+                f"Govee cloud API unreachable for all {cloud_results} device(s): " f"{outage_errors[0]}"
+            ) from outage_errors[0]
+
+        return self._states
+
+    def _owning_device_id(self, unique_id: str) -> str | None:
+        """Map an entity registry unique_id back to the device it belongs to.
+
+        Entity unique_ids are either the bare device id (entity.py) or the
+        device id followed by an underscore-prefixed suffix (every SUFFIX_* in
+        const.py starts with "_"). Testing a bare prefix instead would let one
+        device claim another's entities whenever one id is a prefix of the
+        other, which is not hypothetical: group devices carry purely numeric
+        ids, where prefix collisions are easy.
+        """
+        if unique_id in self._devices:
+            return unique_id
+        head = unique_id.split("_", 1)[0]
+        if head in self._devices:
+            return head
+        # Device ids are MAC-shaped or numeric, so the split above resolves
+        # them all; this is the safety net if that ever stops being true.
+        for device_id in self._devices:
+            if unique_id.startswith(f"{device_id}_"):
+                return device_id
+        return None
+
+    def _devices_with_all_entities_disabled(self) -> set[str]:
+        """Device ids that have registry entities and every one is disabled.
+
+        Polling such a device buys nothing: no entity will ever show the
+        result. Each one still spends a request against Govee's documented
+        10,000/day budget every cycle.
+
+        The common cause is a device that a better transport took over — moved
+        to Matter, or controlled locally by another integration — whose cloud
+        twin was disabled here rather than removed. Those twins stay in the
+        account device list forever, so on a mature install they can outnumber
+        the devices still in use and dominate the daily spend. The cause does
+        not matter to this check: any device the user has fully switched off is
+        one the cloud need not be asked about.
+
+        Built in a single pass over the registry. Asking per device would walk
+        the whole entity list once per device on every poll, which is
+        quadratic for no gain.
+
+        A device with no registry entries is deliberately absent from the
+        result — that is the normal state during first setup, before platforms
+        have added their entities, and skipping then would stall discovery.
+        A registry failure returns an empty set, so nothing is ever skipped
+        because the lookup broke.
+        """
+        try:
+            registry = er.async_get(self.hass)
+            entries = er.async_entries_for_config_entry(registry, self._config_entry.entry_id)
+        except Exception as err:  # noqa: BLE001 - registry must never fail a poll
+            _LOGGER.debug("Entity registry unavailable, polling every device: %s", err)
+            return set()
+
+        has_entities: set[str] = set()
+        has_enabled: set[str] = set()
+        for entry in entries:
+            device_id = self._owning_device_id(entry.unique_id)
+            if device_id is None:
+                continue
+            has_entities.add(device_id)
+            if entry.disabled_by is None:
+                has_enabled.add(device_id)
+        return has_entities - has_enabled
+
+    def _entities_all_disabled(self, device_id: str) -> bool:
+        """True when this one device has entities and all of them are disabled."""
+        return device_id in self._devices_with_all_entities_disabled()
+
+    def _defer_for_rate_limit_headers(self, requests_per_cycle: int) -> bool:
+        """Back off on the API's reported allowance, before a 429 happens.
+
+        ``X-RateLimit-Remaining``/``-Reset`` were parsed and displayed but
+        throttled nothing; only a hard 429 reacted, which meant the only way
+        to learn the window was exhausted was to exhaust it.
+
+        Returns True when this cycle should be skipped entirely, having set
+        ``update_interval`` to cover the reset. Isolated from bad readings:
+        a header that does not parse as a number leaves the poll alone.
+        """
+        # Annotated as unknown on purpose. These are parsed from response
+        # headers, so the guard below is a real runtime check rather than a
+        # formality — typing them as the int the client promises would make
+        # the check dead code to a type checker while it still fires in a
+        # test, which is worse than either alone.
+        if self._header_deferred:
+            # One deferral at a time. The headers only refresh when a response
+            # arrives, and a deferred cycle makes no requests, so a reading of
+            # "0 left, resets in 30s" would otherwise repeat identically on every
+            # tick and stall the poll until a command happened to refresh it.
+            # Having waited out one reset, poll; the responses update the numbers.
+            self._header_deferred = False
+            return False
+
+        remaining: object = self._api_client.rate_limit_remaining
+        reset_in: object = self._api_client.rate_limit_reset_in
+        if not isinstance(remaining, int) or not isinstance(reset_in, int):
+            # Headers that did not parse as numbers are no reason to stall a
+            # poll. Tested explicitly, because silently deferring forever on
+            # a malformed header would look exactly like a dead integration.
+            _LOGGER.debug("Rate-limit headers unusable, polling as normal")
+            return False
+
+        interval = header_backoff_interval(
+            remaining=remaining,
+            reset_in=reset_in,
+            requests_per_cycle=requests_per_cycle,
+            base_interval=int(self._original_update_interval.total_seconds()),
+            max_interval=MAX_BUDGET_PACED_INTERVAL,
+        )
+        if interval is None:
+            return False
+
+        _LOGGER.debug(
+            "Govee reports %s request(s) left, this cycle needs %d — deferring %ds until reset",
+            self._api_client.rate_limit_remaining,
+            requests_per_cycle,
+            interval,
+        )
+        self.update_interval = timedelta(seconds=interval)
+        self._header_deferred = True
+        return True
+
+    def _note_state_change(self, device_id: str, state: GoveeDeviceState) -> None:
+        """Stamp the time a freshly read state differs from the one held.
+
+        Only the user-visible control fields count. Anything that ticks on
+        its own — a temperature reading, an RSSI — would make every device
+        look permanently busy and defeat the idle cadence entirely.
+        """
+        previous = self._states.get(device_id)
+        if previous is None:
+            return
+        changed = (
+            previous.power_state,
+            previous.brightness,
+            previous.color,
+            previous.color_temp_kelvin,
+        ) != (
+            state.power_state,
+            state.brightness,
+            state.color,
+            state.color_temp_kelvin,
+        )
+        if changed:
+            self._state_changed_at[device_id] = dt_util.utcnow()
+
+    def _idle_devices_to_skip(self, pollable: dict[str, GoveeDevice]) -> set[str]:
+        """Devices sitting out this cycle because they have been idle.
+
+        A device that has been off with no observed change for
+        IDLE_DEVICE_AFTER_SECONDS is polled one cycle in
+        IDLE_DEVICE_POLL_DIVISOR; a device commanded inside
+        RECENT_COMMAND_WINDOW_SECONDS is always polled, because the poll
+        right after a write is the one that confirms it landed.
+
+        The counter advances for every candidate device each cycle, so the
+        cadence stays in step even while a device moves in and out of idle.
+        """
+        now = dt_util.utcnow()
+        skipped: set[str] = set()
+        for device_id in pollable:
+            if device_id not in self._poll_cycle_counts:
+                # Start each device at its own point in the cycle. Every counter
+                # starting at zero would put all idle devices on the same beat,
+                # so one cycle in four would poll them all at once and the
+                # request count per cycle (and the pacing sized on it) would
+                # swing between the two.
+                self._poll_cycle_counts[device_id] = zlib.crc32(device_id.encode()) % IDLE_DEVICE_POLL_DIVISOR
+            count = self._poll_cycle_counts[device_id]
+            self._poll_cycle_counts[device_id] = count + 1
+
+            state = self._states.get(device_id)
+            if state is None:
+                continue
+
+            changed_at = self._state_changed_at.get(device_id)
+            commanded_at = self.device_last_command_sent(device_id)
+            divisor = cloud_poll_divisor(
+                is_off=not state.power_state,
+                seconds_since_change=None if changed_at is None else (now - changed_at).total_seconds(),
+                seconds_since_command=None if commanded_at is None else (now - commanded_at).total_seconds(),
+                idle_after=IDLE_DEVICE_AFTER_SECONDS,
+                recent_command_window=RECENT_COMMAND_WINDOW_SECONDS,
+                idle_divisor=IDLE_DEVICE_POLL_DIVISOR,
+            )
+            if divisor > 1 and count % divisor != 0:
+                skipped.add(device_id)
+        return skipped
+
+    def _locally_fresh_devices(self, pollable: dict[str, GoveeDevice]) -> set[str]:
+        """Devices whose newest local reading makes this cycle's cloud read moot.
+
+        LAN, MQTT and BLE carry the same power/brightness/colour fields the
+        cloud poll returns, and they cost nothing against Govee's quota. The
+        integration used to overlay them *after* the cloud call was already
+        spent; checking first is where the bulk of the saving on a large
+        install comes from.
+
+        A device qualifies only when it already has state to serve (nothing is
+        ever skipped before its first successful read) and when
+        :func:`request_budget.local_reading_is_fresh` agrees the reading is
+        recent enough and the skip run is not yet capped. The skip counter is
+        reset for every device that is going to be polled, so a device cycles
+        between skipping and reconciling rather than drifting.
+        """
+        window = (self.update_interval or self._original_update_interval).total_seconds()
+        window *= LOCAL_READING_FRESHNESS_FACTOR
+        now = dt_util.utcnow()
+        fresh: set[str] = set()
+        for device_id, device in pollable.items():
+            if device_id not in self._states:
+                continue
+            # A push can create a kettle's state before the poll that tells its
+            # unit; that poll is never skipped (see kettle/manager.py).
+            if device.decodes_kettle_frames and self.kettles.must_poll(device_id):
+                continue
+            latest = self._local_last_updated(device_id)
+            age = None if latest is None else (now - latest).total_seconds()
+            if device_id not in self._local_fresh_skips:
+                # First sighting: start each device part-way through its run of
+                # skips, at a fixed per-device offset. Every device beginning at
+                # zero would reach the cap together and make one burst of cloud
+                # reads every sixth cycle; the offsets spread those reads out.
+                self._local_fresh_skips[device_id] = zlib.crc32(device_id.encode()) % MAX_LOCAL_FRESH_SKIPS
+            if local_reading_is_fresh(
+                seconds_since_local_reading=age,
+                freshness_window=window,
+                consecutive_skips=self._local_fresh_skips[device_id],
+                max_consecutive_skips=MAX_LOCAL_FRESH_SKIPS,
+            ):
+                fresh.add(device_id)
+                self._local_fresh_skips[device_id] += 1
+            else:
+                self._local_fresh_skips[device_id] = 0
+        return fresh
+
+    def _local_last_updated(self, device_id: str) -> datetime | None:
+        """When a LAN or MQTT reading was last applied to this device's state, or None.
+
+        Reads ``last_read_ts``, not ``last_success_ts``: the latter also moves on
+        a write-only LAN send, a successful BLE command and a LAN readback that
+        was discarded as a mismatch, none of which tell us what the device's
+        state is. ``cloud_api`` is excluded too — the cloud's own last success
+        cannot say whether a local source made the cloud read redundant.
+        """
+        latest: datetime | None = None
+        for kind in ("lan", "mqtt"):
+            health = self._transport.get(device_id, kind)
+            if health is None or health.last_read_ts is None:
+                continue
+            if latest is None or health.last_read_ts > latest:
+                latest = health.last_read_ts
+        return latest
+
+    def _apply_budget_pacing(self, requests_per_cycle: int) -> None:
+        """Stretch the poll interval so the day's spend lands on the budget.
+
+        Reads the API client's running daily counter (the same figure the
+        "API rate limit remaining" sensor exposes as ``requests_today``) and
+        asks :func:`request_budget.budget_paced_interval` what spacing the
+        rest of today can afford. Only ever slows the poll down, never speeds
+        it past the user's configured interval.
+
+        Skipped entirely while a 429 back-off is in force: that back-off is
+        the stronger constraint and owns ``update_interval`` until it clears.
+
+        The counter is a floor — requests that die below the HTTP layer are
+        never counted — so the true spend can exceed what this sees. That is
+        why the default budget is 9,000 against a 10,000 cap: the gap absorbs
+        the undercount along with commands, scene fetches and rediscovery.
+        """
+        if self._rate_limited:
+            return
+
+        now = time.time()
+        seconds_remaining_today = int(86400 - (now % 86400))
+        # Same reasoning as _defer_for_rate_limit_headers: checked, not trusted.
+        requests_today: object = self._api_client.requests_today
+        daily_budget: object = self._daily_request_budget
+        if not isinstance(requests_today, int) or not isinstance(daily_budget, int):
+            # Pacing is an optimisation, never a reason to disturb a poll: if
+            # a counter reads back as something non-numeric, leave the
+            # interval where the user put it.
+            _LOGGER.debug("Budget pacing skipped, counters unusable")
+            return
+
+        interval = budget_paced_interval(
+            base_interval=int(self._original_update_interval.total_seconds()),
+            requests_today=requests_today,
+            requests_per_cycle=requests_per_cycle,
+            seconds_remaining_today=seconds_remaining_today,
+            daily_budget=daily_budget,
+            max_interval=MAX_BUDGET_PACED_INTERVAL,
+        )
+        paced = timedelta(seconds=interval)
+        base_seconds = int(self._original_update_interval.total_seconds())
+        if interval > base_seconds and not self._budget_pacing_announced:
+            # The one thing here a user can act on: polls are slower than the
+            # interval they configured, and why. Said once per run, not per tick.
+            self._budget_pacing_announced = True
+            _LOGGER.info(
+                "Polling every %ds instead of the configured %ds to stay within the daily cloud "
+                "request budget of %d; raise the budget in the integration options or "
+                "rely on LAN/MQTT for live state",
+                interval,
+                base_seconds,
+                self._daily_request_budget,
+            )
+        if paced != self.update_interval:
+            _LOGGER.debug(
+                "Budget pacing: %d request(s)/cycle, %d spent today of %d budget " "-> poll interval %ds",
+                requests_per_cycle,
+                self._api_client.requests_today,
+                self._daily_request_budget,
+                interval,
+            )
+            self.update_interval = paced
+
+    def _makes_no_cloud_read(self, device_id: str, device: GoveeDevice) -> bool:
+        """True for a device whose poll is always answered from held state.
+
+        Mirrors the shortcuts at the top of :meth:`_fetch_device_state`.
+        """
+        return device.is_group or device.supports_water_leak_event or device_id in self._bff_thermometer_ids
+
+    def _mark_cached_result(self, device_id: str) -> None:
+        """Note that this cycle's state for a device is held state, not a fresh read."""
+        self._cycle_cached_ids = self._cycle_cached_ids | {device_id}
+
+    async def _fetch_device_state_bounded(
+        self,
+        device_id: str,
+        device: GoveeDevice,
+    ) -> GoveeDeviceState | Exception:
+        """Fetch one device's state under its own deadline.
+
+        Returns the exception rather than raising so ``asyncio.gather`` keeps
+        every other device's result. ``_fetch_device_state`` already converts
+        most failures into a returned exception; this bounds the call in time
+        and catches anything that escapes, so a device that never answers
+        costs only its own slot in the poll.
+
+        Args:
+            device_id: Device identifier.
+            device: Device instance.
+
+        Returns:
+            GoveeDeviceState, or the Exception that stopped the fetch.
+        """
+        try:
+            async with asyncio.timeout(STATE_FETCH_TIMEOUT):
+                result = await self._fetch_device_state(device_id, device)
+        except TimeoutError as err:
+            _LOGGER.debug(
+                "State fetch for %s timed out after %ds",
+                device_id,
+                STATE_FETCH_TIMEOUT,
+            )
+            self._record_transport_failure(device_id, "cloud_api", "poll_timeout")
+            return err
+        except Exception as err:  # noqa: BLE001 - isolate one device's failure
+            self._record_transport_failure(device_id, "cloud_api", str(err))
+            return err
+        if isinstance(result, GoveeDeviceState):
+            # Commit as soon as this device's state is built, not after the
+            # whole gather: the new state was merged from the object held right
+            # now, and a command or MQTT push landing on that object while a
+            # slower device is still being read would otherwise be overwritten.
+            self._note_state_change(device_id, result)
+            self._states[device_id] = result
+        return result
+
+    async def _fetch_device_state(
+        self,
+        device_id: str,
+        device: GoveeDevice,
+    ) -> GoveeDeviceState | Exception:
+        """Fetch state for a single device.
+
+        Args:
+            device_id: Device identifier.
+            device: Device instance.
+
+        Returns:
+            GoveeDeviceState or Exception on error.
+        """
+        # Skip API call for group devices - state fetch always fails with 400
+        if device.is_group:
+            self._mark_cached_result(device_id)
+            existing = self._states.get(device_id)
+            if existing:
+                # Group devices are always "available"; return a new instance
+                # so listeners see a fresh object on identity comparison.
+                refreshed = dataclasses.replace(existing, online=True)
+                self._states[device_id] = refreshed
+                return refreshed
+            return GoveeDeviceState.create_empty(device_id)
+
+        # Standalone water detectors (H5054) carry no useful developer-API state
+        # — the poll only ever returns online=false and never the leak event.
+        # Their online/leak state is owned by the BFF warnMessage poll
+        # (_poll_water_detectors); a developer poll here would clobber it every
+        # cycle. Preserve the BFF-managed state and skip the call (issue #62).
+        if device.supports_water_leak_event:
+            self._mark_cached_result(device_id)
+            return self._states.get(device_id) or GoveeDeviceState.create_empty(device_id)
+
+        # BFF-discovered thermo-hygrometers (H5301) are absent from the Developer
+        # API, so /device/state would 400/return empty and clobber the
+        # BFF-managed reading. State is owned by _refresh_bff_thermometers (#86).
+        if device_id in self._bff_thermometer_ids:
+            self._mark_cached_result(device_id)
+            return self._states.get(device_id) or GoveeDeviceState.create_empty(device_id)
+
+        await self._async_refresh_h6104_ble_status(device_id)
+        try:
+            state = await self._api_client.get_device_state(device_id, device.sku)
+            self._record_transport_success(device_id, "cloud_api")
+            if device.mqtt_outlet_count:
+                self._apply_outlet_mask(device, state, self._raw_power_switch_value(device_id))
+
+            # Preserve optimistic state fields that API doesn't reliably return.
+            # Clear them when device is turned off (no longer active).
+            existing_state = self._states.get(device_id)
+            if existing_state:
+                # Optimistic grace period (issue #60): if a control command
+                # just fired, the device may not yet be visible to the cloud
+                # (e.g. BLE-out-of-range or slow AWS propagation). Preserve
+                # the optimistic power/brightness for a short window instead
+                # of flipflopping the UI. MQTT pushes clear the window early.
+                # The grace test is shared with the LAN read path (#57).
+                if self._in_optimistic_grace(existing_state) and existing_state.power_state != state.power_state:
+                    _LOGGER.debug(
+                        "Preserving optimistic power for %s during grace " "(API=%s optimistic=%s)",
+                        device_id,
+                        state.power_state,
+                        existing_state.power_state,
+                    )
+                    state.power_state = existing_state.power_state
+                    state.brightness = existing_state.brightness
+                    state.source = "optimistic"
+                    state.last_optimistic_update = existing_state.last_optimistic_update
+
+                # Log state transitions from API for debugging stale-state issues
+                if existing_state.power_state != state.power_state:
+                    _LOGGER.debug(
+                        "API state change for %s: power %s -> %s (was source=%s)",
+                        device_id,
+                        existing_state.power_state,
+                        state.power_state,
+                        existing_state.source,
+                    )
+                if existing_state.brightness != state.brightness:
+                    _LOGGER.debug(
+                        "API state change for %s: brightness %s -> %s",
+                        device_id,
+                        existing_state.brightness,
+                        state.brightness,
+                    )
+                # Scenes persist on device across power cycles — always preserve
+                if existing_state.active_scene:
+                    state.active_scene = existing_state.active_scene
+                if existing_state.active_scene_name:
+                    state.active_scene_name = existing_state.active_scene_name
+                # DIY scenes also persist across power cycles
+                if existing_state.active_diy_scene:
+                    state.active_diy_scene = existing_state.active_diy_scene
+
+                # Govee API returns colorRgb=0 when the device is in certain
+                # modes (scenes, color_temp, music, etc.).  This sentinel value
+                # is not meaningful — preserve the last known real color so the
+                # HA UI doesn't flash black after every poll cycle.
+                if (
+                    state.color is not None
+                    and state.color.as_packed_int == 0
+                    and existing_state.color is not None
+                    and existing_state.color.as_packed_int != 0
+                ):
+                    state.color = existing_state.color
+                # Preserve restore-target fields across API polls.
+                # These are "memory" fields — always preserved regardless of power state.
+                if existing_state.last_color is not None:
+                    state.last_color = existing_state.last_color
+                if existing_state.last_color_temp_kelvin is not None:
+                    state.last_color_temp_kelvin = existing_state.last_color_temp_kelvin
+                if existing_state.last_scene_id is not None:
+                    state.last_scene_id = existing_state.last_scene_id
+                if existing_state.last_scene_name is not None:
+                    state.last_scene_name = existing_state.last_scene_name
+
+                # Heater state: keep the last known value only when the poll
+                # omits it (the API doesn't reliably return these); a polled
+                # value wins so changes made in the Govee app show up.
+                if existing_state.heater_temperature is not None and state.heater_temperature is None:
+                    state.heater_temperature = existing_state.heater_temperature
+                if existing_state.heater_auto_stop is not None and state.heater_auto_stop is None:
+                    state.heater_auto_stop = existing_state.heater_auto_stop
+                if existing_state.heater_thermostat is not None and state.heater_thermostat is None:
+                    state.heater_thermostat = existing_state.heater_thermostat
+                if existing_state.device_temperature_unit is not None and state.device_temperature_unit is None:
+                    state.device_temperature_unit = existing_state.device_temperature_unit
+                if device.decodes_kettle_frames:
+                    self.kettles.merge_poll(device_id, existing_state, state)
+
+                # Stand-alone thermometer/hygrometer readings (H5179, H5109,
+                # H5110, HS5108, HS5106): battery-powered sensors push to the
+                # cloud infrequently, and the /device/state response may omit
+                # the value or return null between device-side updates. Without
+                # preservation the entity flips to "unknown" after the first
+                # poll. (#78 follow-up: temperature stops updating until restart.)
+                if existing_state.sensor_temperature is not None and state.sensor_temperature is None:
+                    state.sensor_temperature = existing_state.sensor_temperature
+                if existing_state.sensor_humidity is not None and state.sensor_humidity is None:
+                    state.sensor_humidity = existing_state.sensor_humidity
+
+                # Battery and water-tank-full are owned by the BFF poll — the
+                # Developer /device/state response carries neither, so the fresh
+                # state has them as None. Preserve the BFF-applied values across
+                # the developer poll that runs ~5x between BFF cycles, or they
+                # would flicker to "unknown" each poll (issues #83, #118).
+                if existing_state.battery is not None and state.battery is None:
+                    state.battery = existing_state.battery
+                if existing_state.water_full is not None and state.water_full is None:
+                    state.water_full = existing_state.water_full
+                # Pump-abnormal and hose-connection mode (H7152) are decoded
+                # only from AWS IoT push frames — the Developer poll has no
+                # field for either, so the fresh state has them as None.
+                # Preserve the push-derived values across the poll or the
+                # sensors flicker to "unknown" every poll cycle (same class
+                # of bug as #118/#124).
+                if existing_state.pump_state is not None and state.pump_state is None:
+                    state.pump_state = existing_state.pump_state
+                if existing_state.dehumidifier_mode is not None and state.dehumidifier_mode is None:
+                    state.dehumidifier_mode = existing_state.dehumidifier_mode
+                # Power monitoring (H5086) is decoded only from AWS IoT push
+                # frames, same reasoning as the pump/hose fields above (#200).
+                if existing_state.voltage is not None and state.voltage is None:
+                    state.voltage = existing_state.voltage
+                if existing_state.current is not None and state.current is None:
+                    state.current = existing_state.current
+                if existing_state.power_draw is not None and state.power_draw is None:
+                    state.power_draw = existing_state.power_draw
+                if existing_state.energy_total is not None and state.energy_total is None:
+                    state.energy_total = existing_state.energy_total
+                if existing_state.power_factor is not None and state.power_factor is None:
+                    state.power_factor = existing_state.power_factor
+                # PM2.5 (H5106) is decoded only from AWS IoT push frames — the
+                # Developer poll has no field for it at all (#200). Note
+                # sensor_temperature/sensor_humidity are already preserved
+                # above; this SKU's fresher push values benefit from that
+                # existing preservation too.
+                if existing_state.pm25 is not None and state.pm25 is None:
+                    state.pm25 = existing_state.pm25
+                # Occupancy (H5127) is a momentary push event; the developer
+                # /device/state poll returns only `online` for it (never the
+                # bodyAppearedEvent value), so the fresh state has presence=None.
+                # Preserve the last pushed value or the occupancy sensor would
+                # reset to "unknown" on every poll (issue #124).
+                if existing_state.presence is not None and state.presence is None:
+                    state.presence = existing_state.presence
+
+                # Integrated ceiling fan and named light toggles (H1310/H1370):
+                # the Developer poll returns "" for every one of them, so the
+                # fresh state has nothing — carry the push-derived / optimistic
+                # values across or the fan entity would fall back to its
+                # restored state on every poll (issue #181). Toggles the poll
+                # DID return (e.g. socketToggle1 on the H5089) win.
+                if existing_state.ceiling_fan_on is not None and state.ceiling_fan_on is None:
+                    state.ceiling_fan_on = existing_state.ceiling_fan_on
+                if existing_state.ceiling_fan_speed is not None and state.ceiling_fan_speed is None:
+                    state.ceiling_fan_speed = existing_state.ceiling_fan_speed
+                if existing_state.ceiling_fan_reverse is not None and state.ceiling_fan_reverse is None:
+                    state.ceiling_fan_reverse = existing_state.ceiling_fan_reverse
+                if existing_state.ceiling_fan_swing is not None and state.ceiling_fan_swing is None:
+                    state.ceiling_fan_swing = existing_state.ceiling_fan_swing
+                for toggle_instance, toggle_value in existing_state.toggles.items():
+                    state.toggles.setdefault(toggle_instance, toggle_value)
+
+                # Stamp when the reading last changed (after preservation, so a
+                # preserved-unchanged value does not count as a change).
+                self._note_sensor_reading_change(device_id, state, existing_state)
+
+                self._preserve_optimistic_field(existing_state, state, device_id, "dreamview_enabled", "DreamView")
+                # Music mode has extra fields to preserve alongside the flag
+                if existing_state.music_mode_enabled:
+                    if state.power_state:
+                        state.music_mode_enabled = existing_state.music_mode_enabled
+                        state.music_mode_value = existing_state.music_mode_value
+                        state.music_mode_name = existing_state.music_mode_name
+                        state.music_sensitivity = existing_state.music_sensitivity
+                    else:
+                        _LOGGER.debug(
+                            "Clearing music mode for %s (device turned off)",
+                            device_id,
+                        )
+
+            self._merge_h6104_ble_fields(device_id, state)
+            return state
+
+        except GoveeDeviceNotFoundError:
+            # Expected for group devices - use existing/optimistic state
+            _LOGGER.debug("State query failed for group device %s [expected]", device_id)
+            self._mark_cached_result(device_id)
+            existing = self._states.get(device_id)
+            if existing:
+                existing.online = True  # Group devices are always "available"
+                return existing
+            return GoveeDeviceState.create_empty(device_id)
+
+        except GoveeRateLimitError as err:
+            _LOGGER.warning("Rate limit hit, keeping previous state")
+            self._cycle_rate_limited = True
+            self._mark_cached_result(device_id)
+            # Create rate limit repair issue and back off (only once)
+            if not self._rate_limited:
+                self._rate_limited = True
+                reset_time = "unknown"
+                # Back off: increase poll interval to retry_after or 120s, but
+                # never below the current one. Budget pacing may already have
+                # stretched it further, and a 429 is no reason to poll faster.
+                backoff_seconds = int(err.retry_after) if err.retry_after else 120
+                if self.update_interval is not None:
+                    backoff_seconds = max(backoff_seconds, int(self.update_interval.total_seconds()))
+                self.update_interval = timedelta(seconds=backoff_seconds)
+                _LOGGER.warning(
+                    "Rate limited, increasing poll interval to %ds",
+                    backoff_seconds,
+                )
+                if err.retry_after:
+                    reset_time = f"{int(err.retry_after)} seconds"
+                async_create_rate_limit_issue(self.hass, self._config_entry, reset_time)
+            existing = self._states.get(device_id)
+            return existing if existing else GoveeDeviceState.create_empty(device_id)
+
+        except Exception as err:
+            self._record_transport_failure(device_id, "cloud_api", str(err))
+            existing = self._states.get(device_id)
+            if device.sku == "H6104" and existing is not None:
+                refreshed = dataclasses.replace(existing)
+                if self._merge_h6104_ble_fields(device_id, refreshed):
+                    self._mark_cached_result(device_id)
+                    return refreshed
+            return err
+
+    def _raw_power_switch_value(self, device_id: str) -> Any:
+        """The verbatim ``powerSwitch`` value from the last /device/state poll.
+
+        ``GoveeDeviceState`` keeps only ``bool(value)``; multi-outlet plugs
+        put a bitmask there (an H5160 with two outlets on reported ``6``).
+        """
+        raw = self._api_client.last_raw_state.get(device_id) or {}
+        for cap in raw.get("capabilities") or []:
+            if isinstance(cap, dict) and cap.get("instance") == "powerSwitch":
+                return (cap.get("state") or {}).get("value")
+        return None
+
+    @staticmethod
+    def _apply_outlet_mask(device: GoveeDevice, state: GoveeDeviceState, value: Any) -> None:
+        """Decode a multi-outlet plug's on/off bitmask into per-outlet toggles.
+
+        Both the AWS IoT push ``onOff`` and the Developer API ``powerSwitch``
+        carry a bitmask on these strips — bit i = outlet i+1 — rather than 0/1:
+        an H5160 with one outlet on pushed ``onOff: 2`` and, at another time,
+        polled ``powerSwitch: 6`` (issue #184). That matches the bit layout
+        homebridge-govee uses to *send*. A bool or anything outside the mask
+        range is left alone (the master power_state already reflects it).
+        """
+        if isinstance(value, bool) or not isinstance(value, int):
+            return
+        count = device.mqtt_outlet_count
+        if value < 0 or value >= (1 << count):
+            return
+        for index in range(count):
+            state.toggles[f"outlet{index + 1}"] = bool(value & (1 << index))
+        state.power_state = value != 0
+
+    async def async_set_mqtt_outlet(self, device_id: str, outlet_index: int, enabled: bool) -> bool:
+        """Switch one outlet of a multi-outlet plug over AWS IoT (issue #184).
+
+        Publishes the native ``turn`` command with homebridge-govee's bitmask
+        value (switch-triple.js). Never falls back to REST: the public API
+        rejects any value other than 0/1, and a plain 0/1 would switch the
+        whole strip. Optimistic — the plug's per-outlet readback is not
+        decoded yet — so the result is written to ``state.toggles``.
+        """
+        device = self._devices.get(device_id)
+        if device is None or not (0 <= outlet_index < device.mqtt_outlet_count):
+            return False
+        if self._mqtt_client is None or not self._mqtt_client.connected:
+            _LOGGER.warning(
+                "Cannot switch outlet %d on %s: needs the AWS IoT session (account login)",
+                outlet_index + 1,
+                device.name,
+            )
+            return False
+        topic = await self._ensure_device_topic(device_id)
+        bit = 1 << outlet_index
+        value = (bit << 4) | (bit if enabled else 0)
+        ok = await self._mqtt_client.async_publish_command(topic, "turn", {"val": value})
+        self._record_local_command(
+            device_id,
+            device.sku,
+            "mqtt",
+            ToggleCommand(toggle_instance=f"outlet{outlet_index + 1}", enabled=enabled),
+            delivered=ok,
+            detail=f"turn val={value} (outlet {outlet_index + 1})",
+        )
+        if not ok:
+            return False
+        self._record_transport_send(device_id, "mqtt")
+        state = self._states.get(device_id)
+        if state is not None:
+            state.toggles[f"outlet{outlet_index + 1}"] = enabled
+        self.async_set_updated_data(self._states)
+        return True
+
+    async def async_send_fan_oscillation(self, device_id: str, enabled: bool) -> bool:
+        """Send a Tower-Fan oscillation on/off frame over MQTT.
+
+        Reverse-engineered path for the SKUs in ``MQTT_OSCILLATION_SKUS``,
+        whose oscillation the dev-API oscillationToggle cannot control
+        (no-op). Returns False if the device is unknown, MQTT has no client,
+        or the frame did not go out, so the caller can fall back to the REST
+        OscillationCommand. On success the optimistic state is applied here
+        and listeners are notified — the coordinator owns state, entities
+        observe it — and the send lands in the diagnostics command history
+        with the swing tail that was replayed.
+        """
+        device = self._devices.get(device_id)
+        if not device:
+            return False
+        tail = self._mqtt_client.fan_swing_tail(device_id) if self._mqtt_client else None
+        ok = await self._ble_manager.async_send_fan_oscillation(device_id, device.sku, enabled, tail)
+        self._record_local_command(
+            device_id,
+            device.sku,
+            "mqtt",
+            OscillationCommand(oscillating=enabled),
+            delivered=ok,
+            detail=f"ptReal 33 1d {'01' if enabled else '00'} tail={tail}",
+        )
+        if not ok:
+            return False
+        self._record_transport_send(device_id, "mqtt")
+        state = self._states.get(device_id)
+        if state is not None:
+            state.apply_optimistic_oscillation(enabled)
+        self.async_set_updated_data(self._states)
+        return True
+
+    async def async_set_main_panel(
+        self,
+        device_id: str,
+        *,
+        rgb: RGBColor | None = None,
+        brightness: int | None = None,
+        kelvin: int | None = None,
+    ) -> bool:
+        """Write the Ceiling Light Pro main panel's colour, colour temperature and/or brightness over ptReal.
+
+        The main panel is internal segment 17 (bit ``PTREAL_MAIN_PANEL_BIT``),
+        not a ring segment, so it has no Platform-API equivalent and is
+        reachable only through the masked ptReal frames in ``api/ble_packet.py``
+        (issue #223). Returns False when the SKU is not in
+        ``PTREAL_MAIN_PANEL_BIT``, the BLE passthrough is down, or any frame
+        fails to send; True only if every requested frame sent.
+        """
+        device = self._devices.get(device_id)
+        if not device or device.sku.upper() not in PTREAL_MAIN_PANEL_BIT:
+            return False
+        mask = 1 << PTREAL_MAIN_PANEL_BIT[device.sku.upper()]
+        return await self._async_set_ptreal_zone(device, mask, rgb=rgb, brightness=brightness, kelvin=kelvin)
+
+    async def async_set_ring(
+        self,
+        device_id: str,
+        *,
+        rgb: RGBColor | None = None,
+        brightness: int | None = None,
+        kelvin: int | None = None,
+    ) -> bool:
+        """Write the whole RGBIC ring of a ``PTREAL_LIGHT_ZONE_SKUS`` fixture over ptReal.
+
+        One masked frame per value covers every ring segment
+        (``PTREAL_RING_MASK``, bits 0-15), so the ring changes in one step and
+        the main panel's bit is never set (issue #223). Returns False when
+        the SKU is not in ``PTREAL_LIGHT_ZONE_SKUS``, the BLE passthrough is
+        down, or any frame fails to send.
+        """
+        device = self._devices.get(device_id)
+        if not device or device.sku.upper() not in PTREAL_LIGHT_ZONE_SKUS:
+            return False
+        return await self._async_set_ptreal_zone(
+            device, PTREAL_RING_MASK, rgb=rgb, brightness=brightness, kelvin=kelvin
+        )
+
+    async def _async_set_ptreal_zone(
+        self,
+        device: GoveeDevice,
+        mask: int,
+        *,
+        rgb: RGBColor | None,
+        brightness: int | None,
+        kelvin: int | None,
+    ) -> bool:
+        """Send the masked ptReal colour, colour-temperature and brightness frames for one zone."""
+        if not self._ble_manager.available:
+            return False
+        frames: list[list[int]] = []
+        if rgb is not None:
+            frames.append(build_segment_color_ptreal(rgb, mask))
+        if kelvin is not None:
+            kelvin = max(PTREAL_ZONE_MIN_KELVIN, min(PTREAL_ZONE_MAX_KELVIN, kelvin))
+            r, g, b = color_util.color_temperature_to_rgb(kelvin)
+            white = RGBColor(r=round(r), g=round(g), b=round(b))
+            frames.append(build_segment_color_temp_ptreal(kelvin, white, mask))
+        if brightness is not None:
+            frames.append(build_segment_brightness_ptreal(brightness, mask))
+        for data in frames:
+            packet = build_packet(data)
+            sent = await self._ble_manager.async_send_ble_packet(
+                device.device_id, device.sku, encode_packet_base64(packet)
+            )
+            if not sent:
+                return False
+            self._record_transport_send(device.device_id, "mqtt")
+        return True
+
+    async def _try_ptreal_light_zone(self, device_id: str, device: GoveeDevice, command: ToggleCommand) -> bool:
+        """Switch a Ceiling Light Pro zone with the app's ``33 30`` frame (issue #223).
+
+        The SKUs in ``PTREAL_LIGHT_ZONE_SKUS`` accept ``mainLightToggle`` /
+        ``backgroundLightToggle`` over REST with HTTP 200 and then ignore
+        them. Returns False, leaving REST to carry the command, when the SKU
+        or toggle is not affected or the passthrough is down or fails.
+        """
+        zone = _PTREAL_LIGHT_ZONES.get(command.toggle_instance)
+        if zone is None or device.sku.upper() not in PTREAL_LIGHT_ZONE_SKUS or not self._ble_manager.available:
+            return False
+        packet = build_packet(build_light_zone_ptreal(zone, command.enabled))
+        ok = await self._ble_manager.async_send_ble_packet(device_id, device.sku, encode_packet_base64(packet))
+        self._record_local_command(
+            device_id,
+            device.sku,
+            "mqtt",
+            command,
+            delivered=ok,
+            detail=f"ptReal 33 30 {zone:02x} {int(command.enabled):02x}",
+        )
+        if not ok:
+            return False
+        self._record_transport_send(device_id, "mqtt")
+        self._apply_optimistic_update(device_id, command)
+        self.async_set_updated_data(self._states)
+        return True
+
+    async def _try_mqtt_music_mode(self, device_id: str, device: GoveeDevice, command: MusicModeCommand) -> bool:
+        """Select a music effect with the app's own frame, for SKUs whose REST path is empty.
+
+        Govee relays a Platform-API musicMode to the SKUs in
+        ``MQTT_MUSIC_MODE_SKUS`` as a zeroed ``33 05 01`` frame, so the light
+        goes dark (#186, #215). Returns False, leaving REST to carry the command,
+        when the SKU is not affected, AWS IoT is down, or the effect name has
+        no known app code.
+        """
+        if device.sku.upper() not in MQTT_MUSIC_MODE_SKUS or not self._ble_manager.available:
+            return False
+        name = next(
+            (
+                str(opt.get("name", ""))
+                for opt in device.get_music_mode_options()
+                if opt.get("value") == command.music_mode
+            ),
+            "",
+        )
+        effect_code = music_v3_effect_code(name)
+        if effect_code is None:
+            _LOGGER.debug("No app code for music mode %r on %s, sending over REST", name, device.name)
+            return False
+        ok = await self._ble_manager.async_send_music_mode_v3(device_id, device.sku, effect_code, command.sensitivity)
+        self._record_local_command(
+            device_id,
+            device.sku,
+            "mqtt",
+            command,
+            delivered=ok,
+            detail=f"ptReal 33 05 13 {effect_code:02x} sensitivity={command.sensitivity}",
+        )
+        if not ok:
+            return False
+        self._record_transport_send(device_id, "mqtt")
+        self._apply_optimistic_update(device_id, command)
+        self.async_set_updated_data(self._states)
+        return True
+
+    async def async_control_device(
+        self,
+        device_id: str,
+        command: DeviceCommand,
+    ) -> bool:
+        """Send control command to device with optimistic update.
+
+        An H7175 kettle that accepted a command is re-read shortly afterwards
+        (see KettleManager.schedule_followup).
+
+        Args:
+            device_id: Device identifier.
+            command: Command to execute.
+
+        Returns:
+            True if command succeeded.
+
+        Raises:
+            HomeAssistantError: H8057 Segment 4 needs an AWS IoT passthrough
+                that is unavailable or failed to publish.
+        """
+        confirmer = self._command_confirmer
+        # Before dispatch: a newer command makes a pending confirm stale, and
+        # the confirm compares against the value from before this one (#245).
+        pending = confirmer.prepare(device_id, command) if confirmer is not None else None
+        success = await self._async_control_device(device_id, command, confirm=pending)
+        device = self._devices.get(device_id)
+        if success and device is not None and device.decodes_kettle_frames:
+            self.kettles.schedule_followup(device_id)
+        return success
+
+    async def _async_resend_command(self, device_id: str, command: DeviceCommand) -> bool:
+        """Send a command once more over the cloud API for the confirmer (#245).
+
+        Never itself confirmed and never a kettle follow-up, so a resend cannot
+        loop. Returns False on any failure.
+        """
+        device = self._devices.get(device_id)
+        if device is None:
+            return False
+        try:
+            success = await self._api_client.control_device(device_id, device.sku, command)
+        except GoveeApiError as err:
+            self._record_transport_failure(device_id, "cloud_api", str(err))
+            return False
+        if success:
+            self._record_transport_send(device_id, "cloud_api")
+            self._record_transport_success(device_id, "cloud_api")
+            self._apply_optimistic_update(device_id, command)
+            self.async_set_updated_data(self._states)
+        return bool(success)
+
+    async def _async_control_device(
+        self, device_id: str, command: DeviceCommand, *, confirm: PendingConfirm | None = None
+    ) -> bool:
+        """Send a command over the best transport; see :meth:`async_control_device`.
+
+        ``confirm`` starts only after an MQTT or REST send; the LAN tier reads
+        the device back itself.
+        """
+        device = self._devices.get(device_id)
+        if not device:
+            _LOGGER.error("Unknown device: %s", device_id)
+            return False
+
+        # Track power-off commands so segment entities can detect them
+        # before the first await, ensuring concurrent coroutines see the flag.
+        is_power_off = isinstance(command, PowerCommand) and not command.power_on
+        if is_power_off:
+            self._pending_power_off.add(device_id)
+
+        # Remember what the segments were last set to, before the first await,
+        # so a later whole-device write can faithfully restore them. Recorded
+        # here rather than in the REST branch so it captures the command
+        # whichever transport tier ends up carrying it.
+        if isinstance(command, SegmentColorCommand):
+            rgb = command.color.as_tuple
+            for index in command.segment_indices:
+                self.record_segment_color(device_id, index, rgb)
+
+        try:
+            # H8057 exposes four segments, but REST RGB accepts only 0-2.
+            # Only index 3 has been hardware-verified with masked ptReal;
+            # split mixed writes before the general transport tiers.
+            if (
+                isinstance(command, SegmentColorCommand)
+                and device.sku.upper() == "H8057"
+                and 3 in command.segment_indices
+            ):
+                return await self._control_h8057_segment_color(device_id, device, command)
+
+            # BLE-first dispatch: if a BLE transport is available for this
+            # device, try it before the cloud REST API. BLE is ~10x faster
+            # (~50ms local vs ~500ms cloud) and works when internet is down.
+            if (
+                HAS_BLUETOOTH
+                and device_id in self._ble_devices
+                and self._ble_write_eligible(device_id)
+                and not self._lan_can_carry(device_id, device, command)
+            ):
+                if await self._try_ble_command(device_id, command):
+                    if device.sku == "H6104":
+                        self._h6104_last_write[device_id] = dt_util.utcnow()
+                    self._apply_optimistic_update(device_id, command)
+                    self.async_set_updated_data(self._states)
+                    if device.sku == "H6104":
+                        # The readback holds the BLE lock ~1.5 s; commands must not wait for it.
+                        self._config_entry.async_create_background_task(
+                            self.hass,
+                            self._async_refresh_h6104_ble_status(device_id, force=True),
+                            name=f"govee_h6104_readback_{device_id}",
+                        )
+                    return True
+                # BLE failed — fall through to LAN/MQTT/REST
+
+            if (
+                device.sku == "H6104"
+                and self.h6104_ble_enabled
+                and isinstance(command, ToggleCommand)
+                and command.toggle_instance == INSTANCE_DREAMVIEW
+            ):
+                # H6104 exposes this mode only on the legacy BLE transport.
+                # Cloud returns HTTP 200 with an embedded unsupported-instance
+                # error, obscuring why BLE was skipped or failed.
+                raise HomeAssistantError(
+                    translation_domain=DOMAIN,
+                    translation_key="h6104_bluetooth_required",
+                )
+
+            # LAN (UDP) control tier — sits between BLE and MQTT so precedence
+            # is BLE > LAN > MQTT > REST. Unlike the BLE/MQTT blocks above,
+            # _try_lan_command owns its optimistic update + transport recording
+            # internally: a LAN write is unacked, so it applies optimistic state
+            # immediately for snappy UI, then confirms by reading the device
+            # back. A confirmed write returns True here; an unreachable /
+            # unconfirmed / value-mismatched write returns False and falls
+            # through to MQTT -> REST, so a device is never stranded.
+            if await self._try_lan_command(device_id, device, command):
+                return True
+            # LAN unavailable / unconfirmed — fall through to MQTT/REST.
+
+            if isinstance(command, MusicModeCommand) and await self._try_mqtt_music_mode(device_id, device, command):
+                return True
+
+            if isinstance(command, ToggleCommand) and await self._try_ptreal_light_zone(device_id, device, command):
+                return True
+
+            # MQTT-native control tier: when enabled and connected, push
+            # power/brightness/color over the AWS IoT channel (~50ms) instead
+            # of the REST cloud API (~500ms). Group devices and non-capable
+            # commands (color temp, scenes, segments) fall through to REST.
+            # A publish is never acknowledged, so only devices that have
+            # answered on AWS IoT this session qualify: some firmware (H6163)
+            # never listens there, and its commands would vanish (#198).
+            # MQTT_COLOR_SKUS (#240) have no REST colour at all, so their colour
+            # goes over AWS IoT even with the control option off.
+            if (
+                (
+                    self._enable_mqtt_control
+                    or (isinstance(command, ColorCommand) and device.sku.upper() in MQTT_COLOR_SKUS)
+                )
+                and self.mqtt_connected
+                and not device.is_group
+                and self._mqtt_heard_from(device_id)
+            ):
+                if await self._try_mqtt_command(device_id, device.sku, command):
+                    self._record_transport_send(device_id, "mqtt")
+                    self._apply_optimistic_update(device_id, command)
+                    self.async_set_updated_data(self._states)
+                    self._start_confirm(confirm)
+                    return True
+                # MQTT not applicable / publish failed — fall through to REST
+
+            # H1232 "Ceiling Light Pro" ptReal tier (issue #223): the
+            # Platform API reaches only ring segments 1-13, so when the BLE
+            # passthrough is up, fold every segment the command touches into
+            # one masked ptReal frame (bit i = ring segment i) instead of
+            # looping REST calls. Without passthrough (or when the publish
+            # fails), requests that stay inside the API-reported segment
+            # count fall through to REST unchanged; segments 14-16 have no
+            # REST equivalent and fail.
+            if isinstance(command, SegmentColorCommand) and device.sku.upper() in PTREAL_SEGMENT_SKUS:
+                if self._ble_manager.available:
+                    mask = 0
+                    for index in command.segment_indices:
+                        mask |= 1 << index
+                    packet = build_packet(build_segment_color_ptreal(command.color, mask))
+                    sent = await self._ble_manager.async_send_ble_packet(
+                        device_id, device.sku, encode_packet_base64(packet)
+                    )
+                    if sent:
+                        self._record_transport_send(device_id, "mqtt")
+                        self._apply_optimistic_update(device_id, command)
+                        self.async_set_updated_data(self._states)
+                        return True
+
+                resolution = device.segment_count_resolution
+                api_count = resolution["api_count"] if resolution else 0
+                if any(index >= api_count for index in command.segment_indices):
+                    return False
+                # All indices are within the API-reported count — fall
+                # through to the existing REST dispatch below unchanged.
+
+            # Serialize segment commands per device. Govee silently drops
+            # parallel segment requests (issue #53); sequential dispatch
+            # with a small gap respects the 100/min rate limit. Optimistic
+            # state is applied before entering the lock so UI feedback is
+            # immediate; the actual REST write trails by <~1.5s for a
+            # full 14-segment burst on RGBIC strips.
+            if isinstance(command, SegmentColorCommand):
+                self._apply_optimistic_update(device_id, command)
+                self.async_set_updated_data(self._states)
+                success = await self._dispatch_segment_command(device_id, device.sku, command)
+                return success
+
+            success = await self._api_client.control_device(
+                device_id,
+                device.sku,
+                command,
+            )
+
+            if success:
+                # A REST control call sends AND gets a response back, so stamp
+                # both directions; MQTT publishes are fire-and-forget (send only).
+                self._record_transport_send(device_id, "cloud_api")
+                self._record_transport_success(device_id, "cloud_api")
+                # Apply optimistic update
+                self._apply_optimistic_update(device_id, command)
+                self.async_set_updated_data(self._states)
+                self._maybe_schedule_humidity_verification(device_id, device, command)
+                self._start_confirm(confirm)
+            else:
+                self._record_transport_failure(device_id, "cloud_api", "control_returned_false")
+
+            return success
+
+        except GoveeAuthError as err:
+            self._record_transport_failure(device_id, "cloud_api", "auth_failed")
+            raise ConfigEntryAuthFailed("Invalid API key") from err
+        except GoveeDeviceOfflineError as err:
+            self._mark_device_offline(device_id, err)
+            return False
+        except GoveeApiError as err:
+            _LOGGER.error("Control command failed: %s", err)
+            self._record_transport_failure(device_id, "cloud_api", str(err))
+            return False
+        finally:
+            if is_power_off:
+                self._pending_power_off.discard(device_id)
+
+    def _start_confirm(self, pending: PendingConfirm | None) -> None:
+        """Start confirming a command that went out over MQTT or REST (#245)."""
+        if self._command_confirmer is not None:
+            self._command_confirmer.start(pending)
+
+    @property
+    def command_confirm_counters(self) -> dict[str, dict[str, int]] | None:
+        """Per-device confirm counters, or None while the option is off (diagnostics)."""
+        if self._command_confirmer is None:
+            return None
+        return self._command_confirmer.counters()
+
+    def _mark_device_offline(self, device_id: str, err: GoveeDeviceOfflineError) -> None:
+        """Govee refused a command because the device is offline: show it now (#242).
+
+        The entity then raises the translated ``device_offline`` error instead
+        of the generic one; the next poll or push that says otherwise brings the
+        device back.
+        """
+        _LOGGER.warning("Govee reports %s offline; command not delivered (%s)", device_id, err)
+        self._record_transport_failure(device_id, "cloud_api", "device_offline")
+        state = self._states.get(device_id)
+        if state is not None and state.online:
+            state.online = False
+            self.async_set_updated_data(self._states)
+
+    def _maybe_schedule_humidity_verification(
+        self, device_id: str, device: GoveeDevice, command: DeviceCommand
+    ) -> None:
+        """After a humidifier work_mode/humidity REST write, schedule a re-poll.
+
+        Issue #118: these writes return HTTP 200 but the physical H7150
+        setpoint may not move. The result is attached to the same
+        recent_commands entry so a diagnostics download shows a timestamped
+        "sent X -> Govee reports Y, N seconds later" pair, instead of relying
+        on whatever the next unrelated coordinator poll cycle happens to see.
+        """
+        is_humidity_write = (isinstance(command, WorkModeCommand) and device.is_humidifier) or (
+            isinstance(command, RangeCommand) and command.range_instance == INSTANCE_HUMIDITY
+        )
+        if not is_humidity_write:
+            return
+        record = self._api_client.peek_last_command_record()
+        if record is None:
+            return
+        self._config_entry.async_create_background_task(
+            self.hass,
+            self._verify_humidity_command(device_id, device.sku, record),
+            name="govee_verify_humidity_command",
+        )
+
+    async def _verify_humidity_command(self, device_id: str, sku: str, record: dict[str, Any]) -> None:
+        """Re-poll device state and attach it to a recent_commands record."""
+        await asyncio.sleep(HUMIDITY_VERIFICATION_DELAY_SECONDS)
+        try:
+            state = await self._api_client.get_device_state(device_id, sku)
+        except Exception as err:  # noqa: BLE001 - best-effort diagnostics only
+            record["verification_poll"] = {"error": str(err)}
+            return
+        record["verification_poll"] = {
+            "polled_at": dt_util.utcnow().isoformat(),
+            "delay_seconds": HUMIDITY_VERIFICATION_DELAY_SECONDS,
+            "work_mode": state.work_mode,
+            "mode_value": state.mode_value,
+            "configured_humidity": state.configured_humidity,
+        }
+
+    async def _control_h8057_segment_color(
+        self, device_id: str, device: GoveeDevice, command: SegmentColorCommand
+    ) -> bool:
+        """Split H8057 RGB writes: REST first, then index 3 via AWS IoT.
+
+        Each successful part updates listeners separately. A failed part
+        cannot undo the other: return success only when both succeed, and
+        never retry index 3 through the known-invalid REST endpoint.
+        """
+        rest_indices = tuple(index for index in command.segment_indices if index != 3)
+        rest_success = True
+        if rest_indices:
+            rest_command = SegmentColorCommand(segment_indices=rest_indices, color=command.color)
+            rest_success = await self._dispatch_segment_command(device_id, device.sku, rest_command)
+            if rest_success:
+                self._apply_optimistic_update(device_id, rest_command)
+                self.async_set_updated_data(self._states)
+
+        private_command = SegmentColorCommand(segment_indices=(3,), color=command.color)
+        sent = False
+        if self._ble_manager.available and not device.is_group:
+            packet = build_packet(build_segment_color_ptreal(command.color, 1 << 3))
+            # Share segment serialization with REST to avoid overlapping
+            # writes from frequent color-copy automations.
+            lock = self._segment_locks.setdefault(device_id, asyncio.Lock())
+            async with lock:
+                sent = await self._ble_manager.async_send_ble_packet(
+                    device_id, device.sku, encode_packet_base64(packet)
+                )
+
+        self._record_local_command(
+            device_id, device.sku, "mqtt", private_command, delivered=sent, detail="ptReal segment mask=0x000008"
+        )
+        if not sent:
+            self._record_transport_failure(device_id, "mqtt", "h8057_segment_4_passthrough_failed")
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="segment_passthrough_failed",
+                translation_placeholders={"device": device.name},
+            )
+
+        self._record_transport_send(device_id, "mqtt")
+        self._apply_optimistic_update(device_id, private_command)
+        self.async_set_updated_data(self._states)
+        return rest_success
+
+    async def _dispatch_segment_command(
+        self,
+        device_id: str,
+        sku: str,
+        command: SegmentColorCommand,
+    ) -> bool:
+        """Send a single segment command under a per-device lock.
+
+        Pacing: after each REST call we hold the lock for a short delay so
+        the next segment command has to wait — this bounds the effective
+        dispatch rate for a multi-segment burst to stay within Govee's
+        rate limit without adding a separate queue.
+        """
+        lock = self._segment_locks.setdefault(device_id, asyncio.Lock())
+        async with lock:
+            try:
+                success = await self._api_client.control_device(device_id, sku, command)
+            except GoveeAuthError:
+                self._record_transport_failure(device_id, "cloud_api", "auth_failed")
+                raise
+            except GoveeDeviceOfflineError as err:
+                self._mark_device_offline(device_id, err)
+                return False
+            except GoveeApiError as err:
+                _LOGGER.error("Segment command failed for %s: %s", device_id, err)
+                self._record_transport_failure(device_id, "cloud_api", str(err))
+                return False
+
+            if success:
+                # REST send + response — stamp both directions (see control path).
+                self._record_transport_send(device_id, "cloud_api")
+                self._record_transport_success(device_id, "cloud_api")
+            else:
+                self._record_transport_failure(device_id, "cloud_api", "segment_returned_false")
+
+            # Pace the next acquire so bursts don't trip silent rate limiting.
+            await asyncio.sleep(SEGMENT_COMMAND_PACING_SECONDS)
+            return success
+
+    async def _try_lan_command(
+        self,
+        device_id: str,
+        device: GoveeDevice,
+        command: DeviceCommand,
+    ) -> bool:
+        """Attempt a LAN (UDP) control write, verified by reading the device back.
+
+        The LAN control tier sits between BLE and MQTT (BLE > LAN > MQTT >
+        REST). A LAN write is fire-and-forget and unacknowledged, so this
+        method confirms it by reading the device's reported state back within
+        ``LAN_WRITE_CONFIRM_TIMEOUT`` and requiring an exact (power) /
+        within-tolerance (brightness) match. Anything that cannot be confirmed —
+        LAN disabled, a group / numeric id, an uncorrelated device, an
+        unavailable LAN read-health, a write-suppression cooldown, a non-LAN
+        command, a failed send, no reply, or a value mismatch — returns ``False``
+        so the caller falls through to MQTT/REST, which re-applies the optimistic
+        state and actually delivers the write. A device is therefore never
+        stranded on a LAN write the firmware ignored.
+
+        Transport health vs. write viability are kept separate (issue #57): a
+        confirm miss (no reply / value mismatch) NEVER marks the ``lan`` transport
+        unavailable — that produced a flap synced to control activity. Health is
+        read-driven (the poll read + unsolicited pushes); a run of confirm misses
+        only suppresses LAN *write attempts* (:meth:`_note_lan_write_miss`) so the
+        device's writes route to MQTT/REST without paying the confirm timeout,
+        while its LAN reads — and the connectivity sensor — keep working.
+
+        On a confirmed write the LAN send + success are recorded and the
+        device's real reported values are locked in via :meth:`_apply_lan_read`;
+        an optimistic update is applied immediately (before the blocking confirm
+        read) so the UI responds in ~0ms.
+
+        Args:
+            device_id: The device to control.
+            device: The device's :class:`GoveeDevice` (sku / group / range).
+            command: The domain command to send.
+
+        Returns:
+            ``True`` only when the write was confirmed by a matching readback.
+        """
+        # [1] LAN disabled or degraded — the client is the master switch.
+        if self._lan_client is None:
+            return False
+
+        # [2] Groups (and short numeric group-style ids) have no LAN unicast identity.
+        if device.is_group or looks_like_group_id(device_id):
+            return False
+
+        # [3] Not a correlated LAN device — no IP to write to.
+        info = self._lan_devices.get(device_id)
+        if info is None:
+            return False
+
+        # [4] Write-health gate: never write into a black hole. A device whose
+        #     reads have gone stale — or which has never had a successful LAN
+        #     read yet (TransportHealth defaults is_available=False, so the
+        #     FIRST control after startup falls through HERE until the first LAN
+        #     read marks it available) — must fall back to MQTT/REST.
+        #
+        #     Skipped for a write-only override (#164): that device has never
+        #     answered a read and never will, so this gate could never pass —
+        #     the user's explicit ``device_id=ip!`` override is what stands in
+        #     for read-proven health here.
+        if device_id not in self._lan_write_only:
+            health = self._transport.get(device_id, "lan")
+            if health is None or not health.is_available:
+                return False
+
+        # [4.5] Write-suppression cooldown (issue #57): this device's recent LAN
+        #     writes did not confirm, so skip the LAN write attempt AND its
+        #     confirm-read wait and fall straight to MQTT/REST. LAN READS keep
+        #     running and the lan_connectivity sensor stays Connected — only the
+        #     futile (and latency-adding) write attempt is paused. The cooldown
+        #     re-arms itself so a device that starts confirming again is retried.
+        if self._lan_writes_suppressed(device_id):
+            return False
+
+        # [5] Power, brightness, colour and colour-temp map to LAN — exactly the
+        #     four fields a devStatus read reports back, which is what makes the
+        #     verify-by-read below possible. Scenes / segments / music / DIY /
+        #     work-modes / toggles (and the H5080/H5083 power quirk) return None
+        #     so they keep using REST, where the write is acknowledged and no
+        #     readback confirmation is needed.
+        mapped = command_to_lan(command, device.sku, device.brightness_range)
+        if mapped is None:
+            return False
+        cmd, data = mapped
+
+        # [6] Fire-and-forget unicast write. A sendto OSError (surfaced as a
+        #     False return) means the device is unreachable on LAN right now —
+        #     record the failure and fall through.
+        ip = info.ip
+        sent = await self._lan_client.async_send_command(ip, cmd, data)
+        if not sent:
+            self._record_transport_failure(device_id, "lan", "send_failed")
+            return False
+
+        # [7] Apply optimistic state immediately for ~0ms UI feedback, before the
+        #     confirm read blocks for up to LAN_WRITE_CONFIRM_TIMEOUT.
+        self._apply_optimistic_update(device_id, command)
+        self.async_set_updated_data(self._states)
+
+        # [7.5] Write-only override (#164): this device has never answered a
+        #     read, so waiting on one here would just burn LAN_WRITE_CONFIRM_
+        #     TIMEOUT for a reply that will never come, and — worse — count as
+        #     a write-confirm miss every single time, eventually tripping
+        #     write suppression on a device that is, in fact, working exactly
+        #     as its firmware allows. Treat the successful send itself as the
+        #     confirmation: it is the only signal this firmware ever gives.
+        if device_id in self._lan_write_only:
+            self._record_transport_send(device_id, "lan")
+            self._record_transport_success(device_id, "lan")
+            self._record_local_command(
+                device_id,
+                device.sku,
+                "lan",
+                command,
+                delivered=True,
+                detail="write-only device (#164) — send is the only confirmation available",
+            )
+            return True
+
+        # [8] Verify-by-read: a LAN write is unacked, so read the device back and
+        #     require the reported value to match what we sent.
+        reply = await self._lan_client.async_read_one(ip, LAN_WRITE_CONFIRM_TIMEOUT)
+        if reply is None:
+            # No reply in the confirm window — ambiguous. Count it toward write
+            # suppression (so we stop paying the confirm timeout on a device that
+            # won't confirm) but DO NOT mark LAN down: the periodic poll read is
+            # the authority on transport liveness. The write already fell through
+            # to MQTT/REST, which re-applies the optimistic update and delivers
+            # it. A transient power-on miss must never flap LAN off (#57).
+            self._note_lan_write_miss(device_id)
+            self._record_local_command(
+                device_id,
+                device.sku,
+                "lan",
+                command,
+                delivered=False,
+                detail="no readback within the confirm window",
+            )
+            return False
+
+        if not self._lan_write_confirmed(device, command, reply):
+            # The device ANSWERED — so LAN is alive — but reports a value other
+            # than the one we sent. This is almost always power-on reporting lag
+            # (the controller briefly echoes its pre-command state), NOT a
+            # transport fault. Record only LAN read SUCCESS — keeps the transport
+            # available and the sensor Connected and refreshes the staleness
+            # clock — but DO NOT overlay this reply onto state: it is by
+            # definition stale (a mismatch), and we are inside the optimistic
+            # grace window, so overlaying its color/color-temp would briefly
+            # revert an in-flight optimistic colour write. Count a write-miss
+            # toward suppression and fall through so the write still lands via
+            # MQTT/REST. Transport health is NEVER flipped on a content mismatch —
+            # that flap, synced to control activity, was the reported bug (#57).
+            self._record_transport_success(device_id, "lan")
+            self._note_lan_write_miss(device_id)
+            self._record_local_command(
+                device_id,
+                device.sku,
+                "lan",
+                command,
+                delivered=False,
+                detail="device reported a different value than was sent",
+            )
+            return False
+
+        # Confirmed: stamp the LAN write (send + success — the verify-by-read
+        # recording asymmetry), re-arm LAN writes (reset the miss streak), and
+        # lock in the real device-reported values.
+        self._record_transport_send(device_id, "lan")
+        self._record_transport_success(device_id, "lan")
+        self._clear_lan_write_misses(device_id)
+        self._apply_lan_read(device_id, reply)
+        self._record_local_command(device_id, device.sku, "lan", command, delivered=True)
+        return True
+
+    def _lan_write_confirmed(
+        self,
+        device: GoveeDevice,
+        command: DeviceCommand,
+        reply: LanDevStatus,
+    ) -> bool:
+        """Return ``True`` when a LAN readback confirms the just-sent write.
+
+        Power, brightness, colour and colour temperature reach LAN
+        (``command_to_lan`` returns ``None`` for everything else), and all four
+        are confirmable against the ``devStatus`` fields:
+
+        * :class:`PowerCommand` — require an exact ``reply.on == command.power_on``.
+          A plug whose ``devStatus`` lacks ``onOff`` reports ``reply.on is None``
+          and so never matches, falling through instead of being stranded on a
+          write the device ignored.
+        * :class:`BrightnessCommand` — scale the LAN 0-100 readback into the
+          device-native range and require it within
+          ``LAN_BRIGHTNESS_CONFIRM_TOLERANCE`` of the requested value, absorbing
+          0-100<->native rounding.
+        * :class:`ColorCommand` — require the reported RGB triplet to match
+          exactly. A device that ignored the write reports its previous colour,
+          which is precisely the case that must fall through to REST (#149).
+        * :class:`ColorTempCommand` — require the reported Kelvin within
+          ``LAN_COLOR_TEMP_CONFIRM_TOLERANCE``; firmware rounds the requested
+          value onto its own grid.
+
+        Any other command type is treated as unconfirmable (returns ``False``).
+        Such commands should never reach LAN, so this is a defensive backstop.
+
+        Args:
+            device: The device under control (for its brightness range).
+            command: The command that was sent.
+            reply: The parsed LAN ``devStatus`` readback.
+
+        Returns:
+            ``True`` only when the readback matches the sent value.
+        """
+        if isinstance(command, PowerCommand):
+            return reply.on == command.power_on
+        if isinstance(command, BrightnessCommand):
+            if reply.brightness_0_100 is None:
+                return False
+            native = lan_brightness_to_device(reply.brightness_0_100, device.brightness_range)
+            return abs(native - command.brightness) <= LAN_BRIGHTNESS_CONFIRM_TOLERANCE
+        if isinstance(command, ColorCommand):
+            return reply.color == command.color
+        if isinstance(command, ColorTempCommand):
+            if reply.color_temp_kelvin is None:
+                return False
+            return abs(reply.color_temp_kelvin - command.kelvin) <= LAN_COLOR_TEMP_CONFIRM_TOLERANCE
+        return False
+
+    def _mqtt_heard_from(self, device_id: str) -> bool:
+        """Return True once the device has sent a state message over AWS IoT this session."""
+        health = self._transport.get(device_id, "mqtt")
+        return health is not None and health.last_success_ts is not None
+
+    async def _try_mqtt_command(self, device_id: str, sku: str, command: DeviceCommand) -> bool:
+        """Attempt to send a command via native MQTT. Returns True on success.
+
+        Only power, brightness, and RGB color map to native MQTT commands;
+        all others return False so the caller falls back to REST. A failure
+        is recorded only when a publish was actually attempted and failed
+        (not when the command simply has no MQTT representation).
+        """
+        device = self._devices.get(device_id)
+        brightness_range = device.brightness_range if device is not None else (0, 100)
+        mapped = command_to_mqtt(command, sku, brightness_range)
+        if mapped is None:
+            return False  # Not MQTT-capable — silent fall-through to REST.
+
+        if self._mqtt_client is None:
+            return False
+
+        topic = await self._ensure_device_topic(device_id)
+        if not topic:
+            return False
+
+        cmd, data, cmd_version = mapped
+        success = await self._mqtt_client.async_publish_command(topic, cmd, data, cmd_version=cmd_version)
+        if not success:
+            self._record_transport_failure(device_id, "mqtt", "publish_failed")
+            return False
+
+        # Older strips act only on the legacy `color` command and ignore
+        # `colorwc`. Nothing acknowledges an MQTT publish, so both are sent —
+        # they carry the same RGB, making the follow-up a no-op for devices that
+        # already applied the first one (issues #149, #158).
+        followup = color_legacy_followup(command)
+        if followup is not None:
+            legacy_cmd, legacy_data, legacy_version = followup
+            await self._mqtt_client.async_publish_command(topic, legacy_cmd, legacy_data, cmd_version=legacy_version)
+
+        self._record_local_command(device_id, sku, "mqtt", command, delivered=True)
+        return True
+
+    def _apply_h6104_ble_report(self, device_id: str, report: H6104Report) -> None:
+        """Apply received fields, never values inferred from a sent command."""
+        device = self._devices.get(device_id)
+        existing = self._states.get(device_id)
+        if device is None or device.sku != "H6104" or existing is None:
+            return
+        updates: dict[str, Any] = {"online": True}
+        if report.power is not None:
+            updates["power_state"] = report.power
+        if report.brightness is not None:
+            maximum = device.brightness_range[1]
+            updates["brightness"] = max(0, min(maximum, round(report.brightness * maximum / 254)))
+        if report.mode is not None:
+            updates.update(
+                dreamview_enabled=report.mode == "tv",
+                music_mode_enabled=report.mode == "music",
+            )
+            if report.mode != "music":
+                updates.update(music_mode_value=None, music_mode_name=None)
+            if report.mode in ("tv", "music", "scene", "diy", "color_temp"):
+                updates.update(color=None, color_temp_kelvin=None)
+            if report.mode not in ("scene", "diy"):
+                updates.update(active_scene=None, active_scene_name=None, active_diy_scene=None)
+            if report.mode == "music":
+                api_mode = (
+                    {0: 5, 1: 6, 2: 4, 3: 3}.get(report.music_effect) if report.music_effect is not None else None
+                )
+                name = next(
+                    (opt.get("name") for opt in device.get_music_mode_options() if opt.get("value") == api_mode), None
+                )
+                updates.update(music_mode_value=api_mode, music_mode_name=name)
+                if report.sensitivity is not None:
+                    updates["music_sensitivity"] = report.sensitivity
+        if report.rgb is not None:
+            updates.update(color=RGBColor(*report.rgb), color_temp_kelvin=None)
+        now = dt_util.utcnow()
+        self._h6104_ble_fields.setdefault(device_id, {}).update({key: (value, now) for key, value in updates.items()})
+        refreshed = dataclasses.replace(existing, **updates)
+        if report.power is not None:
+            refreshed.source = "ble"
+            refreshed.clear_optimistic_window()
+        elif existing.source != "optimistic":
+            refreshed.source = "ble"
+        self._states[device_id] = refreshed
+        self._transport.record_read(device_id, "ble")
+        if self.data is not None:
+            self.async_update_listeners()
+
+    def _merge_h6104_ble_fields(self, device_id: str, state: GoveeDeviceState) -> bool:
+        """Keep fresh received fields over a lagging cloud read, field by field."""
+        device = self._devices.get(device_id)
+        if device is None or device.sku != "H6104":
+            return False
+        now = dt_util.utcnow()
+        last_write = self._h6104_last_write.get(device_id)
+        applied = False
+        for field, (value, received) in self._h6104_ble_fields.get(device_id, {}).items():
+            if (now - received).total_seconds() > 120 or (last_write is not None and received < last_write):
+                continue
+            setattr(state, field, value)
+            applied = True
+        if applied:
+            state.source = "ble"
+        return applied
+
+    @property
+    def h6104_ble_enabled(self) -> bool:
+        """Whether the user opted in to H6104 Bluetooth control and readback."""
+        return self._config_entry.options.get(CONF_ENABLE_H6104_BLE, DEFAULT_ENABLE_H6104_BLE) is True
+
+    async def _async_refresh_h6104_ble_status(self, device_id: str, *, force: bool = False) -> None:
+        """Best-effort status reads on commands and the existing poll cadence."""
+        device = self._devices.get(device_id)
+        if device is None or device.sku != "H6104":
+            return
+        client = self._ble_devices.get(device_id)
+        if client is None or client.supports_readback is not True or not self._ble_write_eligible(device_id):
+            return
+        now = time.monotonic()
+        previous = self._h6104_last_query.get(device_id)
+        if not force and previous is not None and now - previous < 2:
+            return
+        self._h6104_last_query[device_id] = now
+        try:
+            async with asyncio.timeout(5):
+                await client.async_read_status()
+        except Exception as err:
+            _LOGGER.debug("H6104 status read failed for %s: %s: %s", device_id, type(err).__name__, err)
+        finally:
+            self._h6104_last_query[device_id] = time.monotonic()
+
+    def _h6104_idle_reconnect_eligible(self, device_id: str) -> bool:
+        """Allow a connection attempt after our own idle release, not a failed link.
+
+        Some proxies do not deliver a fresh advert immediately on release.
+        Requiring one to attempt reconnect would deadlock this known device.
+        A failed attempt clears the idle flag and uses normal failure gating.
+        """
+        device = self._devices.get(device_id)
+        client = self._ble_devices.get(device_id)
+        health = self._transport.get(device_id, "ble")
+        return (
+            device is not None
+            and device.sku == "H6104"
+            and client is not None
+            and client.idle_disconnected is True
+            and health is not None
+            and health.last_failure_reason in (None, "stale_advertisement")
+        )
+
+    def _ble_write_eligible(self, device_id: str) -> bool:
+        """Return True if this device's BLE advertisements are fresh enough to write to.
+
+        BLE writes are unacked (write_gatt_char(..., response=False)), so a stale
+        advertisement (device out of range / asleep) would otherwise be sent to
+        blindly and never fall through to LAN/MQTT/REST (#198).
+        """
+        until = self._ble_connect_backoff_until.get(device_id)
+        if until is not None and time.monotonic() < until:
+            return False
+        health = self._transport.get(device_id, "ble")
+        if self._h6104_idle_reconnect_eligible(device_id):
+            return True
+        if health is not None and health.last_failure_reason == "stale_advertisement":
+            client = self._ble_devices.get(device_id)
+            if client is not None and client.supports_readback is True and client.is_connected is True:
+                return True
+        return health is not None and health.is_available
+
+    def _lan_can_carry(self, device_id: str, device: GoveeDevice, command: DeviceCommand) -> bool:
+        """Return True when a healthy LAN transport can carry this command (#246).
+
+        BLE is then skipped: LAN is acknowledged by a readback and does not
+        compete for the lamp's few Bluetooth connection slots.
+        """
+        if self._lan_client is None or device.is_group or looks_like_group_id(device_id):
+            return False
+        if device_id not in self._lan_devices:
+            return False
+        if command_to_lan(command, device.sku, device.brightness_range) is None:
+            return False
+        health = self._transport.get(device_id, "lan")
+        if device_id not in self._lan_write_only and (health is None or not health.is_available):
+            return False
+        return not self._lan_writes_suppressed(device_id)
+
+    def _ble_backoff_start(self, device_id: str) -> None:
+        """Back off BLE after a failed write: 300 s, doubling per consecutive failure, cap 3600 s (#246)."""
+        failures = self._ble_connect_failures.get(device_id, 0) + 1
+        self._ble_connect_failures[device_id] = failures
+        delay = min(300.0 * 2 ** (failures - 1), 3600.0)
+        self._ble_connect_backoff_until[device_id] = time.monotonic() + delay
+        _LOGGER.debug("BLE backed off for %s for %.0f s after %d consecutive failures", device_id, delay, failures)
+
+    async def _try_ble_command(self, device_id: str, command: DeviceCommand) -> bool:
+        """Attempt to send a command via BLE. Returns True on success.
+
+        Power, brightness, and RGB are shared. The opted-in H6104 additionally
+        handles TV mode and automatic-color music modes over its UART.
+        Scenes, color_temp, work modes, etc. fall through to REST.
+        """
+        ble_device = self._ble_devices.get(device_id)
+        if ble_device is None:
+            return False
+        device = self._devices.get(device_id)
+        ble_sku = device.sku if device is not None else "unknown"
+        detail = None
+
+        try:
+            if isinstance(command, PowerCommand):
+                if command.power_on:
+                    await ble_device.turn_on()
+                else:
+                    await ble_device.turn_off()
+            elif isinstance(command, BrightnessCommand):
+                brightness = command.brightness
+                if ble_sku == "H6104" and device is not None:
+                    brightness = max(20, min(254, round(brightness * 254 / max(1, device.brightness_range[1]))))
+                await ble_device.set_brightness(brightness)
+            elif isinstance(command, ColorCommand):
+                await ble_device.set_rgb(
+                    command.color.r,
+                    command.color.g,
+                    command.color.b,
+                )
+            elif isinstance(command, MusicModeCommand) and ble_sku == "H6104":
+                if command.auto_color != 1 or command.music_mode not in (3, 4, 5, 6):
+                    return False
+                # H6104 API IDs from the field capability dump differ from
+                # legacy BLE effect codes: Energic 5->0, Spectrum 6->1,
+                # Rolling 4->2, Rhythm 3->3. Codes 1/2 also need RGB bytes.
+                # https://github.com/softgrass/govee-api-ble/blob/master/src/govee_api_ble/device.py
+                effect = {5: 0, 6: 1, 4: 2, 3: 3}[command.music_mode]
+                state = self._states.get(device_id)
+                color = (state.last_color or state.color) if state else None
+                color = color or RGBColor(255, 255, 255)
+                await ble_device.set_music_mode(effect, command.sensitivity, rgb=color.as_tuple)
+                detail = (
+                    f"H6104 music api_mode={command.music_mode} ble_effect={effect} "
+                    f"sensitivity={command.sensitivity} rgb={color.as_tuple}"
+                )
+            elif (
+                isinstance(command, ToggleCommand)
+                and command.toggle_instance == INSTANCE_DREAMVIEW
+                and ble_sku == "H6104"
+            ):
+                if command.enabled:
+                    area, sensitivity = self.h6104_tv_settings(device_id)
+                    await ble_device.set_tv_mode(area=area, sensitivity=sensitivity)
+                    detail = f"H6104 TV mode area={area} sensitivity={sensitivity}"
+                else:
+                    state = self._states.get(device_id)
+                    color = (state.last_color or state.color) if state else None
+                    color = color or RGBColor(255, 255, 255)
+                    await ble_device.set_rgb(color.r, color.g, color.b)
+            else:
+                # Not BLE-capable (scenes, color_temp, work modes, etc.)
+                return False
+        except Exception as err:
+            _LOGGER.debug(
+                "BLE command failed for %s, falling back to REST",
+                device_id,
+                exc_info=True,
+            )
+            self._record_transport_failure(device_id, "ble", str(err))
+            self._record_local_command(device_id, ble_sku, "ble", command, delivered=False, detail=str(err))
+            self._ble_backoff_start(device_id)
+            return False
+        else:
+            self._ble_connect_failures.pop(device_id, None)
+            self._ble_connect_backoff_until.pop(device_id, None)
+            _LOGGER.debug("BLE command succeeded for %s: %s", device_id, type(command).__name__)
+            # BLE writes are unacked (response=False), so this is a send, not a
+            # confirmed receive — `last_success_ts` is the advertisement clock
+            # `refresh_ble_staleness` uses to decide the device stopped
+            # advertising; a blind write must not move it (#198).
+            self._record_transport_send(device_id, "ble")
+            self._record_local_command(device_id, ble_sku, "ble", command, delivered=True, detail=detail)
+            # A successful BLE write reaches the device directly — flip
+            # `online` back True if a stale `online: false` from the cloud
+            # is masking a recovered device (issue #68).
+            ble_state = self._states.get(device_id)
+            if ble_state is not None and not ble_state.online:
+                ble_state.online = True
+            return True
+
+    async def _ensure_device_topic(self, device_id: str) -> str | None:
+        """Get device MQTT topic, refreshing if needed.
+
+        If the topic is missing for this device but we have credentials,
+        attempt a single refresh from the API.
+        """
+        topic = self._device_topics.get(device_id)
+        if topic is not None:
+            return topic
+
+        # Topic missing - try one refresh, at most once per window per device.
+        # A device the account's topic lists simply do not contain would
+        # otherwise cost two account-API calls on every command or probe packet.
+        now = time.monotonic()
+        last = self._topic_refresh_at.get(device_id)
+        if last is not None and now - last < TOPIC_REFRESH_MIN_INTERVAL:
+            return None
+        if self._iot_credentials:
+            self._topic_refresh_at[device_id] = now
+            _LOGGER.debug("Device topic missing for %s, refreshing from API", device_id)
+            await self._fetch_device_topics()
+            topic = self._device_topics.get(device_id)
+            if topic:
+                _LOGGER.debug("Got device topic for %s after refresh", device_id)
+
+        return topic
+
+    async def async_send_music_mode(
+        self,
+        device_id: str,
+        enabled: bool,
+        sensitivity: int = 50,
+        music_mode: int = 1,
+        last_scene_id: str | None = None,
+        last_scene_name: str | None = None,
+    ) -> bool:
+        """Send music mode command via REST API first, with BLE fallback.
+
+        Tries REST API for devices with STRUCT music mode capability,
+        then falls back to BLE passthrough via MQTT.
+
+        Args:
+            device_id: Device identifier.
+            enabled: True to enable music mode, False to disable.
+            sensitivity: Microphone sensitivity 0-100 (default 50).
+            music_mode: Music mode value (default 1 = Rhythm).
+            last_scene_id: Last active scene ID (for restoring on disable).
+            last_scene_name: Last active scene name (for restoring on disable).
+
+        Returns:
+            True if command was sent successfully.
+        """
+        device = self._devices.get(device_id)
+        if not device:
+            _LOGGER.error("Unknown device for music mode: %s", device_id)
+            return False
+
+        if device.sku == "H6104" and device_id in self._ble_devices:
+            if enabled:
+                if music_mode == 1:
+                    modes = [
+                        opt["value"] for opt in device.get_music_mode_options() if opt.get("value") in (3, 4, 5, 6)
+                    ]
+                    music_mode = modes[0] if modes else 3
+                return await self.async_control_device(
+                    device_id, MusicModeCommand(music_mode=music_mode, sensitivity=sensitivity, auto_color=1)
+                )
+            state = self._states.get(device_id)
+            color = (state.last_color or state.color) if state else None
+            return await self.async_control_device(device_id, ColorCommand(color=color or RGBColor(255, 255, 255)))
+
+        # Try REST API first for devices with STRUCT music mode capability
+        if device.has_struct_music_mode:
+            if enabled:
+                try:
+                    command = MusicModeCommand(
+                        music_mode=music_mode,
+                        sensitivity=sensitivity,
+                        auto_color=1,
+                    )
+                    success = await self.async_control_device(device_id, command)
+                    if success:
+                        _LOGGER.debug("Sent music mode ON to %s via REST API", device.name)
+                        return True
+                except ConfigEntryAuthFailed:
+                    raise
+                except Exception as err:
+                    _LOGGER.debug(
+                        "REST music mode ON failed for %s: %s, trying BLE",
+                        device.name,
+                        err,
+                    )
+            else:
+                # Disable music mode via REST: restore last scene or send brightness
+                success = await self._rest_disable_music_mode(device_id, last_scene_id, last_scene_name)
+                if success:
+                    return True
+
+        # Fall back to BLE passthrough via MQTT
+        if not self._ble_manager.available:
+            _LOGGER.warning(
+                "Cannot send music mode for %s: MQTT not connected",
+                device_id,
+            )
+            return False
+
+        success = await self._ble_manager.async_send_music_mode(device_id, device.sku, enabled, sensitivity)
+
+        if success:
+            # Apply optimistic update to state
+            state = self._states.get(device_id)
+            if state:
+                state.apply_optimistic_music_mode(enabled)
+            _LOGGER.debug(
+                "Sent music mode %s (sensitivity=%d) to %s via BLE",
+                "ON" if enabled else "OFF",
+                sensitivity,
+                device.name,
+            )
+
+        return success
+
+    async def _rest_disable_music_mode(
+        self,
+        device_id: str,
+        last_scene_id: str | None = None,
+        last_scene_name: str | None = None,
+    ) -> bool:
+        """Disable music mode via REST API.
+
+        Tries to restore the last active scene, then falls back to a
+        brightness command to cleanly exit music mode.
+
+        Args:
+            device_id: Device identifier.
+            last_scene_id: Scene ID to restore.
+            last_scene_name: Scene name to restore.
+
+        Returns:
+            True if successfully disabled via REST.
+        """
+        device = self._devices.get(device_id)
+        success = False
+
+        # Try restoring last active scene
+        if last_scene_id and last_scene_name:
+            command = SceneCommand(
+                scene_id=int(last_scene_id),
+                scene_name=last_scene_name,
+            )
+            success = await self.async_control_device(device_id, command)
+            if success:
+                _LOGGER.debug(
+                    "Restored scene '%s' on %s after music mode off",
+                    last_scene_name,
+                    device.name if device else device_id,
+                )
+
+        if not success:
+            # No last scene or scene restore failed - send brightness command
+            # to cleanly exit music mode via REST (avoids visible power cycle)
+            state = self._states.get(device_id)
+            brightness = state.brightness if state and state.brightness else 100
+            success = await self.async_control_device(device_id, BrightnessCommand(brightness=brightness))
+            _LOGGER.debug(
+                "Sent brightness command to %s to exit music mode (brightness=%d)",
+                device.name if device else device_id,
+                brightness,
+            )
+
+        if success:
+            self.clear_music_mode(device_id)
+
+        return success
+
+    def h6104_tv_settings(self, device_id: str) -> tuple[int, int]:
+        """Return desired area/sensitivity; entity restoration persists them."""
+        return self._h6104_tv_settings.get(device_id, (1, 50))
+
+    def restore_h6104_tv_settings(
+        self, device_id: str, *, area: int | None = None, sensitivity: int | None = None
+    ) -> None:
+        """Restore desired settings without sending a command or selecting TV mode."""
+        old_area, old_sensitivity = self.h6104_tv_settings(device_id)
+        area = old_area if area is None else area
+        sensitivity = old_sensitivity if sensitivity is None else sensitivity
+        if area not in (0, 1) or not 0 <= sensitivity <= 100:
+            raise ValueError("Invalid H6104 TV settings")
+        self._h6104_tv_settings[device_id] = (area, sensitivity)
+
+    async def async_update_h6104_tv_settings(
+        self, device_id: str, *, area: int | None = None, sensitivity: int | None = None
+    ) -> bool:
+        """Apply desired settings immediately only when TV mode is already active."""
+        lock = self._h6104_tv_settings_locks.setdefault(device_id, asyncio.Lock())
+        async with lock:
+            previous = self.h6104_tv_settings(device_id)
+            self.restore_h6104_tv_settings(device_id, area=area, sensitivity=sensitivity)
+            state = self._states.get(device_id)
+            try:
+                if state is not None and state.dreamview_enabled:
+                    if not await self.async_send_dreamview(device_id, True):
+                        self._h6104_tv_settings[device_id] = previous
+                        return False
+            except Exception:
+                self._h6104_tv_settings[device_id] = previous
+                raise
+            return True
+
+    async def async_send_dreamview(self, device_id: str, enabled: bool) -> bool:
+        """Send DreamView command via REST API, with BLE fallback.
+
+        Args:
+            device_id: Device identifier.
+            enabled: True to enable DreamView, False to disable.
+
+        Returns:
+            True if command was sent successfully.
+        """
+        device = self._devices.get(device_id)
+        if not device:
+            _LOGGER.error("Unknown device for DreamView: %s", device_id)
+            return False
+
+        if (
+            device.sku == "H6104"
+            and self._config_entry.options.get(CONF_ENABLE_H6104_BLE, DEFAULT_ENABLE_H6104_BLE) is True
+        ):
+            return await self.async_control_device(device_id, create_dreamview_command(enabled))
+
+        # Try REST API first (works for HTTP-capable devices like H6097), except
+        # on SKUs that accept the toggle and ignore it (issue #213), and except
+        # for OFF on SKUs that accept OFF but stay in video mode (issue #220).
+        skip_rest = device.sku.upper() in PTREAL_DREAMVIEW_SKUS or (
+            not enabled and device.sku.upper() in DREAMVIEW_OFF_VIA_COLOUR_SKUS
+        )
+        if not skip_rest:
+            try:
+                success = await self.async_control_device(device_id, create_dreamview_command(enabled))
+                if success:
+                    _LOGGER.debug(
+                        "Sent DreamView %s to %s via REST API",
+                        "ON" if enabled else "OFF",
+                        device.name,
+                    )
+                    return True
+            except ConfigEntryAuthFailed:
+                # Let authentication errors propagate so Home Assistant can handle reauth
+                raise
+            except Exception as err:
+                _LOGGER.debug("REST DreamView failed for %s: %s", device.name, err)
+
+        # Fall back to BLE passthrough for devices that need it.
+        #
+        # Only for enabling: the protocol has no video-off opcode, so there is
+        # nothing meaningful to pass through when turning DreamView off. The
+        # device leaves video mode as soon as it is given another mode, which
+        # the REST colour path above already does.
+        if not enabled:
+            # No BLE opcode leaves video mode; giving the device another mode
+            # does. Restore the last known colour (or white) over the normal
+            # control path so the switch settles to off instead of sticking.
+            state = self._states.get(device_id)
+            color = (state.last_color or state.color) if state else None
+            if color is None or color.as_packed_int == 0:
+                color = RGBColor(255, 255, 255)
+            success = await self.async_control_device(device_id, ColorCommand(color=color))
+            if success and state is not None:
+                state.apply_optimistic_dreamview(False)
+            _LOGGER.debug(
+                "DreamView OFF for %s: no BLE opcode exists for leaving video mode; "
+                "restored colour %s instead (%s)",
+                device.name,
+                color.as_tuple,
+                "ok" if success else "failed",
+            )
+            return success
+
+        if not self._ble_manager.available:
+            _LOGGER.warning(
+                "Cannot send DreamView for %s: MQTT not connected",
+                device_id,
+            )
+            return False
+
+        success = await self._ble_manager.async_send_dreamview(device_id, device.sku)
+
+        if success:
+            state = self._states.get(device_id)
+            if state:
+                state.apply_optimistic_dreamview(enabled)
+            _LOGGER.debug(
+                "Sent DreamView %s to %s via BLE passthrough",
+                "ON" if enabled else "OFF",
+                device.name,
+            )
+
+        return success
+
+    async def async_send_diy_scene(
+        self,
+        device_id: str,
+        scene_id: int,
+        scene_name: str = "",
+    ) -> bool:
+        """Send DIY scene command via REST API, with BLE fallback.
+
+        Args:
+            device_id: Device identifier.
+            scene_id: DIY scene ID from the API.
+            scene_name: DIY scene name for logging/state.
+
+        Returns:
+            True if command was sent successfully.
+        """
+        device = self._devices.get(device_id)
+        if not device:
+            _LOGGER.error("Unknown device for DIY scene: %s", device_id)
+            return False
+
+        # Try REST API first
+        try:
+            command = DIYSceneCommand(scene_id=scene_id, scene_name=scene_name)
+            success = await self.async_control_device(device_id, command)
+            if success:
+                _LOGGER.debug(
+                    "Activated DIY scene '%s' on %s via REST API",
+                    scene_name,
+                    device.name,
+                )
+                return True
+            _LOGGER.debug(
+                "REST DIY scene returned failure for %s, trying BLE passthrough",
+                device.name,
+            )
+        except ConfigEntryAuthFailed:
+            raise
+        except Exception as err:
+            _LOGGER.debug("REST DIY scene failed for %s: %s", device.name, err)
+
+        # Fall back to BLE passthrough
+        if not self._ble_manager.available:
+            _LOGGER.warning(
+                "Cannot send DIY scene for %s: MQTT not connected",
+                device_id,
+            )
+            return False
+
+        success = await self._ble_manager.async_send_diy_scene(device_id, device.sku, scene_id)
+
+        if success:
+            state = self._states.get(device_id)
+            if state:
+                state.apply_optimistic_diy_scene(str(scene_id))
+            _LOGGER.debug(
+                "Activated DIY scene '%s' on %s via BLE passthrough",
+                scene_name,
+                device.name,
+            )
+
+        return success
+
+    async def async_send_raw_ptreal(self, device_id: str, frame: bytes) -> bool:
+        """Send a raw ptReal BLE frame to a device (developer/debug aid).
+
+        This is a debug path for issue #208 (H7026 and similar RGBIC devices
+        where the Platform API cannot address every segment): it lets a
+        developer service try candidate frames against the device's BLE
+        passthrough. It performs no validation of the frame's meaning and
+        applies no optimistic state update. Sending a wrong frame can put the
+        light into an unexpected mode.
+
+        Args:
+            device_id: Device identifier.
+            frame: Raw command bytes. 1-19 bytes are padded and checksummed
+                via `build_packet`; exactly 20 bytes are sent as-is provided
+                the last byte is a valid XOR checksum of the first 19.
+
+        Returns:
+            True if the frame was sent successfully.
+        """
+        device = self._devices.get(device_id)
+        if not device or device.is_group:
+            _LOGGER.debug("Unknown or group device for raw ptReal: %s", device_id)
+            return False
+
+        if not self._ble_manager.available:
+            _LOGGER.debug(
+                "Cannot send raw ptReal for %s: AWS IoT passthrough not connected",
+                device_id,
+            )
+            return False
+
+        if not frame or len(frame) > 20:
+            _LOGGER.debug("Invalid raw ptReal frame length for %s: %d bytes", device_id, len(frame))
+            return False
+
+        if len(frame) == 20:
+            if calculate_checksum(list(frame[:19])) != frame[19]:
+                _LOGGER.debug("Invalid raw ptReal checksum for %s", device_id)
+                return False
+            packet = bytes(frame)
+        else:
+            packet = build_packet(list(frame))
+
+        result = await self._ble_manager.async_send_ble_packet(device_id, device.sku, encode_packet_base64(packet))
+
+        _LOGGER.debug(
+            "Sent raw ptReal %s to %s: %s",
+            packet.hex(),
+            device_id,
+            "ok" if result else "failed",
+        )
+
+        return result
+
+    @staticmethod
+    def _preserve_optimistic_field(
+        existing: GoveeDeviceState,
+        new: GoveeDeviceState,
+        device_id: str,
+        field: str,
+        label: str,
+    ) -> None:
+        """Preserve an optimistic state field across API polls.
+
+        If the existing state has a truthy value for the field, preserve it
+        on the new state when the device is on. Clear it when the device is off.
+        """
+        if getattr(existing, field):
+            if new.power_state:
+                setattr(new, field, getattr(existing, field))
+            else:
+                _LOGGER.debug("Clearing %s for %s (device turned off)", label, device_id)
+
+    def _is_heater(self, device_id: str) -> bool:
+        """Return True when the device is a heater."""
+        device = self._devices.get(device_id)
+        return device is not None and device.is_heater
+
+    def _apply_optimistic_update(
+        self,
+        device_id: str,
+        command: DeviceCommand,
+    ) -> None:
+        """Apply optimistic state update based on command."""
+        state = self._states.get(device_id)
+        if not state:
+            return
+        device = self._devices.get(device_id)
+        if (
+            device is not None
+            and device.sku == "H6104"
+            and self._config_entry.options.get(CONF_ENABLE_H6104_BLE, DEFAULT_ENABLE_H6104_BLE) is True
+        ):
+            self._h6104_last_write[device_id] = dt_util.utcnow()
+            if isinstance(command, (ColorCommand, ColorTempCommand)):
+                state.dreamview_enabled = False
+                state.music_mode_enabled = False
+        # H7175: kettle power, targets and modes (the heater's targetTemperature
+        # too is a TemperatureSettingCommand, but heaters are not kettles).
+        if isinstance(command, (PowerCommand, TemperatureSettingCommand, WorkModeCommand)):
+            device = self._devices.get(device_id)
+            if device is not None and device.decodes_kettle_frames:
+                self.kettles.apply_command(device_id, state, command)
+                return
+
+        if isinstance(command, PowerCommand):
+            state.apply_optimistic_power(command.power_on)
+        elif isinstance(command, BrightnessCommand):
+            state.apply_optimistic_brightness(command.brightness)
+        elif isinstance(command, RangeCommand) and command.range_instance == INSTANCE_HUMIDITY:
+            # Dehumidifier setpoint (H7152 dial, H7150 reinforcement write) —
+            # the poll returns "" for range::humidity, so keep it optimistically
+            # (issues #114/#118).
+            state.configured_humidity = command.value
+        elif isinstance(command, ColorCommand):
+            state.apply_optimistic_color(command.color)
+        elif isinstance(command, ColorTempCommand):
+            state.apply_optimistic_color_temp(command.kelvin)
+        elif isinstance(command, SceneCommand):
+            state.apply_optimistic_scene(str(command.scene_id), command.scene_name)
+        elif isinstance(command, DIYSceneCommand):
+            state.apply_optimistic_diy_scene(str(command.scene_id))
+        elif isinstance(command, ModeCommand):
+            if command.mode_instance == INSTANCE_HDMI_SOURCE:
+                state.apply_optimistic_hdmi_source(command.value)
+            elif command.mode_instance == INSTANCE_FAN_SPEED_MODE:
+                # Setting a speed implies the ceiling fan is running (#181).
+                state.ceiling_fan_speed = command.value
+                state.ceiling_fan_on = True
+        elif isinstance(command, TemperatureSettingCommand):
+            state.heater_temperature = command.temperature
+            state.heater_auto_stop = command.auto_stop
+            if self._is_heater(device_id):
+                # The heater switches itself on for a setpoint write (#265).
+                state.apply_optimistic_power(True)
+        elif isinstance(command, WorkModeCommand):
+            state.apply_optimistic_work_mode(command.work_mode, command.mode_value)
+            if self._is_heater(device_id):
+                # Same for a heat-level write (#265); fans and purifiers keep their power.
+                state.apply_optimistic_power(True)
+        elif isinstance(command, OscillationCommand):
+            state.apply_optimistic_oscillation(command.oscillating)
+        elif isinstance(command, MusicModeCommand):
+            # Look up mode name from device capabilities for display
+            device = self._devices.get(device_id)
+            mode_name = None
+            if device:
+                for opt in device.get_music_mode_options():
+                    if opt.get("value") == command.music_mode:
+                        mode_name = opt.get("name")
+                        break
+            state.apply_optimistic_music_mode_struct(
+                command.music_mode,
+                command.sensitivity,
+                mode_name,
+            )
+        elif isinstance(command, ToggleCommand):
+            # Handle toggle commands (DreamView, night light, thermostat, etc)
+            if command.toggle_instance == INSTANCE_DREAMVIEW:
+                state.apply_optimistic_dreamview(command.enabled)
+            elif command.toggle_instance == INSTANCE_THERMOSTAT_TOGGLE:
+                thermostat_device = self._devices.get(device_id)
+                if thermostat_device is not None and thermostat_device.sku.upper() in HEATER_AUTO_STOP_STRUCT_SKUS:
+                    state.heater_thermostat = command.enabled
+                else:
+                    state.heater_auto_stop = 1 if command.enabled else 0
+            elif command.toggle_instance == INSTANCE_FAN_TOGGLE:
+                state.ceiling_fan_on = command.enabled
+            elif command.toggle_instance == INSTANCE_REVERSE_AIRFLOW:
+                # The motor starts when the direction is changed while off
+                # (reported on an H1310, #181), so the fan shows as running.
+                state.ceiling_fan_reverse = command.enabled
+                state.ceiling_fan_on = True
+            elif command.toggle_instance == INSTANCE_FAN_OSCILLATE:
+                state.ceiling_fan_swing = command.enabled
+            else:
+                # Generic toggles (socketToggleN, mainLightToggle, ...): keep
+                # the shared state in step with what was just sent, so an
+                # entity reading state.toggles agrees with the one that wrote
+                # it, and a later push or poll can still overwrite it.
+                state.toggles[command.toggle_instance] = command.enabled
+
+    async def async_get_scenes(
+        self,
+        device_id: str,
+        refresh: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Get available scenes for a device.
+
+        Args:
+            device_id: Device identifier.
+            refresh: Force refresh from API.
+
+        Returns:
+            List of scene definitions.
+        """
+        device = self._devices.get(device_id)
+        return await self._scene_cache.async_get_scenes(device_id, device, refresh)
+
+    async def async_get_diy_scenes(
+        self,
+        device_id: str,
+        refresh: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Get available DIY scenes for a device.
+
+        Args:
+            device_id: Device identifier.
+            refresh: Force refresh from API.
+
+        Returns:
+            List of DIY scene definitions.
+        """
+        device = self._devices.get(device_id)
+        return await self._scene_cache.async_get_diy_scenes(device_id, device, refresh)
+
+    async def async_clear_scene(self, device_id: str) -> None:
+        """Clear active scene by sending a color/color_temp command to exit it on the device.
+
+        Brightness commands don't exit scenes, so we must send a color or color_temp
+        command. Restores the last known color/color_temp when available.
+        """
+        state = self._states.get(device_id)
+        device = self._devices.get(device_id)
+        if not state or not device:
+            return
+
+        # Nothing to clear if no scene is active
+        if not state.active_scene and not state.active_diy_scene:
+            self.clear_scene(device_id)
+            self.clear_diy_scene(device_id)
+            return
+
+        # HDMI sync boxes (e.g., H6604 AI Sync Box) have no meaningful "static
+        # color" to restore — their default mode is video sync of the live HDMI
+        # feed. Sending ColorCommand(white) here would lock the device into
+        # manual color mode and lose the sync (issue #48: "Setting DIY scene
+        # to none just leaves a flat white image"). Re-selecting the HDMI
+        # source forces the device back into Video Sync.
+        if device.supports_hdmi_source:
+            source = state.hdmi_source
+            if source is None:
+                options = device.get_hdmi_source_options()
+                source = int(options[0]["value"]) if options else 1
+            success = await self.async_control_device(
+                device_id,
+                ModeCommand(mode_instance=INSTANCE_HDMI_SOURCE, value=int(source)),
+            )
+            if success:
+                self.clear_scene(device_id)
+                self.clear_diy_scene(device_id)
+            return
+
+        # Resolve the color to restore. Skip RGBColor(0,0,0) — the API returns
+        # colorRgb=0 when a scene is running, which is not a meaningful restore target.
+        color = state.color or state.last_color
+        if color and color.as_packed_int == 0:
+            color = state.last_color
+        # Final guard: never restore black even if last_color is somehow (0,0,0)
+        if color and color.as_packed_int == 0:
+            color = None
+        color_temp = state.color_temp_kelvin or state.last_color_temp_kelvin
+
+        success = False
+        if color and device.supports_rgb:
+            success = await self.async_control_device(device_id, ColorCommand(color=color))
+        elif color_temp and device.supports_color_temp:
+            success = await self.async_control_device(device_id, ColorTempCommand(kelvin=color_temp))
+        elif device.supports_rgb:
+            # Prefer RGB white — Govee API reflects this value reliably
+            # (colorRgb=16777215), unlike color_temp which may return 0.
+            success = await self.async_control_device(device_id, ColorCommand(color=RGBColor(255, 255, 255)))
+        elif device.supports_color_temp:
+            # Fallback for color-temp-only devices
+            ct_range = device.color_temp_range
+            if ct_range:
+                midpoint = (ct_range.min_kelvin + ct_range.max_kelvin) // 2
+            else:
+                midpoint = 4000
+            success = await self.async_control_device(device_id, ColorTempCommand(kelvin=midpoint))
+
+        if success:
+            # ColorCommand/ColorTempCommand already clear active_scene via optimistic handlers,
+            # but we also need to clear active_diy_scene explicitly.
+            self.clear_scene(device_id)
+            self.clear_diy_scene(device_id)
+
+    def clear_scene(self, device_id: str) -> None:
+        """Clear active scene for a device."""
+        state = self._states.get(device_id)
+        if state:
+            state.active_scene = None
+            state.active_scene_name = None
+            state.source = "optimistic"
+
+    def clear_diy_scene(self, device_id: str) -> None:
+        """Clear active DIY scene for a device."""
+        state = self._states.get(device_id)
+        if state:
+            state.active_diy_scene = None
+            state.source = "optimistic"
+
+    def clear_music_mode(self, device_id: str) -> None:
+        """Clear music mode state for a device."""
+        state = self._states.get(device_id)
+        if state:
+            state.music_mode_enabled = False
+            state.source = "optimistic"
+
+    def restore_group_state(self, device_id: str, power: bool, brightness: int | None = None) -> None:
+        """Restore state for a group device from HA state machine."""
+        state = self._states.get(device_id)
+        if state:
+            state.power_state = power
+            if brightness is not None:
+                state.brightness = brightness
+            state.source = "optimistic"
+
+    async def async_shutdown(self) -> None:
+        """Shutdown coordinator and cleanup resources."""
+        self._shut_down = True
+        if self._mqtt_silence_unsub is not None:
+            self._mqtt_silence_unsub()
+            self._mqtt_silence_unsub = None
+        if self._command_confirmer is not None:
+            self._command_confirmer.cancel_all()
+        self.kettles.async_shutdown()
+        self.status_burst.async_shutdown()
+        # Cancel BFF polling
+        if self._bff_poll_unsub:
+            self._bff_poll_unsub()
+            self._bff_poll_unsub = None
+        if self._bff_poll_task and not self._bff_poll_task.done():
+            self._bff_poll_task.cancel()
+            self._bff_poll_task = None
+        if self._login_retry_unsub:
+            self._login_retry_unsub()
+            self._login_retry_unsub = None
+        # Cancel standalone water-detector polling (issue #62)
+        if self._wd_poll_unsub:
+            self._wd_poll_unsub()
+            self._wd_poll_unsub = None
+        # Cancel probe-thermometer polling
+        if self._probe_poll_task and not self._probe_poll_task.done():
+            self._probe_poll_task.cancel()
+        self._probe_poll_task = None
+        if self._probe_poll_unsub:
+            self._probe_poll_unsub()
+            self._probe_poll_unsub = None
+        # Cancel periodic MQTT status re-query
+        if self._status_poll_unsub:
+            self._status_poll_unsub()
+            self._status_poll_unsub = None
+
+        # Disconnect all BLE devices
+        for ble_device in self._ble_devices.values():
+            await ble_device.stop()
+        self._ble_devices.clear()
+
+        if self._mqtt_client:
+            await self._mqtt_client.async_stop()
+            self._mqtt_client = None
+
+        if self._openapi_events_client:
+            await self._openapi_events_client.async_stop()
+            self._openapi_events_client = None
+
+        # Drop the multicast group and release the :4002 bind so a reload /
+        # unload never leaks the LAN socket (issue #57, blocking #5).
+        self._lan_closed = True
+        if self._lan_client is not None:
+            await self._lan_client.async_stop()
+            self._lan_client = None
+
+        await self._api_client.close()
+
+        # Let DataUpdateCoordinator cancel its scheduled refresh and debouncer
+        # (it is idempotent; HA also calls this on unload / HA stop).
+        await super().async_shutdown()
+
+
+# Typed config entry for this integration; ``entry.runtime_data`` is the
+# coordinator (quality-scale rules ``runtime-data`` and ``strict-typing``).
+type GoveeConfigEntry = ConfigEntry[GoveeCoordinator]

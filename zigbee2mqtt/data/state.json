@@ -1,0 +1,569 @@
+{
+    "0x28dba7fffee55fc6": {
+        "state": "OFF",
+        "power_on_behavior": "on",
+        "brightness": 254,
+        "update": {
+            "state": "idle",
+            "installed_version": 16777220,
+            "latest_version": 16777220,
+            "latest_source": "https://raw.githubusercontent.com/Koenkk/zigbee-OTA/master/images/IKEA/tradfri-driver-zingo_release_prod_v16777220_1fd2b92c-45c5-44d0-97c5-5c71c2ecb8d2.ota",
+            "latest_release_notes": "https://ww8.ikea.com/ikeahomesmart/releasenotes/releasenotes.html"
+        }
+    },
+    "0xecf64cfffe10b2b4": {
+        "battery": 93,
+        "update": {
+            "state": "idle",
+            "installed_version": 16777303,
+            "latest_version": 16777303,
+            "latest_source": "https://raw.githubusercontent.com/Koenkk/zigbee-OTA/master/images/IKEA/rodret-dimmer-soc_release_prod_v16777303_0a78457a-950c-4903-bfd1-67902aa66cf9.ota",
+            "latest_release_notes": "https://ww8.ikea.com/ikeahomesmart/releasenotes/releasenotes.html"
+        }
+    },
+    "0x680ae2fffe36ca1f": {
+        "battery": 2
+    },
+    "0xa4c138105a6451a1": {
+        "state": "OFF",
+        "power_on_behavior": "previous",
+        "backlight_mode": "normal"
+    },
+    "0xa4c13820c3781e01": {
+        "position": 0,
+        "state": "CLOSE",
+        "moving": "STOP",
+        "calibration": "OFF",
+        "calibration_time": 38.1,
+        "indicator_mode": "off",
+        "backlight_mode": "ON",
+        "motor_reversal": "OFF"
+    },
+    "0xa4c138b7e6e6f754": {
+        "state": "OFF",
+        "power_on_behavior": "previous",
+        "backlight_mode": "normal"
+    },
+    "0xa4c1385f099dfb51": {
+        "state": "ON",
+        "power_on_behavior": "previous",
+        "backlight_mode": "normal"
+    },
+    "0xa4c138ae27025d6a": {
+        "state": "OFF",
+        "power_on_behavior": "previous",
+        "backlight_mode": "normal"
+    },
+    "0x0cae5ffffeae6730": {
+        "local_temperature": 21.1,
+        "occupied_heating_setpoint": 19,
+        "system_mode": "heat",
+        "running_state": "idle",
+        "local_temperature_calibration": -4.8,
+        "child_lock": "UNLOCK",
+        "open_window": "OFF",
+        "frost_protection_temperature": 7,
+        "idle_steps": 278,
+        "closing_steps": 283,
+        "valve_opening_limit_voltage": 1800,
+        "valve_closing_limit_voltage": 2741,
+        "valve_motor_running_voltage": 1663,
+        "battery": 83,
+        "weekly_schedule": {
+            "monday": "00:00/16 07:00/19 10:00/16 10:00/16 17:00/19 23:00/16",
+            "tuesday": "00:00/16 07:00/19 10:00/16 10:00/16 17:00/19 23:00/16",
+            "wednesday": "00:00/16 07:00/19 10:00/16 10:00/16 17:00/19 23:00/16",
+            "thursday": "00:00/16 07:00/19 10:00/16 10:00/16 17:00/19 23:00/16",
+            "friday": "00:00/16 07:00/19 10:00/16 10:00/16 17:00/19 23:00/16",
+            "saturday": "00:00/16 07:00/19 10:00/19 10:00/19 10:00/19 23:00/16",
+            "sunday": "00:00/16 07:00/19 10:00/19 10:00/19 10:00/19 23:00/16"
+        },
+        "valve_opening_degree": 100,
+        "valve_closing_degree": 100,
+        "temperature_sensor_select": "internal",
+        "external_temperature_input": 38.6,
+        "temperature_accuracy": -1
+    },
+    "0x0cae5ffffeb12f67": {
+        "local_temperature_calibration": 12.7,
+        "child_lock": "LOCK",
+        "open_window": "OFF",
+        "frost_protection_temperature": 7,
+        "idle_steps": 20,
+        "closing_steps": 517,
+        "valve_opening_limit_voltage": 1825,
+        "valve_closing_limit_voltage": 2781,
+        "valve_motor_running_voltage": 0,
+        "local_temperature": 41.8,
+        "occupied_heating_setpoint": 19,
+        "system_mode": "heat",
+        "running_state": "idle",
+        "battery": 86,
+        "weekly_schedule": {
+            "monday": "00:00/16 07:00/19 10:00/16 10:00/16 17:00/19 23:00/16",
+            "tuesday": "00:00/16 07:00/19 10:00/16 10:00/16 17:00/19 23:00/16",
+            "wednesday": "00:00/16 07:00/19 10:00/16 10:00/16 17:00/19 23:00/16",
+            "thursday": "00:00/16 07:00/19 10:00/16 10:00/16 17:00/19 23:00/16",
+            "friday": "00:00/16 07:00/19 10:00/16 10:00/16 17:00/19 23:00/16",
+            "saturday": "00:00/16 07:00/19 10:00/19 10:00/19 10:00/19 23:00/16",
+            "sunday": "00:00/16 07:00/19 10:00/19 10:00/19 10:00/19 23:00/16"
+        },
+        "valve_opening_degree": 100,
+        "valve_closing_degree": 100,
+        "temperature_sensor_select": "internal",
+        "external_temperature_input": 38.7,
+        "temperature_accuracy": -1
+    },
+    "0x0cae5ffffeb360c0": {
+        "local_temperature": 32.4,
+        "occupied_heating_setpoint": 19,
+        "system_mode": "heat",
+        "running_state": "idle",
+        "local_temperature_calibration": 12.7,
+        "child_lock": "LOCK",
+        "open_window": "OFF",
+        "frost_protection_temperature": 7,
+        "idle_steps": 20,
+        "closing_steps": 529,
+        "valve_opening_limit_voltage": 1842,
+        "valve_closing_limit_voltage": 3094,
+        "valve_motor_running_voltage": 1955,
+        "battery": 79,
+        "weekly_schedule": {
+            "monday": "00:00/16 07:00/19 10:00/16 10:00/16 17:00/19 23:00/16",
+            "tuesday": "00:00/16 07:00/19 10:00/16 10:00/16 17:00/19 23:00/16",
+            "wednesday": "00:00/16 07:00/19 10:00/16 10:00/16 17:00/19 23:00/16",
+            "thursday": "00:00/16 07:00/19 10:00/16 10:00/16 17:00/19 23:00/16",
+            "friday": "00:00/16 07:00/19 10:00/16 10:00/16 17:00/19 23:00/16",
+            "saturday": "00:00/16 07:00/19 10:00/19 10:00/19 10:00/19 23:00/16",
+            "sunday": "00:00/16 07:00/19 10:00/19 10:00/19 10:00/19 23:00/16"
+        },
+        "valve_opening_degree": 100,
+        "valve_closing_degree": 100,
+        "temperature_sensor_select": "internal",
+        "external_temperature_input": 26.5,
+        "temperature_accuracy": -0.6,
+        "update": {
+            "state": "idle",
+            "installed_version": 5124,
+            "latest_version": 5124,
+            "latest_source": "https://raw.githubusercontent.com/Koenkk/zigbee-OTA/master/images/Sonoff/trvzb_v1.4.4.ota",
+            "latest_release_notes": null
+        }
+    },
+    "0x0cae5ffffeb27ca3": {
+        "local_temperature": 22.1,
+        "occupied_heating_setpoint": 21,
+        "system_mode": "heat",
+        "running_state": "idle",
+        "local_temperature_calibration": 1,
+        "child_lock": "LOCK",
+        "open_window": "OFF",
+        "frost_protection_temperature": 7,
+        "idle_steps": 20,
+        "closing_steps": 521,
+        "valve_opening_limit_voltage": 1699,
+        "valve_closing_limit_voltage": 2769,
+        "valve_motor_running_voltage": 2054,
+        "battery": 100,
+        "weekly_schedule": {
+            "monday": "00:00/16 07:00/19 10:00/16 10:00/16 17:00/19 23:00/16",
+            "tuesday": "00:00/16 07:00/19 10:00/16 10:00/16 17:00/19 23:00/16",
+            "wednesday": "00:00/16 07:00/19 10:00/16 10:00/16 17:00/19 23:00/16",
+            "thursday": "00:00/16 07:00/19 10:00/16 10:00/16 17:00/19 23:00/16",
+            "friday": "00:00/16 07:00/19 10:00/16 10:00/16 17:00/19 23:00/16",
+            "saturday": "00:00/16 07:00/19 10:00/19 10:00/19 10:00/19 23:00/16",
+            "sunday": "00:00/16 07:00/19 10:00/19 10:00/19 10:00/19 23:00/16"
+        },
+        "valve_opening_degree": 100,
+        "valve_closing_degree": 100,
+        "temperature_sensor_select": "internal",
+        "external_temperature_input": 22.2,
+        "temperature_accuracy": -0.6,
+        "update": {
+            "state": "idle",
+            "installed_version": 5124,
+            "latest_version": 5124,
+            "latest_source": "https://raw.githubusercontent.com/Koenkk/zigbee-OTA/master/images/Sonoff/trvzb_v1.4.4.ota",
+            "latest_release_notes": null
+        }
+    },
+    "0x0ceff6fffe59be21": {
+        "battery": 100,
+        "temperature": 21.8,
+        "humidity": 46.2,
+        "comfort_temperature_min": 19,
+        "comfort_temperature_max": 27,
+        "comfort_humidity_min": 40,
+        "comfort_humidity_max": 60,
+        "temperature_units": "celsius",
+        "temperature_calibration": 0,
+        "humidity_calibration": 0,
+        "update": {
+            "state": "idle",
+            "installed_version": 8960,
+            "latest_version": 8960,
+            "latest_source": "https://raw.githubusercontent.com/Koenkk/zigbee-OTA/master/images/Sonoff/snzb-02d_v2.3.0.ota",
+            "latest_release_notes": null
+        }
+    },
+    "0x0ceff6fffe3fcc56": {
+        "battery": 100,
+        "temperature": 20.7,
+        "humidity": 51.1,
+        "comfort_temperature_min": 19,
+        "comfort_temperature_max": 27,
+        "comfort_humidity_min": 40,
+        "comfort_humidity_max": 60,
+        "temperature_units": "celsius",
+        "temperature_calibration": 0,
+        "humidity_calibration": 0,
+        "update": {
+            "state": "idle",
+            "installed_version": 8960,
+            "latest_version": 8960,
+            "latest_source": "https://raw.githubusercontent.com/Koenkk/zigbee-OTA/master/images/Sonoff/snzb-02d_v2.3.0.ota",
+            "latest_release_notes": null
+        }
+    },
+    "0x00158d008b0ba12e": {
+        "contact": true,
+        "voltage": 3005,
+        "battery": 100,
+        "device_temperature": 23,
+        "power_outage_count": 8,
+        "trigger_count": 0
+    },
+    "0x0ceff6fffe5b83e8": {
+        "battery": 100,
+        "temperature": 20.2,
+        "humidity": 51.9,
+        "update": {
+            "state": "idle",
+            "installed_version": 8960,
+            "latest_version": 8960,
+            "latest_source": "https://raw.githubusercontent.com/Koenkk/zigbee-OTA/master/images/Sonoff/snzb-02d_v2.3.0.ota",
+            "latest_release_notes": null
+        }
+    },
+    "0x00158d008b0ba0da": {
+        "contact": true,
+        "voltage": 2985,
+        "battery": 90,
+        "device_temperature": 26,
+        "power_outage_count": 9,
+        "trigger_count": 0
+    },
+    "0x0ceff6fffe69f3a8": {
+        "battery": 100,
+        "temperature": 21,
+        "humidity": 58.1,
+        "comfort_temperature_min": 19,
+        "comfort_temperature_max": 27,
+        "comfort_humidity_min": 40,
+        "comfort_humidity_max": 60,
+        "temperature_units": "celsius",
+        "temperature_calibration": 0,
+        "humidity_calibration": 0,
+        "update": {
+            "state": "idle",
+            "installed_version": 8960,
+            "latest_version": 8960,
+            "latest_source": "https://raw.githubusercontent.com/Koenkk/zigbee-OTA/master/images/Sonoff/snzb-02d_v2.3.0.ota",
+            "latest_release_notes": null
+        }
+    },
+    "0x842712fffe33c984": {
+        "battery": 0,
+        "temperature": 18.2,
+        "humidity": 55.2,
+        "comfort_temperature_min": 19,
+        "comfort_temperature_max": 27,
+        "comfort_humidity_min": 40,
+        "comfort_humidity_max": 60,
+        "temperature_units": "celsius",
+        "temperature_calibration": 0,
+        "humidity_calibration": 0,
+        "update": {
+            "state": "idle",
+            "installed_version": 8960,
+            "latest_version": 8960,
+            "latest_source": "https://raw.githubusercontent.com/Koenkk/zigbee-OTA/master/images/Sonoff/snzb-02d_v2.3.0.ota",
+            "latest_release_notes": null
+        }
+    },
+    "0x842712fffe418355": {
+        "battery": 100,
+        "temperature": 21.3,
+        "humidity": 46.5,
+        "update": {
+            "state": "idle",
+            "installed_version": 8960,
+            "latest_version": 8960,
+            "latest_source": "https://raw.githubusercontent.com/Koenkk/zigbee-OTA/master/images/Sonoff/snzb-02d_v2.3.0.ota",
+            "latest_release_notes": null
+        }
+    },
+    "0x00158d008b0bc29f": {
+        "contact": true,
+        "voltage": 2985,
+        "battery": 90,
+        "device_temperature": 25,
+        "power_outage_count": 13,
+        "trigger_count": 0
+    },
+    "0x881a14fffee96739": {
+        "local_temperature": 20.8,
+        "occupied_heating_setpoint": 14,
+        "system_mode": "heat",
+        "running_state": "idle",
+        "local_temperature_calibration": 0,
+        "child_lock": "LOCK",
+        "open_window": "OFF",
+        "frost_protection_temperature": 7,
+        "idle_steps": 20,
+        "closing_steps": 533,
+        "valve_opening_limit_voltage": 1934,
+        "valve_closing_limit_voltage": 3057,
+        "valve_motor_running_voltage": 2025,
+        "battery": 49,
+        "weekly_schedule": {
+            "monday": "00:00/16 07:00/19 10:00/16 10:00/16 17:00/19 23:00/16",
+            "tuesday": "00:00/16 07:00/19 10:00/16 10:00/16 17:00/19 23:00/16",
+            "wednesday": "00:00/16 07:00/19 10:00/16 10:00/16 17:00/19 23:00/16",
+            "thursday": "00:00/16 07:00/19 10:00/16 10:00/16 17:00/19 23:00/16",
+            "friday": "00:00/16 07:00/19 10:00/16 10:00/16 17:00/19 23:00/16",
+            "saturday": "00:00/16 07:00/19 10:00/19 10:00/19 10:00/19 23:00/16",
+            "sunday": "00:00/16 07:00/19 10:00/19 10:00/19 10:00/19 23:00/16"
+        },
+        "valve_opening_degree": 100,
+        "valve_closing_degree": 100,
+        "external_temperature_input": 18.6,
+        "temperature_accuracy": -0.8,
+        "temperature_sensor_select": "internal",
+        "update": {
+            "state": "idle",
+            "installed_version": 5124,
+            "latest_version": 5124,
+            "latest_source": "https://raw.githubusercontent.com/Koenkk/zigbee-OTA/master/images/Sonoff/trvzb_v1.4.4.ota",
+            "latest_release_notes": null
+        }
+    },
+    "0x0cae5ffffed02ee3": {
+        "local_temperature": 21.7,
+        "occupied_heating_setpoint": 20,
+        "system_mode": "heat",
+        "running_state": "idle",
+        "local_temperature_calibration": 0.8,
+        "child_lock": "LOCK",
+        "open_window": "OFF",
+        "frost_protection_temperature": 7,
+        "idle_steps": 273,
+        "closing_steps": 288,
+        "valve_opening_limit_voltage": 1869,
+        "valve_closing_limit_voltage": 2722,
+        "valve_motor_running_voltage": 1529,
+        "battery": 79,
+        "weekly_schedule": {
+            "monday": "00:00/16 07:00/19 10:00/16 10:00/16 17:00/19 23:00/16",
+            "tuesday": "00:00/16 07:00/19 10:00/16 10:00/16 17:00/19 23:00/16",
+            "wednesday": "00:00/16 07:00/19 10:00/16 10:00/16 17:00/19 23:00/16",
+            "thursday": "00:00/16 07:00/19 10:00/16 10:00/16 17:00/19 23:00/16",
+            "friday": "00:00/16 07:00/19 10:00/16 10:00/16 17:00/19 23:00/16",
+            "saturday": "00:00/16 07:00/19 10:00/19 10:00/19 10:00/19 23:00/16",
+            "sunday": "00:00/16 07:00/19 10:00/19 10:00/19 10:00/19 23:00/16"
+        },
+        "valve_opening_degree": 100,
+        "valve_closing_degree": 100,
+        "temperature_sensor_select": "internal",
+        "external_temperature_input": 15.5,
+        "temperature_accuracy": -0.6,
+        "update": {
+            "state": "idle",
+            "installed_version": 5124,
+            "latest_version": 5124,
+            "latest_source": "https://raw.githubusercontent.com/Koenkk/zigbee-OTA/master/images/Sonoff/trvzb_v1.4.4.ota",
+            "latest_release_notes": null
+        }
+    },
+    "0x0cae5ffffed0fec7": {
+        "local_temperature": 21.1,
+        "occupied_heating_setpoint": 20,
+        "system_mode": "heat",
+        "running_state": "idle",
+        "local_temperature_calibration": 0,
+        "child_lock": "UNLOCK",
+        "open_window": "OFF",
+        "frost_protection_temperature": 7,
+        "idle_steps": 20,
+        "closing_steps": 510,
+        "valve_opening_limit_voltage": 1848,
+        "valve_closing_limit_voltage": 2544,
+        "valve_motor_running_voltage": 1382,
+        "battery": 66,
+        "weekly_schedule": {
+            "monday": "00:00/16 07:00/19 10:00/16 10:00/16 17:00/19 23:00/16",
+            "tuesday": "00:00/16 07:00/19 10:00/16 10:00/16 17:00/19 23:00/16",
+            "wednesday": "00:00/16 07:00/19 10:00/16 10:00/16 17:00/19 23:00/16",
+            "thursday": "00:00/16 07:00/19 10:00/16 10:00/16 17:00/19 23:00/16",
+            "friday": "00:00/16 07:00/19 10:00/16 10:00/16 17:00/19 23:00/16",
+            "saturday": "00:00/16 07:00/19 10:00/19 10:00/19 10:00/19 23:00/16",
+            "sunday": "00:00/16 07:00/19 10:00/19 10:00/19 10:00/19 23:00/16"
+        },
+        "valve_opening_degree": 100,
+        "valve_closing_degree": 100,
+        "temperature_accuracy": -0.6,
+        "temperature_sensor_select": "internal",
+        "external_temperature_input": 20.5,
+        "update": {
+            "state": "idle",
+            "installed_version": 5124,
+            "latest_version": 5124,
+            "latest_source": "https://raw.githubusercontent.com/Koenkk/zigbee-OTA/master/images/Sonoff/trvzb_v1.4.4.ota",
+            "latest_release_notes": null
+        }
+    },
+    "0xa4c1386b18fe9844": {
+        "state": "OFF",
+        "countdown": 0,
+        "power_outage_memory": "restore",
+        "indicator_mode": "off/on",
+        "child_lock": "UNLOCK",
+        "voltage": 233,
+        "power": 0,
+        "energy": 13.28,
+        "current": 0
+    },
+    "0xa4c13879eb7ec79a": {
+        "state": "OFF",
+        "countdown": 0,
+        "power_outage_memory": "restore",
+        "indicator_mode": "off/on",
+        "child_lock": "UNLOCK",
+        "voltage": 235,
+        "power": 0,
+        "energy": 25.47,
+        "current": 0
+    },
+    "0xa4c138919a88e4bf": {
+        "state": "OFF",
+        "countdown": 0,
+        "power_outage_memory": "restore",
+        "indicator_mode": "on/off",
+        "child_lock": "UNLOCK",
+        "power": 0,
+        "current": 0,
+        "voltage": 234,
+        "energy": 23.95
+    },
+    "0x001788010dbd8410": {
+        "state": "ON",
+        "brightness": 254
+    },
+    "0x001788010dbd8bd4": {
+        "state": "ON",
+        "brightness": 254
+    },
+    "0xa4c138f9d410f172": {
+        "state": "OFF",
+        "brightness": 216,
+        "max_brightness": 254,
+        "light_type": "led",
+        "countdown": 0,
+        "min_brightness": 0
+    },
+    "0x00158d008b0baed9": {
+        "voltage": 3035,
+        "battery": 100,
+        "device_temperature": 22,
+        "power_outage_count": 6,
+        "trigger_count": 0,
+        "contact": true
+    },
+    "0x00158d008b0ba9ac": {
+        "contact": false,
+        "voltage": 2975,
+        "battery": 83,
+        "device_temperature": 24,
+        "power_outage_count": 8,
+        "trigger_count": 0
+    },
+    "0x00158d008afe12ef": {
+        "contact": true,
+        "voltage": 3005,
+        "battery": 100,
+        "device_temperature": 22,
+        "power_outage_count": 27,
+        "trigger_count": 0
+    },
+    "0x0cae5ffffec2a74f": {
+        "occupancy_sensitivity": "low",
+        "occupancy": false,
+        "illumination": "bright",
+        "update": {
+            "state": "idle",
+            "installed_version": 4102,
+            "latest_version": 4101,
+            "latest_source": "https://raw.githubusercontent.com/Koenkk/zigbee-OTA/master/images/Sonoff/snzb-06p_v1.0.5.ota",
+            "latest_release_notes": null
+        }
+    },
+    "0xa4c138b9196b91a6": {
+        "voltage": 232,
+        "energy": 9.68,
+        "power": 0,
+        "current": 0,
+        "state": "OFF",
+        "countdown": 0,
+        "power_outage_memory": "restore",
+        "indicator_mode": "off/on",
+        "child_lock": "UNLOCK"
+    },
+    "0xa4c1383ca4c071be": {
+        "state": "OFF",
+        "countdown": 0,
+        "power_outage_memory": "restore",
+        "indicator_mode": "off/on",
+        "child_lock": "UNLOCK",
+        "voltage": 233,
+        "current": 0,
+        "power": 0,
+        "energy": 11.98
+    },
+    "0xa4c1384cc1e27f97": {
+        "state": "OFF",
+        "power_on_behavior": "previous",
+        "backlight_mode": "normal"
+    },
+    "0x00158d000ad9d9e6": {
+        "voltage": 3025,
+        "battery": 100,
+        "device_temperature": 19,
+        "power_outage_count": 9,
+        "trigger_count": 0,
+        "contact": true
+    },
+    "0x0ceff6fffe16cb3f": {
+        "occupancy": false,
+        "illumination": "bright",
+        "occupancy_sensitivity": "low",
+        "update": {
+            "state": "idle",
+            "installed_version": 4102,
+            "latest_version": 4101,
+            "latest_source": "https://raw.githubusercontent.com/Koenkk/zigbee-OTA/master/images/Sonoff/snzb-06p_v1.0.5.ota",
+            "latest_release_notes": null
+        }
+    },
+    "0xa4c138d2aecc2e8a": {
+        "voltage": 231,
+        "state": "OFF",
+        "countdown": 0,
+        "power_outage_memory": "restore",
+        "indicator_mode": "off/on",
+        "child_lock": "UNLOCK",
+        "power": 0,
+        "current": 0,
+        "energy": 2.2
+    }
+}

@@ -1,0 +1,56 @@
+{
+    "entity": {
+        "binary_sensor": {
+            "battery_low": {
+                "default": "mdi:battery-alert"
+            }
+        },
+        "button": {
+            "battery_replaced": {
+                "default": "mdi:battery-sync"
+            }
+        },
+        "sensor": {
+            "battery_type": {
+                "default": "mdi:battery-unknown"
+            },
+            "battery_last_replaced": {
+                "default": "mdi:battery-clock"
+            }
+        }
+    },
+    "services": {
+        "set_battery_replaced": {
+            "service": "mdi:battery-sync"
+        },
+        "check_battery_last_replaced": {
+            "service": "mdi:battery-clock"
+        },
+        "check_battery_last_reported": {
+            "service": "mdi:battery-unknown"
+        },
+        "check_battery_low": {
+            "service": "mdi:battery-alert"
+        }
+    },
+    "triggers": {
+        "battery_has_increased": {
+            "trigger": "mdi:battery-arrow-up"
+        },
+        "battery_was_not_reported": {
+            "trigger": "mdi:battery-unknown"
+        },
+        "battery_was_not_replaced": {
+            "trigger": "mdi:battery-clock"
+        },
+        "battery_no_longer_low": {
+            "trigger": "mdi:battery-check"
+        },
+        "battery_became_low": {
+            "trigger": "mdi:battery-alert"
+        },
+        "battery_was_replaced": {
+            "trigger": "mdi:battery-sync"
+        }
+    }
+}

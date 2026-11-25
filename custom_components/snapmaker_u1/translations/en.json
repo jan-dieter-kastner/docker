@@ -1,0 +1,283 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Add to Snapmaker U1",
+        "description": "What would you like to add?",
+        "menu_options": {
+          "printer": "Snapmaker U1 printer",
+          "popstatus": "BIQU PopStatus light bar",
+          "popknomi": "BIQU PopKnomi status display"
+        }
+      },
+      "reconfigure": {
+        "title": "Reconfigure Snapmaker U1",
+        "description": "Update the connection settings for your Snapmaker U1.",
+        "data": {
+          "host": "IP Address or Hostname",
+          "port": "Port",
+          "api_key": "API Key (optional)"
+        }
+      },
+      "printer": {
+        "title": "Connect to Snapmaker U1",
+        "description": "Enter the IP address of your Snapmaker U1 printer. Leave the API key blank if your printer uses the default trusted LAN client configuration.",
+        "data": {
+          "host": "IP Address or Hostname",
+          "port": "Port (default 80)",
+          "api_key": "API Key (optional)"
+        },
+        "data_description": {
+          "host": "The IP address or hostname of your Snapmaker U1 on your local network.",
+          "api_key": "Only required if you have configured authentication in Moonraker."
+        }
+      },
+      "popstatus": {
+        "title": "Add a BIQU PopStatus",
+        "description": "Enter the IP address or hostname of your PopStatus light bar (e.g. 192.168.1.60 or PopStatus.local). Set it up and connect it to your printer in BIQU's app or its own web page first.",
+        "data": {
+          "host": "PopStatus address",
+          "printer_entry_id": "Printer"
+        },
+        "data_description": {
+          "printer_entry_id": "The printer it belongs to; its dashboard card gets a Status bar button."
+        }
+      },
+      "popknomi": {
+        "title": "Add a BIQU PopKnomi",
+        "description": "Enter the IP address or hostname of your PopKnomi display (e.g. 192.168.1.61). Set it up and connect it to your printer in BIQU's app or its own web page first.",
+        "data": {
+          "host": "PopKnomi address",
+          "printer_entry_id": "Printer"
+        },
+        "data_description": {
+          "printer_entry_id": "The printer it belongs to."
+        }
+      },
+      "reconfigure_accessory": {
+        "title": "Reconfigure {device}",
+        "data": {
+          "host": "Address",
+          "printer_entry_id": "Printer"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Update the Snapmaker U1 API key",
+        "description": "The printer at {host} rejected the stored API key. Enter its current Moonraker API key, or leave it blank if Home Assistant is a trusted client.",
+        "data": {
+          "api_key": "API Key"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Unable to connect to the printer. Please check the IP address and that the printer is powered on and on the same network.",
+      "accessory_cannot_connect": "Can't reach the device at that address. Check it's powered on and on the same network (open its address in a browser to test).",
+      "invalid_auth": "The printer rejected the API key. Check the key in Moonraker, or leave it blank if Home Assistant is a trusted client."
+    },
+    "abort": {
+      "already_configured": "This device is already configured.",
+      "reauth_successful": "The API key was updated."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Snapmaker U1 Options",
+        "data": {
+          "scan_interval": "Fallback poll interval (seconds)",
+          "temperature_unit": "Temperature unit"
+        },
+        "data_description": {
+          "scan_interval": "How often to poll the printer via HTTP when the WebSocket is disconnected (10–300 seconds).",
+          "temperature_unit": "Unit for all printer temperatures. 3D printing normally uses °C, even if the rest of Home Assistant uses °F."
+        }
+      }
+    }
+  },
+  "selector": {
+    "temperature_unit": {
+      "options": {
+        "celsius": "Celsius (°C)",
+        "fahrenheit": "Fahrenheit (°F)",
+        "system": "Home Assistant default"
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "print_state": {
+        "name": "Print State",
+        "state": {
+          "standby": "Standby",
+          "printing": "Printing",
+          "paused": "Paused",
+          "complete": "Complete",
+          "error": "Error",
+          "cancelled": "Cancelled"
+        }
+      },
+      "print_progress": { "name": "Print Progress" },
+      "current_layer": { "name": "Current Layer" },
+      "total_layers": { "name": "Total Layers" },
+      "print_duration": { "name": "Print Duration" },
+      "total_duration": { "name": "Total Duration" },
+      "time_remaining": { "name": "Time Remaining" },
+      "print_eta": { "name": "Print ETA" },
+      "filament_used": { "name": "Filament Used" },
+      "filename": { "name": "Filename" },
+      "bed_temperature": { "name": "Bed Temperature" },
+      "bed_target": { "name": "Bed Target Temperature" },
+      "fan_speed": { "name": "Part Cooling Fan" },
+      "klipper_state": {
+        "name": "Klipper State",
+        "state": {
+          "ready": "Ready",
+          "startup": "Starting Up",
+          "shutdown": "Shutdown",
+          "error": "Error"
+        }
+      },
+      "toolhead_position": { "name": "Toolhead Position" },
+      "nozzle_temperature": { "name": "Nozzle Temperature" },
+      "nozzle_target": { "name": "Nozzle Target Temperature" },
+      "speed_factor": { "name": "Print Speed" },
+      "flow_rate": { "name": "Flow Rate" },
+      "chamber_temperature": { "name": "Temperature" },
+      "top_cover_filter_used": { "name": "Top Cover Filter Used" },
+      "top_cover_filter_life": { "name": "Top Cover Filter Life" },
+      "top_cover_circulation_rpm": { "name": "Top Cover Circulation Fan RPM" },
+      "current_object": { "name": "Current object" },
+      "last_timelapse": { "name": "Last timelapse" }
+    },
+    "binary_sensor": {
+      "printer_ready": { "name": "Printer Ready" },
+      "is_printing": { "name": "Printing" },
+      "is_paused": { "name": "Paused" },
+      "has_error": { "name": "Error" },
+      "popstatus_printer_link": { "name": "Printer connection" },
+      "popknomi_printer_link": { "name": "Printer connection" }
+    },
+    "button": {
+      "pause_print": { "name": "Pause Print" },
+      "resume_print": { "name": "Resume Print" },
+      "cancel_print": { "name": "Cancel Print" },
+      "emergency_stop": { "name": "Emergency Stop" },
+      "home_all": { "name": "Home All Axes" },
+      "home_x": { "name": "Home X" },
+      "home_y": { "name": "Home Y" },
+      "home_z": { "name": "Home Z" },
+      "restart_klipper": { "name": "Restart Klipper" },
+      "top_cover_reset_filter": { "name": "Reset Top Cover Filter" }
+    },
+    "camera": {
+      "webcam": { "name": "Webcam" }
+    },
+    "image": {
+      "print_preview": { "name": "Print Preview" }
+    },
+    "number": {
+      "bed_target": { "name": "Bed Target Temperature" },
+      "fan_speed_setpoint": { "name": "Part Cooling Fan Speed" },
+      "nozzle_target_setpoint": { "name": "Nozzle Target Temperature" },
+      "speed_factor_setpoint": { "name": "Print Speed Override" },
+      "flow_rate_setpoint": { "name": "Flow Rate Override" },
+      "top_cover_exhaust_fan": { "name": "Top Cover Exhaust Fan" },
+      "top_cover_circulation_fan": { "name": "Top Cover Circulation Fan" },
+      "active_spool": { "name": "Active spool" }
+    },
+    "select": {
+      "print_file": { "name": "Print File" },
+      "active_tool": { "name": "Active Tool" },
+      "top_cover_mode": {
+        "name": "Top Cover Mode",
+        "state": {
+          "off": "Off",
+          "cooling": "Cooling",
+          "preheat": "Preheat",
+          "keep_warm": "Keep warm"
+        }
+      },
+      "popstatus_light_mode": {
+        "name": "Light mode",
+        "state": {
+          "simple": "Simple",
+          "advanced": "Advanced"
+        }
+      },
+      "popknomi_print_progress": {
+        "name": "Print progress display",
+        "state": {
+          "data": "Printing data only",
+          "gif": "GIF only",
+          "alternate": "Data and GIF alternately",
+          "overlay": "Percentage over GIF"
+        }
+      },
+      "popknomi_error_display": {
+        "name": "Error display",
+        "state": {
+          "off": "Off",
+          "qr_code": "QR code",
+          "gif": "GIF"
+        }
+      },
+      "popknomi_screen_off": {
+        "name": "Screen off",
+        "state": {
+          "never": "Never",
+          "standby": "On standby",
+          "inactivity": "After 30 minutes idle"
+        }
+      },
+      "exclude_object": { "name": "Exclude object" }
+    },
+    "switch": {
+      "work_light": { "name": "Work Light" },
+      "timelapse": { "name": "Timelapse" }
+    },
+    "light": {
+      "popstatus_light": { "name": "Light" }
+    }
+  },
+  "device_automation": {
+    "trigger_type": {
+      "print_started": "Print started",
+      "print_complete": "Print complete",
+      "print_failed": "Print failed",
+      "print_paused": "Print paused",
+      "print_cancelled": "Print cancelled"
+    }
+  },
+  "services": {
+    "execute_gcode": {
+      "name": "Execute G-code",
+      "description": "Send a raw G-code command or macro to the printer."
+    },
+    "set_bed_temperature": {
+      "name": "Set Bed Temperature",
+      "description": "Set the heated bed target temperature."
+    },
+    "set_nozzle_temperature": {
+      "name": "Set Nozzle Temperature",
+      "description": "Set a nozzle (extruder) target temperature."
+    },
+    "start_print": {
+      "name": "Start Print",
+      "description": "Start printing a G-code file from the printer's storage."
+    },
+    "exclude_object": {
+      "name": "Exclude object",
+      "description": "Stop printing one labelled object of the running print (EXCLUDE_OBJECT). Needs object labels from the slicer. Can't be undone for this print.",
+      "fields": {
+        "config_entry_id": {
+          "name": "Config Entry",
+          "description": "The config entry ID for the printer."
+        },
+        "name": {
+          "name": "Object name",
+          "description": "The object's name, as listed in the Current Object sensor's \"objects\" attribute."
+        }
+      }
+    }
+  }
+}

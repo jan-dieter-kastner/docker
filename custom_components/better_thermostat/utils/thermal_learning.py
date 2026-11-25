@@ -1,0 +1,551 @@
+"""Thermal learning: heating-power and heat-loss state machines.
+
+Typed tracker dataclasses that perform no Home Assistant side effects.  Everything
+the caller has to act on is handed back in frozen *Result* dataclasses.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+import logging
+import math
+from typing import NamedTuple, TypedDict
+
+from homeassistant.components.climate.const import HVACAction
+
+from .const import MAX_HEAT_LOSS, MAX_HEATING_POWER, MIN_HEAT_LOSS, MIN_HEATING_POWER
+
+_LOGGER = logging.getLogger(__name__)
+
+# Internal constants
+_TIMEOUT_MIN: int = 30  # plateau safety timeout (minutes)
+_MIN_CYCLE_DURATION: float = 1.0  # minimum cycle minutes to accept
+_BASE_ALPHA: float = 0.10  # EMA base smoothing factor
+_ALPHA_MIN: float = 0.02
+_ALPHA_MAX: float = 0.25
+# Minutes the heat-loss measurement waits after the cooler stops. The room
+# keeps falling fast for a few minutes (4 in the measured case) while cold air
+# leaves the unit and the sensor catches up; ten minutes covers that tail
+# plus one report interval of a sensor that reports every five minutes.
+_COOLER_SETTLE_MIN: float = 10.0
+
+# Telemetry deque sizes
+_STATS_MAXLEN: int = 10
+_CYCLES_MAXLEN: int = 50
+
+
+# Telemetry record types (one entry per finalized cycle / stats sample)
+
+
+class HeatingCycle(TypedDict):
+    """One finalized heating cycle (start → peak)."""
+
+    start: str | None
+    end: str | None
+    start_temperature: float | None
+    peak_temperature: float | None
+    delta_kelvin: float
+    minutes: float
+    rate_kelvin_per_min: float
+    target: float
+    outdoor: float | None
+    norm_power: float | None
+
+
+class HeatingStats(TypedDict):
+    """Compact heating-power learning sample."""
+
+    delta_kelvin: float
+    min: float
+    rate: float
+    alpha: float
+    envf: float
+    hp: float
+    norm: float | None
+
+
+class LossCycle(TypedDict):
+    """One finalized idle cooling cycle (start → minimum)."""
+
+    start: str | None
+    end: str | None
+    start_temperature: float | None
+    min_temperature: float | None
+    rate: float
+
+
+class LossStats(TypedDict):
+    """Compact heat-loss learning sample."""
+
+    delta_kelvin: float
+    min: float
+    rate: float
+    alpha: float
+    loss: float
+
+
+# Pure helpers
+
+
+def ema_smooth(old: float, new: float, alpha: float) -> float:
+    """Exponential moving average: ``old * (1 - alpha) + new * alpha``."""
+    return old * (1.0 - alpha) + new * alpha
+
+
+def clamp(value: float, lo: float, hi: float) -> float:
+    """Clamp *value* into ``[lo, hi]``.
+
+    Total over floats: NaN maps to ``lo`` so the result is always inside
+    the range — NaN comparisons are False and would otherwise leak
+    through into setpoints.
+    """
+    if math.isnan(value):
+        return lo
+    if value < lo:
+        return lo
+    if value > hi:
+        return hi
+    return value
+
+
+def compute_weight_factor(
+    heat_target_temperature: float, min_target: float, max_target: float
+) -> float:
+    """Relative-position weight within the observed target-temperature range.
+
+    Returns a factor in ``[0.5, 1.5]``.
+    """
+    range_kelvin = max(max_target - min_target, 0.1)
+    relative_pos = (heat_target_temperature - min_target) / range_kelvin
+    return clamp(0.5 + relative_pos, 0.5, 1.5)
+
+
+def compute_env_factor(
+    outdoor_temperature: float | None, heat_target_temperature: float
+) -> float:
+    """Environmental factor based on outdoor-to-setpoint gradient.
+
+    Returns a factor in ``[0.7, 1.3]``.  Without outdoor data returns 1.0.
+    """
+    if outdoor_temperature is None:
+        return 1.0
+    delta_env = max(heat_target_temperature - outdoor_temperature, 0.1)
+    return clamp(delta_env / 20.0, 0.7, 1.3)
+
+
+class Reading(NamedTuple):
+    """A room temperature and the time it was read."""
+
+    temperature: float
+    ts: datetime
+
+
+# Result dataclasses (frozen – no mutation after creation)
+
+
+@dataclass(frozen=True, slots=True)
+class CycleResult:
+    """Result of a finalized heating or cooling cycle."""
+
+    power_changed: bool = False
+    loss_changed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class HeatingPowerUpdate:
+    """Return value of :meth:`HeatingPowerTracker.update`."""
+
+    action_changed: bool = False
+    current_action: HVACAction | None = None
+    cycle_result: CycleResult | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class HeatLossUpdate:
+    """Return value of :meth:`HeatLossTracker.update`."""
+
+    cycle_result: CycleResult | None = None
+
+
+# HeatingPowerTracker
+
+
+@dataclass
+class HeatingPowerTracker:
+    """State machine that learns effective heating power (°C / min).
+
+    Call :meth:`update` on every temperature event.  The caller is responsible
+    for acting on the returned :class:`HeatingPowerUpdate`.
+    """
+
+    heating_power: float = 0.01
+    normalized_power: float | None = None
+    start: Reading | None = None
+    end: Reading | None = None  # peak temperature after heating stops
+    _prev_action: HVACAction | None = None
+    min_target: float = 18.0
+    max_target: float = 21.0
+    stats: deque[HeatingStats] = field(
+        default_factory=lambda: deque(maxlen=_STATS_MAXLEN)
+    )
+    cycles: deque[HeatingCycle] = field(
+        default_factory=lambda: deque(maxlen=_CYCLES_MAXLEN)
+    )
+
+    # Public API
+
+    def update(
+        self,
+        room_temperature: float,
+        current_action: HVACAction,
+        now: datetime,
+        *,
+        heat_target_temperature: float,
+        outdoor_temperature: float | None = None,
+        learning_paused: bool = False,
+    ) -> HeatingPowerUpdate:
+        """Process one temperature reading and return what changed.
+
+        While ``learning_paused`` is set the reading teaches nothing: a
+        cycle in progress is aborted, no new one starts and the observed
+        target range stays as it is. The action is still tracked, so a
+        cycle that started before the pause and is still heating after it
+        is never evaluated; the next one starts with the next heating start.
+        """
+        action_changed = current_action != self._prev_action
+
+        if learning_paused:
+            self.abort_cycle()
+
+        # --- Transition: heating starts ---
+        if (
+            not learning_paused
+            and current_action == HVACAction.HEATING
+            and self._prev_action != HVACAction.HEATING
+        ):
+            self.start = Reading(room_temperature, now)
+            self.end = None
+
+        # --- Transition: heating stops (candidate end) ---
+        elif (
+            current_action != HVACAction.HEATING
+            and self._prev_action == HVACAction.HEATING
+            and self.start is not None
+            and self.end is None
+        ):
+            self.end = Reading(room_temperature, now)
+
+        # --- Peak tracking: temperature still rising after heating stopped ---
+        elif (
+            current_action != HVACAction.HEATING
+            and self.start is not None
+            and self.end is not None
+            and room_temperature > self.end.temperature
+        ):
+            self.end = Reading(room_temperature, now)
+
+        # --- Finalization criteria ---
+        cycle_result = self._maybe_finalize(
+            room_temperature,
+            now,
+            heat_target_temperature=heat_target_temperature,
+            outdoor_temperature=outdoor_temperature,
+        )
+
+        # --- Dynamic target range ---
+        if not learning_paused:
+            self.min_target = min(self.min_target, heat_target_temperature)
+            self.max_target = max(self.max_target, heat_target_temperature)
+
+        self._prev_action = current_action
+
+        return HeatingPowerUpdate(
+            action_changed=action_changed,
+            current_action=current_action,
+            cycle_result=cycle_result,
+        )
+
+    def reset_power(self, value: float = 0.01) -> None:
+        """Reset heating power to the given default."""
+        self.heating_power = value
+
+    def abort_cycle(self) -> None:
+        """Give up on the running heating cycle, so that it teaches nothing.
+
+        Only the start is dropped. Without it no end is recorded and no peak
+        is tracked. An end recorded already stays and finalizes the cycle
+        once it times out, with no rise and so without learning from it.
+        """
+        self.start = None
+
+    # Internals
+
+    def _maybe_finalize(
+        self,
+        room_temperature: float,
+        now: datetime,
+        *,
+        heat_target_temperature: float,
+        outdoor_temperature: float | None,
+    ) -> CycleResult | None:
+        """Check finalization criteria and compute a new EMA value if met."""
+        finalize = False
+
+        start, end = self.start, self.end
+        if start is not None and end is not None and room_temperature < end.temperature:
+            finalize = True
+        elif end is not None and (now - end.ts) > timedelta(minutes=_TIMEOUT_MIN):
+            finalize = True
+
+        if not finalize:
+            return None
+
+        # Reset for next cycle (even if discarded)
+        self.start = None
+        self.end = None
+
+        if start is None or end is None:
+            return CycleResult()
+
+        power_changed = False
+        delta_kelvin = end.temperature - start.temperature
+        duration_minutes = (end.ts - start.ts).total_seconds() / 60.0
+
+        if duration_minutes >= _MIN_CYCLE_DURATION and delta_kelvin > 0:
+            weight_factor = compute_weight_factor(
+                heat_target_temperature, self.min_target, self.max_target
+            )
+            env_factor = compute_env_factor(
+                outdoor_temperature, heat_target_temperature
+            )
+
+            normalized_power: float | None = None
+            if outdoor_temperature is not None:
+                delta_env = max(heat_target_temperature - outdoor_temperature, 0.1)
+                normalized_power = round(
+                    (delta_kelvin / duration_minutes) / delta_env, 5
+                )
+
+            heating_rate = delta_kelvin / duration_minutes
+
+            alpha = clamp(
+                _BASE_ALPHA * weight_factor * env_factor, _ALPHA_MIN, _ALPHA_MAX
+            )
+
+            old_power = self.heating_power
+            unbounded = ema_smooth(old_power, heating_rate, alpha)
+            new_power = clamp(unbounded, MIN_HEATING_POWER, MAX_HEATING_POWER)
+
+            if new_power != unbounded:
+                bound_name = (
+                    "MIN_HEATING_POWER"
+                    if new_power <= MIN_HEATING_POWER
+                    else "MAX_HEATING_POWER"
+                )
+                _LOGGER.debug(
+                    "better_thermostat: heating_power clamped from %.4f to %.4f at %s "
+                    "(min=%.4f, max=%.4f)",
+                    unbounded,
+                    new_power,
+                    bound_name,
+                    MIN_HEATING_POWER,
+                    MAX_HEATING_POWER,
+                )
+
+            self.heating_power = new_power
+            self.normalized_power = normalized_power
+            power_changed = self.heating_power != old_power
+
+            # Short stats history
+            self.stats.append(
+                {
+                    "delta_kelvin": round(delta_kelvin, 2),
+                    "min": round(duration_minutes, 1),
+                    "rate": round(heating_rate, 4),
+                    "alpha": round(alpha, 3),
+                    "envf": round(env_factor, 3),
+                    "hp": round(self.heating_power, 4),
+                    "norm": normalized_power,
+                }
+            )
+
+            # Full cycle telemetry
+            self.cycles.append(
+                {
+                    "start": start.ts.isoformat(),
+                    "end": end.ts.isoformat(),
+                    "start_temperature": round(start.temperature, 2),
+                    "peak_temperature": round(end.temperature, 2),
+                    "delta_kelvin": round(delta_kelvin, 3),
+                    "minutes": round(duration_minutes, 2),
+                    "rate_kelvin_per_min": round(heating_rate, 4),
+                    "target": heat_target_temperature,
+                    "outdoor": outdoor_temperature,
+                    "norm_power": normalized_power,
+                }
+            )
+
+            _LOGGER.debug(
+                "better_thermostat: heating cycle evaluated: ΔT=%.3f°C, t=%.2fmin, "
+                "rate=%.4f°C/min, hp(old/new)=%.4f/%.4f, alpha=%.3f, env_factor=%.3f, norm=%s",
+                delta_kelvin,
+                duration_minutes,
+                heating_rate,
+                old_power,
+                self.heating_power,
+                alpha,
+                env_factor,
+                normalized_power,
+            )
+
+        return CycleResult(power_changed=power_changed)
+
+
+# HeatLossTracker
+
+
+@dataclass
+class HeatLossTracker:
+    """State machine that learns heat-loss rate (°C / min) during idle periods.
+
+    Call :meth:`update` on every temperature event.  The caller is responsible
+    for acting on the returned :class:`HeatLossUpdate`.
+    """
+
+    heat_loss_rate: float = 0.01
+    start: Reading | None = None
+    end: Reading | None = None  # lowest observed temperature
+    _prev_action: HVACAction | None = None
+    _settle_until: datetime | None = None
+    stats: deque[LossStats] = field(default_factory=lambda: deque(maxlen=_STATS_MAXLEN))
+    cycles: deque[LossCycle] = field(
+        default_factory=lambda: deque(maxlen=_CYCLES_MAXLEN)
+    )
+
+    # Public API
+
+    def update(
+        self,
+        room_temperature: float,
+        current_action: HVACAction,
+        now: datetime,
+        *,
+        window_open: bool = False,
+        learning_paused: bool = False,
+    ) -> HeatLossUpdate:
+        """Process one temperature reading and return what changed.
+
+        While ``learning_paused`` is set the idle stretch in progress is
+        dropped as it is for an open window, so a stretch that straddles
+        the pause is never evaluated.
+        """
+        # The first reading without cooling is the cycle that switches the
+        # cooler off, so the settle window starts there.
+        if (
+            self._prev_action == HVACAction.COOLING
+            and current_action != HVACAction.COOLING
+        ):
+            self._settle_until = now + timedelta(minutes=_COOLER_SETTLE_MIN)
+
+        # An open window or a running cooler drives the drop, so the stretch
+        # it covers says nothing about passive heat loss: reset tracking.
+        if window_open or learning_paused or current_action == HVACAction.COOLING:
+            self.start = None
+            self.end = None
+            self._prev_action = current_action
+            return HeatLossUpdate()
+
+        if self._settle_until is not None and now < self._settle_until:
+            self._prev_action = current_action
+            return HeatLossUpdate()
+        self._settle_until = None
+
+        # Track idle cooling
+        if current_action != HVACAction.HEATING:
+            if self.start is None:
+                self.start = Reading(room_temperature, now)
+                self.end = self.start
+            elif self.end is None or room_temperature < self.end.temperature:
+                self.end = Reading(room_temperature, now)
+
+        # Finalize when heating restarts
+        cycle_result: CycleResult | None = None
+        if current_action == HVACAction.HEATING and self.start is not None:
+            cycle_result = self._finalize()
+
+        self._prev_action = current_action
+        return HeatLossUpdate(cycle_result=cycle_result)
+
+    def abort_cycle(self) -> None:
+        """Give up on the idle stretch being followed, so that it teaches nothing.
+
+        The next stretch starts with the next reading that is not heating.
+        """
+        self.start = None
+        self.end = None
+
+    # Internals
+
+    def _finalize(self) -> CycleResult:
+        """Evaluate the completed idle-cooling cycle."""
+        start, end = self.start, self.end
+        # Reset after finalize
+        self.start = None
+        self.end = None
+
+        if start is None or end is None:
+            return CycleResult()
+
+        loss_changed = False
+        drop_kelvin = start.temperature - end.temperature
+        duration_minutes = (end.ts - start.ts).total_seconds() / 60.0
+
+        if duration_minutes >= _MIN_CYCLE_DURATION and drop_kelvin > 0:
+            loss_rate = drop_kelvin / duration_minutes
+
+            # Adaptive smoothing (alpha is always base for heat loss)
+            alpha = clamp(_BASE_ALPHA, _ALPHA_MIN, _ALPHA_MAX)
+            old_loss = self.heat_loss_rate
+            unbounded = ema_smooth(old_loss, loss_rate, alpha)
+            new_loss = clamp(unbounded, MIN_HEAT_LOSS, MAX_HEAT_LOSS)
+
+            if new_loss != unbounded:
+                bound_name = (
+                    "MIN_HEAT_LOSS" if new_loss <= MIN_HEAT_LOSS else "MAX_HEAT_LOSS"
+                )
+                _LOGGER.debug(
+                    "better_thermostat: heat_loss clamped from %.4f to %.4f at %s "
+                    "(min=%.4f, max=%.4f)",
+                    unbounded,
+                    new_loss,
+                    bound_name,
+                    MIN_HEAT_LOSS,
+                    MAX_HEAT_LOSS,
+                )
+
+            self.heat_loss_rate = new_loss
+            loss_changed = self.heat_loss_rate != old_loss
+
+            self.stats.append(
+                {
+                    "delta_kelvin": round(drop_kelvin, 2),
+                    "min": round(duration_minutes, 1),
+                    "rate": round(loss_rate, 5),
+                    "alpha": round(alpha, 3),
+                    "loss": round(self.heat_loss_rate, 5),
+                }
+            )
+
+            self.cycles.append(
+                {
+                    "start": start.ts.isoformat(),
+                    "end": end.ts.isoformat(),
+                    "start_temperature": round(start.temperature, 2),
+                    "min_temperature": round(end.temperature, 2),
+                    "rate": round(loss_rate, 5),
+                }
+            )
+
+        return CycleResult(loss_changed=loss_changed)

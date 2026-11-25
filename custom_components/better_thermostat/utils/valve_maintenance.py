@@ -1,0 +1,745 @@
+"""Pure-logic helpers for periodic TRV valve maintenance.
+
+All functions are side-effect-free (aside from the async callbacks they
+receive) and can be tested without Home Assistant.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+import logging
+from random import randint
+
+from homeassistant.components.climate.const import HVACMode
+from homeassistant.core import State
+from homeassistant.util import dt as dt_util
+
+from ..model_fixes.types import (
+    DEFAULT_VALVE_MAINTENANCE_INTERVAL_HOURS,
+    MaintenanceIntervalQuirk,
+)
+from ..trv import Trv
+from .advanced_flags import advanced_flag
+from .const import CONF_VALVE_MAINTENANCE, CalibrationOutput
+from .helpers import configured_calibration_output, device_offers_mode, state_is_live
+
+_LOGGER = logging.getLogger(__name__)
+
+# Type alias for the per-entity Trv registry (``real_trvs``).
+TrvMap = dict[str, Trv]
+
+# Data types
+
+
+@dataclass(frozen=True)
+class MaintenanceTrvInfo:
+    """Snapshot of a single TRV needed during valve maintenance."""
+
+    entity_id: str
+    cur_mode: str
+    setpoint: float | None
+    use_direct_valve: bool
+    max_temp: float
+    min_temp: float
+    wake_mode: HVACMode | None = None
+    """Device-native mode to switch into for the exercise, or ``None``.
+
+    Only set for a TRV that is ``off`` and driven through temperature
+    extremes: such a device ignores setpoint writes, so the cycle would
+    move nothing. Valve-driven TRVs are written through a number entity
+    that works while the device is off, so they are never woken.
+    """
+
+
+# Modes a TRV can be woken into for the exercise, most preferred first.
+_WAKE_MODE_PREFERENCE: tuple[HVACMode, ...] = (
+    HVACMode.HEAT,
+    HVACMode.AUTO,
+    HVACMode.HEAT_COOL,
+)
+
+
+# Pure helpers
+
+
+def pick_wake_mode(
+    cur_mode: str, use_direct_valve: bool, hvac_modes: object
+) -> HVACMode | None:
+    """Return the mode to exercise an ``off`` TRV in, or ``None``.
+
+    Parameters
+    ----------
+    cur_mode : str
+        The TRV's current device-native HVAC mode.
+    use_direct_valve : bool
+        Whether the TRV is driven by writing a valve percentage.
+    hvac_modes : object
+        The modes the TRV reports, as read from its state attributes.
+        Any spelling: ``HVACMode`` members, plain strings or
+        ``"HVACMode.HEAT"``.
+
+    Returns
+    -------
+    HVACMode | None
+        The first supported mode from ``_WAKE_MODE_PREFERENCE``, or
+        ``None`` when the TRV needs no wake or offers no usable mode.
+    """
+    if use_direct_valve or cur_mode != HVACMode.OFF:
+        return None
+    if not isinstance(hvac_modes, (list, tuple, set)):
+        return None
+    for candidate in _WAKE_MODE_PREFERENCE:
+        if device_offers_mode(hvac_modes, candidate):
+            return candidate
+    return None
+
+
+def mode_needs_restoring(
+    info: MaintenanceTrvInfo, get_state: Callable[[str], State | None], *, woken: bool
+) -> bool:
+    """Whether the TRV's HVAC mode has to be written back after the run.
+
+    Parameters
+    ----------
+    info : MaintenanceTrvInfo
+        The snapshot the run started from, carrying the mode to restore.
+    get_state : Callable[[str], State | None]
+        ``hass.states.get``. A TRV that reports no state is taken to need
+        the restore: nothing then says the mode is where it belongs.
+    woken : bool
+        Whether the wake write for this TRV went out without raising. A
+        wake that was selected but failed left the mode where it was, so
+        only a wake that landed decides on its own.
+
+    Returns
+    -------
+    bool
+        True when the run woke the TRV, or when the mode it reports is no
+        longer the one the snapshot was taken in.
+    """
+    if woken:
+        return True
+    state = get_state(info.entity_id)
+    if state is None:
+        return True
+    return state.state != info.cur_mode
+
+
+def collect_maintenance_trvs(real_trvs: TrvMap) -> list[str]:
+    """Return entity-ids of TRVs that have valve maintenance enabled."""
+    result: list[str] = []
+    for entity_id, info in real_trvs.items():
+        adv = info.advanced
+        if advanced_flag(adv, CONF_VALVE_MAINTENANCE):
+            result.append(entity_id)
+    return result
+
+
+def _interval_hours(real_trvs: TrvMap, entity_id: str) -> int:
+    """Return one TRV's maintenance interval, in hours.
+
+    A TRV whose quirks set no interval, and an id with no TRV record,
+    count with the default interval, which also bounds the result.
+    """
+    trv = real_trvs.get(entity_id)
+    quirks: object = trv.model_quirks if trv is not None else None
+    if isinstance(quirks, MaintenanceIntervalQuirk):
+        return min(
+            DEFAULT_VALVE_MAINTENANCE_INTERVAL_HOURS,
+            quirks.VALVE_MAINTENANCE_INTERVAL_HOURS,
+        )
+    return DEFAULT_VALVE_MAINTENANCE_INTERVAL_HOURS
+
+
+def _shortest_interval_hours(real_trvs: TrvMap, trv_ids: list[str]) -> int:
+    """Return the shortest maintenance interval among the TRVs, in hours."""
+    return min(
+        (_interval_hours(real_trvs, entity_id) for entity_id in trv_ids),
+        default=DEFAULT_VALVE_MAINTENANCE_INTERVAL_HOURS,
+    )
+
+
+def _longest_interval_hours(real_trvs: TrvMap, trv_ids: list[str]) -> int:
+    """Return the longest maintenance interval among the TRVs, in hours."""
+    return max(
+        (_interval_hours(real_trvs, entity_id) for entity_id in trv_ids),
+        default=DEFAULT_VALVE_MAINTENANCE_INTERVAL_HOURS,
+    )
+
+
+def compute_next_maintenance(
+    real_trvs: TrvMap, trv_ids: list[str], *, now: datetime | None = None
+) -> datetime:
+    """Compute the next maintenance datetime based on TRV quirks.
+
+    Uses the *minimum* interval across all enabled TRVs and adds ~7 %
+    random jitter.
+    """
+    if now is None:
+        now = dt_util.now()
+
+    min_interval_hours = _shortest_interval_hours(real_trvs, trv_ids)
+    return now + timedelta(
+        hours=min_interval_hours + randint(0, _jitter_hours(min_interval_hours))
+    )
+
+
+def _jitter_hours(interval_hours: int) -> int:
+    """Return the most a run's schedule is pushed past its interval, in hours."""
+    return max(1, int(interval_hours * 0.07))
+
+
+def compute_initial_maintenance(
+    real_trvs: TrvMap, trv_ids: list[str], *, now: datetime
+) -> datetime:
+    """Compute the *first* maintenance datetime after startup.
+
+    Randomises within ``[1 h, min(5 d, interval)]`` so that multiple
+    BT instances don't all fire at once.
+    """
+    min_interval_hours = _shortest_interval_hours(real_trvs, trv_ids)
+
+    max_delay_hours = min(24 * 5, min_interval_hours)
+    delay_hours = randint(1, max(2, max_delay_hours))
+    return now + timedelta(hours=delay_hours)
+
+
+def restored_maintenance_due(raw: object) -> datetime | None:
+    """Read the schedule a restored thermostat state publishes.
+
+    The state carries it as the ISO 8601 string the attribute is written
+    as; a restored state hands it back unchanged.
+
+    Parameters
+    ----------
+    raw : object
+        The value of the ``next_valve_maintenance`` attribute, or ``None``
+        when the state carries none.
+
+    Returns
+    -------
+    datetime | None
+        The schedule, or ``None`` when ``raw`` is no valid time with a time
+        zone.
+    """
+    if not isinstance(raw, str):
+        return None
+    try:
+        due = dt_util.parse_datetime(raw)
+    except ValueError:
+        return None
+    if due is None or due.tzinfo is None:
+        return None
+    return due
+
+
+def first_maintenance_due(
+    real_trvs: TrvMap, trv_ids: list[str], restored: datetime | None, *, now: datetime
+) -> datetime:
+    """Return the schedule a startup takes up.
+
+    The schedule restored from before the restart is kept, so a restart
+    does not move it. One that has passed in the meantime stays overdue,
+    and the first maintenance tick runs it as it runs any overdue
+    maintenance; restarting more often than the delay rolled below
+    therefore never keeps a run from happening. Only a startup without a
+    schedule, or with one further out than a run ever schedules the next,
+    rolls the delay of ``compute_initial_maintenance``. A run schedules
+    over the shortest interval of the TRVs it exercised, which leaves out
+    released ones; whichever of them it exercised, that interval is never
+    longer than the longest interval among ``trv_ids``, and that interval
+    plus its jitter bounds every schedule a run writes.
+
+    Parameters
+    ----------
+    real_trvs : TrvMap
+        The cached TRV records, keyed by entity id.
+    trv_ids : list[str]
+        The TRVs with valve maintenance enabled.
+    restored : datetime | None
+        The schedule the restored state publishes, if any.
+    now : datetime
+        The current time.
+
+    Returns
+    -------
+    datetime
+        When the next maintenance run is due.
+    """
+    interval_hours = _longest_interval_hours(real_trvs, trv_ids)
+    horizon = timedelta(hours=interval_hours + _jitter_hours(interval_hours))
+    if restored is not None and restored <= now + horizon:
+        return restored
+    return compute_initial_maintenance(real_trvs, trv_ids, now=now)
+
+
+# Snapshot builder
+
+
+def build_trv_snapshots(
+    real_trvs: TrvMap,
+    trv_ids: list[str],
+    get_state: Callable[[str], State | None],
+    device_name: str,
+    *,
+    read_setpoint: Callable[[State], float | None],
+) -> list[MaintenanceTrvInfo]:
+    """Build per-TRV snapshots needed for the maintenance cycle.
+
+    A TRV without a readable state is left out of the run entirely: it
+    publishes no state at all, or the one it publishes is ``unavailable``
+    or ``unknown`` and therefore names no mode and no setpoint to put back
+    afterwards. Only a TRV with a snapshot is driven, so the one skipped
+    here is never left standing in one of the cycle's temperature
+    extremes. A TRV still awaiting its setup is left out as well: its
+    range, calibration and valve channel are what the setup reads, and the
+    first run after it is exercises it. Every skip is logged at debug level.
+
+    Parameters
+    ----------
+    real_trvs : TrvMap
+            the cached TRV records, keyed by entity id
+    trv_ids : list[str]
+            entity ids to consider for this run
+    get_state : Callable[[str], State | None]
+            reads a TRV's reported state; ``hass.states.get``
+    device_name : str
+            thermostat instance name, for logging
+    read_setpoint : Callable[[State], float | None]
+            reads the setpoint a TRV's state publishes, in Celsius; the
+            state carries it in the system unit, and the restore writes the
+            snapshot back as Celsius
+
+    Returns
+    -------
+    list[MaintenanceTrvInfo]
+            one snapshot per TRV the cycle may drive, in the order given
+    """
+    infos: list[MaintenanceTrvInfo] = []
+    for entity_id in trv_ids:
+        trv_state = get_state(entity_id)
+        if not state_is_live(trv_state):
+            _LOGGER.debug(
+                "better_thermostat %s: maintenance skip %s (reports %s, so it names "
+                "no state to restore afterwards)",
+                device_name,
+                entity_id,
+                trv_state.state if trv_state is not None else None,
+            )
+            continue
+
+        trv = real_trvs.get(entity_id)
+        if trv is None:
+            _LOGGER.debug(
+                "better_thermostat %s: maintenance skip %s (not in real_trvs)",
+                device_name,
+                entity_id,
+            )
+            continue
+        if trv.awaiting_initialization:
+            _LOGGER.debug(
+                "better_thermostat %s: maintenance skip %s (not set up yet; its "
+                "setup brings it in, and the next run exercises it)",
+                device_name,
+                entity_id,
+            )
+            continue
+        support_valve = trv.capabilities().supports_valve_write
+        adv = trv.advanced
+        use_direct = (
+            support_valve
+            and configured_calibration_output(adv)
+            == CalibrationOutput.DIRECT_VALVE_BASED
+        )
+
+        raw_min_temperature = trv.min_temp
+        infos.append(
+            MaintenanceTrvInfo(
+                entity_id=entity_id,
+                cur_mode=trv_state.state,
+                setpoint=read_setpoint(trv_state),
+                use_direct_valve=use_direct,
+                max_temp=trv.max_temp,
+                min_temp=float(raw_min_temperature)
+                if isinstance(raw_min_temperature, (int, float))
+                else 5.0,
+                wake_mode=pick_wake_mode(
+                    trv_state.state, use_direct, trv_state.attributes.get("hvac_modes")
+                ),
+            )
+        )
+    return infos
+
+
+# Async step helpers
+
+SetValveFn = Callable[[str, int], Awaitable[bool]]
+SetTemperatureFn = Callable[[str, float], Awaitable[None]]
+SetHvacModeFn = Callable[[str, str], Awaitable[None]]
+
+
+async def _set_valve_percent(
+    entity_id: str, percent: int, set_valve_fn: SetValveFn
+) -> bool:
+    """Set valve percentage via callback."""
+    try:
+        return await set_valve_fn(entity_id, percent)
+    except Exception:
+        _LOGGER.debug(
+            "better_thermostat: setting the valve of %s to %d%% failed",
+            entity_id,
+            percent,
+            exc_info=True,
+        )
+        return False
+
+
+def _temperature_cycle_reaches_valve(info: MaintenanceTrvInfo) -> bool:
+    """Whether writing a setpoint moves this TRV's valve.
+
+    An ``off`` TRV ignores setpoint writes, so the cycle only reaches it
+    once ``wake_step`` has switched it into ``wake_mode``.
+    """
+    return info.cur_mode != HVACMode.OFF or info.wake_mode is not None
+
+
+async def wake_step(
+    info: MaintenanceTrvInfo, *, set_hvac_mode_fn: SetHvacModeFn
+) -> None:
+    """Switch an ``off`` TRV into its exercise mode.
+
+    ``restore_one`` puts ``cur_mode`` back at the end of the run, so the
+    TRV returns to ``off`` afterwards.
+    """
+    if info.wake_mode is None:
+        return
+    await set_hvac_mode_fn(info.entity_id, info.wake_mode)
+
+
+async def open_step(
+    info: MaintenanceTrvInfo,
+    *,
+    set_valve_fn: SetValveFn,
+    set_temperature_fn: SetTemperatureFn,
+) -> None:
+    """Open a TRV valve fully."""
+    if info.use_direct_valve:
+        await _set_valve_percent(info.entity_id, 100, set_valve_fn)
+        return
+    if _temperature_cycle_reaches_valve(info):
+        await set_temperature_fn(info.entity_id, info.max_temp)
+
+
+async def close_step(
+    info: MaintenanceTrvInfo,
+    *,
+    set_valve_fn: SetValveFn,
+    set_temperature_fn: SetTemperatureFn,
+) -> None:
+    """Close a TRV valve fully."""
+    if info.use_direct_valve:
+        await _set_valve_percent(info.entity_id, 0, set_valve_fn)
+        return
+    if _temperature_cycle_reaches_valve(info):
+        await set_temperature_fn(info.entity_id, info.min_temp)
+
+
+async def restore_one(
+    info: MaintenanceTrvInfo,
+    *,
+    set_temperature_fn: SetTemperatureFn,
+    set_hvac_mode_fn: SetHvacModeFn,
+    get_state: Callable[[str], State | None],
+    woken: bool = False,
+) -> None:
+    """Restore a TRV to its pre-maintenance state.
+
+    The setpoint is always written back; the mode only when it moved.
+    A device that reports a single mode implements no setter for it, so
+    writing the mode it is already in raises ``NotImplementedError`` inside
+    Home Assistant's climate component and buys nothing in exchange.
+
+    Two things move a mode here, and the guard answers to both. The run
+    itself moves one only through ``wake_step``, so a wake that went out
+    says a mode was written and has to go back regardless of what the
+    device has published since. Anything else that moved it, a valve write
+    a device answers by switching itself on among them, shows up as a
+    reported mode that is no longer the one the snapshot was taken in.
+
+    Parameters
+    ----------
+    info : MaintenanceTrvInfo
+        The snapshot the run started from, carrying the setpoint and mode
+        to restore.
+    set_temperature_fn : SetTemperatureFn
+        Writes the setpoint back.
+    set_hvac_mode_fn : SetHvacModeFn
+        Writes the mode back, when it moved.
+    get_state : Callable[[str], State | None]
+        ``hass.states.get``, supplying the mode the TRV reports now.
+    woken : bool
+        Whether this TRV's wake write went out without raising.
+    """
+    if info.setpoint is not None:
+        try:
+            await set_temperature_fn(info.entity_id, info.setpoint)
+        except Exception:
+            _LOGGER.debug(
+                "better_thermostat: restoring the setpoint of %s failed",
+                info.entity_id,
+                exc_info=True,
+            )
+    if not mode_needs_restoring(info, get_state, woken=woken):
+        _LOGGER.debug(
+            "better_thermostat: %s is still in mode %s, leaving it alone",
+            info.entity_id,
+            info.cur_mode,
+        )
+        return
+    try:
+        await set_hvac_mode_fn(info.entity_id, info.cur_mode)
+    except Exception:
+        _LOGGER.debug(
+            "better_thermostat: restoring the HVAC mode of %s failed",
+            info.entity_id,
+            exc_info=True,
+        )
+
+
+# Main orchestrator
+
+# Longest a run stopped part-way spends putting its TRVs back. What stops a run
+# is mostly the thermostat being unloaded or removed, and the removal waits for
+# the restore, so it is bounded; a TRV that does not answer in that time keeps
+# the position the run left it in.
+RESTORE_AFTER_STOP_TIMEOUT_S = 10.0
+
+
+async def _restore_all(
+    infos: list[MaintenanceTrvInfo],
+    woken: set[str],
+    *,
+    set_temperature_fn: SetTemperatureFn,
+    set_hvac_mode_fn: SetHvacModeFn,
+    get_state: Callable[[str], State | None],
+) -> None:
+    """Put every TRV of a run back into its pre-maintenance state."""
+    await asyncio.gather(
+        *(
+            restore_one(
+                info,
+                set_temperature_fn=set_temperature_fn,
+                set_hvac_mode_fn=set_hvac_mode_fn,
+                get_state=get_state,
+                woken=info.entity_id in woken,
+            )
+            for info in infos
+        ),
+        return_exceptions=True,
+    )
+
+
+async def _restore_after_stop(
+    infos: list[MaintenanceTrvInfo],
+    woken: set[str],
+    open_valves: list[MaintenanceTrvInfo],
+    *,
+    set_valve_fn: SetValveFn,
+    set_temperature_fn: SetTemperatureFn,
+    set_hvac_mode_fn: SetHvacModeFn,
+    get_state: Callable[[str], State | None],
+    device_name: str,
+) -> None:
+    """Restore the TRVs of a run that was cancelled part-way.
+
+    A cancelled run leaves its TRVs wherever the cycle had them: on their
+    maximum setpoint, woken out of ``off``, or with the valve fully open.
+    Nothing else puts them back once the thermostat is gone. The valves the
+    cycle may have left open are closed, as the last step of a full run
+    does, and every TRV gets its setpoint and mode back. The whole of it is
+    bounded by ``RESTORE_AFTER_STOP_TIMEOUT_S``.
+    """
+    _LOGGER.info(
+        "better_thermostat %s: valve maintenance stopped, restoring the TRVs",
+        device_name,
+    )
+    try:
+        async with asyncio.timeout(RESTORE_AFTER_STOP_TIMEOUT_S):
+            await asyncio.gather(
+                *(
+                    close_step(
+                        info,
+                        set_valve_fn=set_valve_fn,
+                        set_temperature_fn=set_temperature_fn,
+                    )
+                    for info in open_valves
+                ),
+                return_exceptions=True,
+            )
+            await _restore_all(
+                infos,
+                woken,
+                set_temperature_fn=set_temperature_fn,
+                set_hvac_mode_fn=set_hvac_mode_fn,
+                get_state=get_state,
+            )
+    except TimeoutError:
+        _LOGGER.warning(
+            "better_thermostat %s: restoring the TRVs after a stopped valve "
+            "maintenance did not finish within %.0f s",
+            device_name,
+            RESTORE_AFTER_STOP_TIMEOUT_S,
+        )
+
+
+async def run_valve_maintenance(
+    infos: list[MaintenanceTrvInfo],
+    *,
+    set_valve_fn: SetValveFn,
+    set_temperature_fn: SetTemperatureFn,
+    set_hvac_mode_fn: SetHvacModeFn,
+    get_state: Callable[[str], State | None],
+    device_name: str,
+    cycle_sleep: float = 30,
+) -> None:
+    """Execute 2 x open/close cycles on all TRVs, then restore state.
+
+    This is the pure async orchestrator.  State mutations on
+    ``self`` (ignore_states, in_maintenance, control_queue) stay in
+    ``climate.py``'s wrapper.
+
+    A run cancelled part-way, its own restore included, still restores its
+    TRVs, within ``RESTORE_AFTER_STOP_TIMEOUT_S``, before the cancellation
+    propagates.
+
+    Parameters
+    ----------
+    infos : list[MaintenanceTrvInfo]
+        The snapshot of each TRV the run drives, taken before it starts.
+    set_valve_fn : SetValveFn
+        Writes a valve percentage; used for the valve-driven TRVs.
+    set_temperature_fn : SetTemperatureFn
+        Writes a setpoint; drives the cycle on the other TRVs and restores
+        the setpoint on all of them.
+    set_hvac_mode_fn : SetHvacModeFn
+        Writes an HVAC mode; wakes a TRV that is off and puts a moved mode
+        back.
+    get_state : Callable[[str], State | None]
+        ``hass.states.get``, read at the restore to tell a mode that moved
+        from one that never did.
+    device_name : str
+        The Better Thermostat instance name, for logging context.
+    cycle_sleep : float
+        Seconds to hold each valve position, so the motor reaches it.
+    """
+    _LOGGER.info(
+        "better_thermostat %s: starting valve maintenance for %d TRV(s)",
+        device_name,
+        len(infos),
+    )
+
+    # Every wake counts as sent until it is known to have failed, so a run
+    # cancelled while the wakes are in flight still puts those modes back.
+    woken = {info.entity_id for info in infos if info.wake_mode is not None}
+    cycled: list[MaintenanceTrvInfo] = []
+    # The valve-driven TRVs the cycle may have left open. Between an open
+    # step and the close step after it, that is every one of them.
+    open_valves: list[MaintenanceTrvInfo] = []
+    try:
+        # Wake TRVs that are off, otherwise the temperature cycle below moves
+        # nothing on them. restore_one puts them back to off at the end.
+        wake_results = await asyncio.gather(
+            *(wake_step(info, set_hvac_mode_fn=set_hvac_mode_fn) for info in infos),
+            return_exceptions=True,
+        )
+
+        # Which TRVs the cycle below actually moves. A failed wake leaves a
+        # TRV off, so a setpoint write would either move nothing or, on a
+        # device that reads a setpoint as "turn on", heat it without the cycle
+        # asking for it. A TRV that offered no wake mode at all is unreachable
+        # for the same reason. Both are still restored below.
+        for info, result in zip(infos, wake_results):
+            if isinstance(result, BaseException):
+                _LOGGER.warning(
+                    "better_thermostat %s: could not wake %s for maintenance "
+                    "(%s), skipping its temperature cycle",
+                    device_name,
+                    info.entity_id,
+                    result,
+                )
+                woken.discard(info.entity_id)
+                continue
+            if info.use_direct_valve or _temperature_cycle_reaches_valve(info):
+                cycled.append(info)
+
+        if not cycled:
+            # Nothing to open or close, so the four cycle sleeps would be
+            # waits around no work at all. Drop straight through to the
+            # restore.
+            _LOGGER.info(
+                "better_thermostat %s: no TRV reachable for the cycle, "
+                "restoring directly",
+                device_name,
+            )
+        else:
+            # Execute in synchronized steps across all TRVs (much faster than
+            # sequential). Open all → wait → close all → wait (repeat twice).
+            for i in range(2):
+                _LOGGER.debug(
+                    "better_thermostat %s: valve maintenance cycle %d/2 "
+                    "starting for %d TRV(s)",
+                    device_name,
+                    i + 1,
+                    len(cycled),
+                )
+                open_valves = [info for info in cycled if info.use_direct_valve]
+                await asyncio.gather(
+                    *(
+                        open_step(
+                            info,
+                            set_valve_fn=set_valve_fn,
+                            set_temperature_fn=set_temperature_fn,
+                        )
+                        for info in cycled
+                    ),
+                    return_exceptions=True,
+                )
+                await asyncio.sleep(cycle_sleep)
+                await asyncio.gather(
+                    *(
+                        close_step(
+                            info,
+                            set_valve_fn=set_valve_fn,
+                            set_temperature_fn=set_temperature_fn,
+                        )
+                        for info in cycled
+                    ),
+                    return_exceptions=True,
+                )
+                open_valves = []
+                await asyncio.sleep(cycle_sleep)
+
+        await _restore_all(
+            infos,
+            woken,
+            set_temperature_fn=set_temperature_fn,
+            set_hvac_mode_fn=set_hvac_mode_fn,
+            get_state=get_state,
+        )
+    except asyncio.CancelledError:
+        await _restore_after_stop(
+            infos,
+            woken,
+            open_valves,
+            set_valve_fn=set_valve_fn,
+            set_temperature_fn=set_temperature_fn,
+            set_hvac_mode_fn=set_hvac_mode_fn,
+            get_state=get_state,
+            device_name=device_name,
+        )
+        raise
+
+    _LOGGER.info("better_thermostat %s: valve maintenance finished", device_name)

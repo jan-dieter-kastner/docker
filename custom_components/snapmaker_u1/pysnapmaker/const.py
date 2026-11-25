@@ -1,0 +1,112 @@
+"""Constants for the pysnapmaker Moonraker API client."""
+
+# Moonraker HTTP endpoints
+ENDPOINT_PRINTER_INFO = "/printer/info"
+ENDPOINT_SERVER_INFO = "/server/info"
+ENDPOINT_PRINTER_OBJECTS_QUERY = "/printer/objects/query"
+ENDPOINT_PRINTER_OBJECTS_LIST = "/printer/objects/list"
+ENDPOINT_PRINT_PAUSE = "/printer/print/pause"
+ENDPOINT_PRINT_RESUME = "/printer/print/resume"
+ENDPOINT_PRINT_CANCEL = "/printer/print/cancel"
+ENDPOINT_EMERGENCY_STOP = "/printer/emergency_stop"
+ENDPOINT_PRINTER_RESTART = "/printer/restart"
+ENDPOINT_GCODE_SCRIPT = "/printer/gcode/script"
+ENDPOINT_SERVER_TEMPERATURE_STORE = "/server/temperature_store"
+ENDPOINT_FILES_LIST = "/server/files/list"
+ENDPOINT_FILES_METADATA = "/server/files/metadata"
+ENDPOINT_FILES_GCODES = "/server/files/gcodes/"
+ENDPOINT_PRINT_START = "/printer/print/start"
+ENDPOINT_WEBCAMS_LIST = "/server/webcams/list"
+# Optional Moonraker components (Extended Firmware)
+ENDPOINT_SPOOLMAN_SPOOL_ID = "/server/spoolman/spool_id"
+ENDPOINT_SPOOLMAN_STATUS = "/server/spoolman/status"
+ENDPOINT_TIMELAPSE_SETTINGS = "/machine/timelapse/settings"
+
+# HA event names fired on print-state transitions
+EVENT_PRINT_STARTED = "snapmaker_u1_print_started"
+EVENT_PRINT_COMPLETE = "snapmaker_u1_print_complete"
+EVENT_PRINT_FAILED = "snapmaker_u1_print_failed"
+EVENT_PRINT_PAUSED = "snapmaker_u1_print_paused"
+EVENT_PRINT_CANCELLED = "snapmaker_u1_print_cancelled"
+
+# Map Moonraker print state → HA event suffix (only states that trigger events)
+PRINT_STATE_EVENTS: dict[str, str] = {
+    "printing": EVENT_PRINT_STARTED,
+    "complete": EVENT_PRINT_COMPLETE,
+    "error": EVENT_PRINT_FAILED,
+    "paused": EVENT_PRINT_PAUSED,
+    "cancelled": EVENT_PRINT_CANCELLED,
+}
+
+# WebSocket
+WS_ENDPOINT = "/websocket"
+WS_METHOD_SUBSCRIBE = "printer.objects.subscribe"
+WS_NOTIFY_STATUS_UPDATE = "notify_status_update"
+WS_NOTIFY_KLIPPY_READY = "notify_klippy_ready"
+WS_NOTIFY_KLIPPY_SHUTDOWN = "notify_klippy_shutdown"
+WS_NOTIFY_KLIPPY_DISCONNECTED = "notify_klippy_disconnected"
+WS_NOTIFY_HISTORY_CHANGED = "notify_history_changed"
+WS_NOTIFY_FILELIST_CHANGED = "notify_filelist_changed"
+WS_NOTIFY_ACTIVE_SPOOL_SET = "notify_active_spool_set"
+WS_NOTIFY_SPOOLMAN_STATUS = "notify_spoolman_status_changed"
+WS_NOTIFY_TIMELAPSE_EVENT = "notify_timelapse_event"
+
+# Klipper object for skipping labelled objects mid-print
+EXCLUDE_OBJECT = "exclude_object"
+# Extended Firmware camera service RTSP ports (internal, USB camera)
+RTSP_PORT_INTERNAL = 8554
+RTSP_PORT_USB = 8555
+
+# Camera
+CAMERA_STREAM_PATH = "/webcam/stream.mjpg"
+CAMERA_SNAPSHOT_PATH = "/webcam/snapshot.jpg"
+
+# Printer objects to subscribe/query
+# None value means subscribe to all fields for that object
+PRINTER_OBJECTS = [
+    "print_stats",
+    "virtual_sdcard",
+    "extruder",
+    "extruder1",
+    "extruder2",
+    "extruder3",
+    "heater_bed",
+    "toolhead",
+    "display_status",
+    "webhooks",
+    "fan",
+    "idle_timeout",
+    "gcode_move",
+    # Cavity/work light RGBW LED, so the switch can report the real lamp
+    # state instead of only what Home Assistant last commanded.
+    "led cavity_led",
+]
+
+# Official Top Cover air purifier (stock firmware 1.3.0+)
+PURIFIER_OBJECT = "purifier"
+
+# Klipper modules of the Extended Firmware's chamber heaters. Besides their
+# heater_generic they publish the device's own state (link, faults, drying).
+PANDA_BREATH_OBJECT = "panda_breath"
+DRAGONBREATH_OBJECT = "dragonbreath"
+CHAMBER_DEVICE_OBJECTS = (PANDA_BREATH_OBJECT, DRAGONBREATH_OBJECT)
+# Panda Breath filament drying limits (PANDA_BREATH_DRY_START TEMP= HOURS=)
+PANDA_BREATH_DRY_TEMP_MAX = 80
+PANDA_BREATH_DRY_HOURS_MIN = 1
+PANDA_BREATH_DRY_HOURS_MAX = 12
+# Snapmaker recommends a new filter every 720 hours of circulation.
+TOP_COVER_FILTER_LIFE_HOURS = 720
+
+# Print states (Moonraker/Klipper)
+STATE_STANDBY = "standby"
+STATE_PRINTING = "printing"
+STATE_PAUSED = "paused"
+STATE_COMPLETE = "complete"
+STATE_ERROR = "error"
+STATE_CANCELLED = "cancelled"
+
+# Klipper states
+KLIPPER_READY = "ready"
+KLIPPER_STARTUP = "startup"
+KLIPPER_SHUTDOWN = "shutdown"
+KLIPPER_ERROR = "error"

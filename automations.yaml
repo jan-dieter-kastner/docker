@@ -1,0 +1,325 @@
+- id: '1718632821688'
+  alias: awtrixx_dnd_button
+  description: ''
+  trigger:
+  - platform: state
+    entity_id:
+    - input_button.awtrixx_dnd
+  condition: []
+  action:
+  - service: script.awtrix_set_to_dnd
+    metadata: {}
+    data: {}
+  mode: single
+- id: '1718632884473'
+  alias: awtrixx_welcome_button
+  description: ''
+  trigger:
+  - platform: state
+    entity_id:
+    - input_button.awtrixx_welcome
+  condition: []
+  action:
+  - service: script.awtrix_set_to_welcome
+    metadata: {}
+    data: {}
+  mode: single
+- id: '1718702805965'
+  alias: awtrixx_clear_button
+  description: ''
+  trigger:
+  - platform: state
+    entity_id:
+    - input_button.awtrixx_clear
+  condition: []
+  action:
+  - device_id: f03f08f2c21c84c4c13beec2b790406a
+    domain: button
+    entity_id: 88964ad6ea86e296e0715cad577105e3
+    type: press
+  mode: single
+- id: '1719141497062'
+  alias: AWTRIXX Beer
+  description: ''
+  trigger:
+  - platform: state
+    entity_id:
+    - input_button.awtrixx_beer
+  condition: []
+  action:
+  - service: script.awtrix_set_to_beer
+    metadata: {}
+    data: {}
+  mode: single
+- id: '1729632853989'
+  alias: Tiffanylampe an
+  description: ''
+  triggers:
+  - trigger: sun
+    event: sunset
+    offset: 0
+  conditions: []
+  actions:
+  - type: turn_on
+    device_id: 34a0af945ed27f5b3b1dbffc4dd9be79
+    entity_id: 9d89f40d6cee465787828b3c74adaa52
+    domain: switch
+  - type: turn_on
+    device_id: 1a2dd87db233625cc9378de977958f21
+    entity_id: 3bd503df2d4f94f899a37f79022d83c3
+    domain: switch
+  mode: single
+- id: '1730374885954'
+  alias: Badlicht an
+  description: ''
+  triggers:
+  - type: occupied
+    device_id: 1a25358837884fcf0b7d111b199bc8a4
+    entity_id: 795ccfb897665dec032acdec72c4181f
+    domain: binary_sensor
+    trigger: device
+  conditions: []
+  actions:
+  - type: turn_on
+    device_id: 225dca2949285d099eef325ead20539a
+    entity_id: 5ac27c0cb3b370c037d7758a949bacac
+    domain: light
+  mode: single
+- id: '1730374926846'
+  alias: Badlicht aus
+  description: ''
+  triggers:
+  - type: not_occupied
+    device_id: 1a25358837884fcf0b7d111b199bc8a4
+    entity_id: 795ccfb897665dec032acdec72c4181f
+    domain: binary_sensor
+    trigger: device
+  conditions: []
+  actions:
+  - type: turn_off
+    device_id: 225dca2949285d099eef325ead20539a
+    entity_id: 5ac27c0cb3b370c037d7758a949bacac
+    domain: light
+  mode: single
+- id: '1732492349091'
+  alias: Sylvia Licht aus
+  description: ''
+  triggers:
+  - device_id: 06b5d7c592511b2052055cd6ba2ac422
+    domain: device_tracker
+    entity_id: 228ede1260fefaa9e357150f55ec2c8d
+    type: leaves
+    trigger: device
+    zone: zone.home
+  conditions:
+  - condition: device
+    device_id: 60942c890696143d24dd12556b71b98e
+    domain: device_tracker
+    entity_id: 19b545a9cea6b84f8f7960264ff4cad1
+    type: is_not_home
+  actions:
+  - action: notify.mobile_app_sylvias_iphone
+    metadata: {}
+    data:
+      message: Hast Du das Licht ausgeschaltet?
+      title: Weib!!!
+  mode: single
+- id: '1732974471631'
+  alias: Tiffanylampe aus
+  description: ''
+  triggers:
+  - trigger: sun
+    event: sunset
+    offset: 06:00:00
+  conditions: []
+  actions:
+  - type: turn_off
+    device_id: 34a0af945ed27f5b3b1dbffc4dd9be79
+    entity_id: 9d89f40d6cee465787828b3c74adaa52
+    domain: switch
+  - type: turn_off
+    device_id: 1a2dd87db233625cc9378de977958f21
+    entity_id: 3bd503df2d4f94f899a37f79022d83c3
+    domain: switch
+  mode: single
+- id: '1733346185394'
+  alias: Tablet Strom aus
+  description: ''
+  triggers:
+  - type: battery_level
+    device_id: d66c89541af77f63edf01e7b52e49047
+    entity_id: 41a3aad67e4fa09996fcc9d188480ded
+    domain: sensor
+    trigger: device
+    above: 80
+    for:
+      hours: 0
+      minutes: 0
+      seconds: 1
+  conditions: []
+  actions:
+  - type: turn_off
+    device_id: 1a2dd87db233625cc9378de977958f21
+    entity_id: 3bd503df2d4f94f899a37f79022d83c3
+    domain: switch
+  mode: single
+- id: '1733346265885'
+  alias: Tablet Strom an
+  description: ''
+  triggers:
+  - type: battery_level
+    device_id: d66c89541af77f63edf01e7b52e49047
+    entity_id: 41a3aad67e4fa09996fcc9d188480ded
+    domain: sensor
+    trigger: device
+    below: 20
+    for:
+      hours: 0
+      minutes: 0
+      seconds: 1
+  conditions: []
+  actions:
+  - type: turn_on
+    device_id: 4a6bbd6feef1c02d0276a4c00e4852b4
+    entity_id: e9dd2c5c162137dd709125ac5448a642
+    domain: switch
+  mode: single
+- id: '1733851366651'
+  alias: Gästebad an
+  description: ''
+  triggers:
+  - type: occupied
+    device_id: 76e6a195b5b224156e4b12ec7ae6ede3
+    entity_id: a7e50e7f12ace85ca0ac89baf431877c
+    domain: binary_sensor
+    trigger: device
+  conditions: []
+  actions:
+  - type: turn_on
+    device_id: 65e08b024034f6c0a18481a1869a05a8
+    entity_id: 4deec58d810bc36819ec791a03fa3eff
+    domain: light
+  mode: single
+- id: '1733851425388'
+  alias: Gästebad aus
+  description: ''
+  triggers:
+  - type: not_occupied
+    device_id: 76e6a195b5b224156e4b12ec7ae6ede3
+    entity_id: a7e50e7f12ace85ca0ac89baf431877c
+    domain: binary_sensor
+    trigger: device
+  conditions: []
+  actions:
+  - type: turn_off
+    device_id: 65e08b024034f6c0a18481a1869a05a8
+    entity_id: 4deec58d810bc36819ec791a03fa3eff
+    domain: light
+  mode: single
+- id: '1733852211333'
+  alias: Gästebad heizung fenster
+  description: ''
+  triggers:
+  - trigger: state
+    entity_id:
+    - binary_sensor.fenster_gastebad_contact
+  conditions: []
+  actions:
+  - type: toggle
+    device_id: d01857fa86a1d1ebae843e96f5df5964
+    entity_id: c69b87e4c8f47333e93534e989c58b65
+    domain: switch
+  mode: single
+- id: '1739628863820'
+  alias: Alle aus dem Haus
+  description: ''
+  triggers:
+  - trigger: state
+    entity_id:
+    - device_tracker.unifi_default_46_4a_c7_41_d1_70
+    - device_tracker.iphone_4
+    to: not_home
+  conditions:
+  - condition: not
+    conditions:
+    - condition: state
+      entity_id: device_tracker.unifi_default_46_4a_c7_41_d1_70
+      state: home
+    - condition: and
+      conditions:
+      - condition: state
+        entity_id: device_tracker.iphone_4
+        state: home
+  actions:
+  - action: camera.enable_motion_detection
+    metadata: {}
+    data: {}
+    target:
+      device_id:
+      - 67a2fc80e59534b5d96d33cc8a46b209
+      - 0d0fe49841647f1a5cd38c08a598e013
+      - eca7ac8782408f521b81735dc2204aab
+  mode: single
+- id: '1739818641006'
+  alias: Mindestens einer zu Hause
+  description: ''
+  triggers:
+  - trigger: state
+    entity_id:
+    - device_tracker.unifi_default_46_4a_c7_41_d1_70
+    - device_tracker.iphone_4
+    to: home
+  conditions: []
+  actions:
+  - action: camera.disable_motion_detection
+    metadata: {}
+    data: {}
+    target:
+      device_id:
+      - 67a2fc80e59534b5d96d33cc8a46b209
+      - 0d0fe49841647f1a5cd38c08a598e013
+  mode: single
+- id: '1774518977784'
+  alias: low battery
+  description: ''
+  use_blueprint:
+    path: andrew-codechimp/battery_notes_battery_threshold.yaml
+- id: '1774519019544'
+  alias: low battery
+  description: ''
+  use_blueprint:
+    path: andrew-codechimp/battery_notes_battery_threshold.yaml
+- id: '1793206472619'
+  alias: wasserleck spüle
+  description: ''
+  triggers:
+  - trigger: moisture.detected
+    target:
+      device_id: 141dbc36b3ad0b266e41ab4d1ec63459
+    options:
+      behavior: each
+  conditions: []
+  actions:
+  - action: siren.turn_on
+    metadata: {}
+    target:
+      entity_id: siren.flur_sirene
+    data: {}
+  mode: single
+- id: '1793206566448'
+  alias: wasserleck waschmaschine
+  description: ''
+  triggers:
+  - trigger: moisture.detected
+    target:
+      device_id: 50399cde9cadebc75c24995b69053e3d
+    options:
+      behavior: each
+  conditions: []
+  actions:
+  - action: siren.turn_on
+    metadata: {}
+    target:
+      entity_id: siren.flur_sirene
+    data: {}
+  mode: single

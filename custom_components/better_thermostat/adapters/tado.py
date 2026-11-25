@@ -1,0 +1,135 @@
+"""Tado adapter helpers for Better Thermostat.
+
+This module implements the thin adapter that maps Better Thermostat actions
+onto the Tado climate services (offsets and modes).
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Final
+
+from ..model_fixes.model_quirks import offset_from_device
+from ..utils.helpers import state_is_live
+from .base import AdapterCapabilities, DeviceChannels
+from .generic import set_hvac_mode, set_temperature
+from .types import AdapterHost, AdapterProbeHost
+
+__all__ = (
+    "CAPABILITIES",
+    "get_calibration_offset",
+    "get_info",
+    "get_max_calibration_offset",
+    "get_min_calibration_offset",
+    "get_calibration_offset_step",
+    "init",
+    "set_hvac_mode",
+    "set_calibration_offset",
+    "set_temperature",
+    "set_valve",
+)
+
+_LOGGER = logging.getLogger(__name__)
+
+# Tado: offset via the tado.set_climate_temperature_offset service,
+# no valve channel.
+CAPABILITIES = AdapterCapabilities(
+    offset_write=True, offset_needs_entity=False, valve_write=False
+)
+
+# The offset range and granularity Tado accepts. They belong to the
+# ecosystem rather than to a discovered entity, so every Tado TRV reports the
+# same three numbers and the write clamps to them. The range is the one
+# Tado's API enforces: it rejects ±10 with HTTP 422, although the service's
+# selector in Home Assistant offers it.
+OFFSET_MIN: Final = -9.99
+OFFSET_MAX: Final = 9.99
+OFFSET_STEP: Final = 0.01
+
+
+async def get_info(self: AdapterProbeHost, entity_id: str) -> DeviceChannels:
+    """Get info from TRV."""
+    return DeviceChannels(offset_write=True, valve_write=False)
+
+
+async def init(self: AdapterHost, entity_id: str) -> None:
+    """Perform per-entity initialization for the Tado adapter.
+
+    Currently, no initialization is required and the function returns None.
+    """
+    return None
+
+
+async def get_calibration_offset(self: AdapterHost, entity_id: str) -> float:
+    """Get current offset."""
+    state = self.hass.states.get(entity_id)
+    if not state_is_live(state):
+        return 0.0
+    try:
+        return float(str(state.attributes.get("offset_celsius", 0)))
+    except ValueError, TypeError:
+        _LOGGER.warning(
+            "better_thermostat %s: Could not convert calibration offset '%s' to float, using 0",
+            self.device_name,
+            state.attributes.get("offset_celsius"),
+        )
+        return 0.0
+
+
+async def get_calibration_offset_step(self: AdapterHost, entity_id: str) -> float:
+    """Get offset step."""
+    return OFFSET_STEP
+
+
+async def get_min_calibration_offset(self: AdapterHost, entity_id: str) -> float:
+    """Get min offset."""
+    return OFFSET_MIN
+
+
+async def get_max_calibration_offset(self: AdapterHost, entity_id: str) -> float:
+    """Get max offset."""
+    return OFFSET_MAX
+
+
+async def set_calibration_offset(
+    self: AdapterHost, entity_id: str, calibration_offset: float
+) -> bool:
+    """Write a calibration offset through the Tado offset service.
+
+    Parameters
+    ----------
+    self : AdapterHost
+        Host providing Home Assistant access and the per-TRV records.
+    entity_id : str
+        Entity ID of the TRV to write to
+    calibration_offset : float
+        Calibration offset in Kelvin, clamped to the range Tado accepts
+
+    Returns
+    -------
+    bool
+        True once the write went out. The offset rides on the TRV's own
+        service call, so every Tado TRV has the channel.
+    """
+    calibration_offset = min(
+        await get_max_calibration_offset(self, entity_id), calibration_offset
+    )
+    calibration_offset = max(
+        await get_min_calibration_offset(self, entity_id), calibration_offset
+    )
+    await self.hass.services.async_call(
+        "tado",
+        "set_climate_temperature_offset",
+        {"entity_id": entity_id, "offset": calibration_offset},
+        blocking=True,
+        context=self.context,
+    )
+    self.real_trvs[entity_id].last_calibration = offset_from_device(
+        self, entity_id, calibration_offset
+    )
+    return True
+
+
+async def set_valve(self: AdapterHost, entity_id: str, valve: float) -> None:
+    """Set new target valve."""
+    return None

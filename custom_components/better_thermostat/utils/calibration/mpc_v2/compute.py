@@ -1,0 +1,194 @@
+"""MPC v2 entry point: one control cycle from input to percent recommendation."""
+
+from __future__ import annotations
+
+import logging
+import math
+from time import time
+
+from .controller import MpcV2Controller
+from .io import MpcV2Input, MpcV2Output
+from .params import MpcV2Params
+from .state import MpcV2State, _plant_signature_of, plant_signature_differs
+
+_LOGGER = logging.getLogger(__name__)
+
+# When the user has no outdoor sensor we fall back to this value (°C) so the
+# QP and DOB still have a defined operating point. A warm-ish German winter
+# day average — close enough that the steady-state input is still in the
+# valid range; well off-target temps make ``u_ss`` saturate, which the
+# reference governor catches.
+OUTDOOR_TEMPERATURE_FALLBACK = 10.0
+
+
+def _all_finite(*values: float | None) -> bool:
+    """Return ``True`` when every non-None value passes ``math.isfinite``."""
+    for v in values:
+        if v is None:
+            continue
+        if not math.isfinite(v):
+            return False
+    return True
+
+
+def compute_mpc_v2(
+    inp: MpcV2Input,
+    params: MpcV2Params,
+    state: MpcV2State | None = None,
+    *,
+    now: float | None = None,
+) -> tuple[MpcV2Output | None, MpcV2State]:
+    """Run one v2 cycle and return a percent recommendation + updated state.
+
+    Early-exits to ``(None, state)`` while heating is not allowed, a window
+    is open or an input is not finite; the caller treats this as "hold last
+    value".
+
+    ``now`` overrides the wall-clock used as the controller's ``t_s``.
+    Production callers leave it ``None`` (real ``time.time()``); tests
+    pass a synthetic value so realistic dt-driven behaviour (DOB)
+    can be exercised without sleeping.
+    """
+    if now is None:
+        now = time()
+    if state is None:
+        state = MpcV2State()
+    if state.created_ts == 0.0:
+        state.created_ts = now
+
+    if not inp.heating_allowed or inp.window_open:
+        # The room moves on while the controller is off; the first reading
+        # after the pause is fresh, not a step of the sensor.
+        if state.controller is not None:
+            state.controller.report_band.forget_reading()
+            state.controller.mark_paused()
+        return None, state
+
+    # Reject non-finite sensor inputs. Without this guard a NaN propagates
+    # through Kalman/QP and poisons the cached state — a single bad reading
+    # would require restarting the integration to recover.
+    if not _all_finite(
+        inp.room_temperature,
+        inp.target_temperature,
+        inp.outdoor_temperature,
+        inp.trv_temperature,
+        inp.applied_valve_percent,
+    ):
+        _LOGGER.warning(
+            "better_thermostat %s: MPC v2 (%s) non-finite input "
+            "(current=%s target=%s outdoor=%s trv=%s) — holding last command",
+            inp.bt_name or "BT",
+            inp.entity_id or inp.key,
+            inp.room_temperature,
+            inp.target_temperature,
+            inp.outdoor_temperature,
+            inp.trv_temperature,
+        )
+        return None, state
+
+    new_signature = _plant_signature_of(params)
+    if (
+        state.controller is not None
+        and state.plant_signature is not None
+        and plant_signature_differs(state.plant_signature, new_signature)
+    ):
+        _LOGGER.info(
+            "MPC v2 plant prior changed for %s (%s → %s); rebuilding controller "
+            "with the observer state carried over",
+            inp.key,
+            state.plant_signature,
+            new_signature,
+        )
+        # The estimates, the disturbance reading, the error integral, the
+        # governor and the command history describe the room, not the prior,
+        # so the new controller takes them over and continues where the old
+        # one stood instead of re-learning from a cold start. A controller
+        # whose observer never saw the room has nothing to hand over.
+        previous = state.controller
+        state.controller = MpcV2Controller(params)
+        if previous.initialised:
+            state.controller.restore_snapshot(previous.export_snapshot())
+        if previous.paused:
+            state.controller.mark_paused()
+        state.plant_signature = new_signature
+
+    if state.controller is None:
+        state.controller = MpcV2Controller(params)
+        state.plant_signature = new_signature
+
+    # A successful adapter write (or a device position echo) is the source of
+    # truth for the preceding plant input.  In particular, do not assume that
+    # the recommendation from the last call made it through a write budget.
+    if inp.applied_valve_percent is not None:
+        state.controller.set_applied_u(inp.applied_valve_percent / 100.0)
+
+    if inp.outdoor_temperature is None:
+        T_outdoor = OUTDOOR_TEMPERATURE_FALLBACK
+        if not state.outdoor_fallback_logged:
+            _LOGGER.warning(
+                "better_thermostat %s: MPC v2 (%s) no outdoor_temperature — falling "
+                "back to %.1f °C. Configure an outdoor sensor for accurate "
+                "feed-forward (u_ss).",
+                inp.bt_name or "BT",
+                inp.entity_id or inp.key,
+                T_outdoor,
+            )
+            state.outdoor_fallback_logged = True
+    else:
+        T_outdoor = inp.outdoor_temperature
+
+    # The cap is a percent by contract; clamp it into 0..100 here so an
+    # out-of-range value from a caller cannot widen or invert the limit.
+    # ``int`` floors the clamped cap, which is the largest whole percent a
+    # fractional cap still admits.
+    cap_percent = int(max(0.0, min(100.0, inp.max_opening_percent)))
+
+    u, diag = state.controller.step(
+        t_s=now,
+        T_room=inp.room_temperature,
+        T_target=inp.target_temperature,
+        T_outdoor=T_outdoor,
+        T_rad=inp.trv_temperature,
+        u_max=cap_percent / 100.0,
+        learning_paused=inp.learning_paused,
+        room_reading_from_trvs=inp.room_temperature_from_trvs,
+    )
+
+    # Round half up. The built-in ``round`` is half to even, so it sends every
+    # second exact half percent down (12.5 → 12) and the next one up (13.5 →
+    # 14), which quantises the valve command lopsidedly.
+    #
+    # Scaling first is not exact: a fraction that denotes a half percent can
+    # land a hair below it, because 0.285 is held as 0.28499999999999998 and
+    # times 100 that is 28.499999999999996. Snapping to the nearest
+    # micro-percent makes "half" mean half before the half-up step decides,
+    # and leaves every fraction that is not one where it was.
+    percent_int = int(round(max(0.0, min(1.0, u)) * 100.0, 6) + 0.5)
+    percent_int = min(percent_int, cap_percent)
+
+    # This is the bounded command requested this cycle.  It is replaced by the
+    # confirmed input above on the next cycle once the adapter has succeeded.
+    if state.controller is not None:
+        state.controller.set_command_u(percent_int / 100.0)
+
+    state.last_percent = float(percent_int)
+    state.last_compute_ts = now
+
+    if _LOGGER.isEnabledFor(logging.DEBUG):
+        _LOGGER.debug(
+            "better_thermostat %s: MPC v2 (%s) target=%.2f current=%.2f trv=%s "
+            "outdoor=%s -> valve=%d%% (T_rad_hat=%.2f D_hat=%.4f tau_room=%.0f) key=%s",
+            inp.bt_name or "BT",
+            inp.entity_id or inp.key,
+            inp.target_temperature,
+            inp.room_temperature,
+            inp.trv_temperature,
+            inp.outdoor_temperature,
+            percent_int,
+            diag.T_rad_hat,
+            diag.D_hat_K_per_min,
+            diag.tau_room_min,
+            inp.key,
+        )
+
+    return MpcV2Output(valve_percent=percent_int, diagnostics=diag), state

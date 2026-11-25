@@ -1,0 +1,164 @@
+"""Provide device conditions for Better Thermostat."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from enum import StrEnum
+
+from homeassistant.components.climate.const import (
+    ATTR_HVAC_ACTION,
+    ATTR_HVAC_MODE,
+    HVACAction,
+    HVACMode,
+)
+from homeassistant.const import (
+    CONF_CONDITION,
+    CONF_DEVICE_ID,
+    CONF_DOMAIN,
+    CONF_ENTITY_ID,
+    CONF_TYPE,
+)
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import condition, config_validation as cv, entity_registry
+from homeassistant.helpers.config_validation import DEVICE_CONDITION_BASE_SCHEMA
+from homeassistant.helpers.typing import ConfigType
+import probatio as vol
+
+from . import DOMAIN
+from .utils.helpers import is_bt_climate_entity
+
+
+class ConditionType(StrEnum):
+    """The condition types this platform offers, as stored in an automation."""
+
+    IS_HVAC_MODE = "is_hvac_mode"
+    IS_HVAC_ACTION = "is_hvac_action"
+
+
+CONDITION_TYPES = frozenset(ConditionType)
+
+# The actions the thermostat reports: cooling only with a cooler configured.
+_HVAC_ACTIONS = [
+    HVACAction.OFF,
+    HVACAction.HEATING,
+    HVACAction.COOLING,
+    HVACAction.IDLE,
+]
+
+# Both extend the device-condition base schema, which carries the `condition`,
+# `device_id` and `domain` keys every condition this platform offers is built
+# with; a bare schema rejects its own output.
+HVAC_MODE_CONDITION = DEVICE_CONDITION_BASE_SCHEMA.extend(
+    {
+        vol.Required(CONF_ENTITY_ID): cv.entity_id_or_uuid,
+        vol.Required(CONF_TYPE): ConditionType.IS_HVAC_MODE,
+        vol.Required(ATTR_HVAC_MODE): vol.In(
+            [HVACMode.OFF, HVACMode.HEAT, HVACMode.HEAT_COOL]
+        ),
+    }
+)
+
+HVAC_ACTION_CONDITION = DEVICE_CONDITION_BASE_SCHEMA.extend(
+    {
+        vol.Required(CONF_ENTITY_ID): cv.entity_id_or_uuid,
+        vol.Required(CONF_TYPE): ConditionType.IS_HVAC_ACTION,
+        vol.Required(ATTR_HVAC_ACTION): vol.In(_HVAC_ACTIONS),
+    }
+)
+
+CONDITION_SCHEMA = vol.Any(HVAC_MODE_CONDITION, HVAC_ACTION_CONDITION)
+
+
+async def async_get_conditions(
+    hass: HomeAssistant, device_id: str
+) -> list[dict[str, str]]:
+    """List device conditions for Better Thermostat devices."""
+    registry = entity_registry.async_get(hass)
+    conditions = []
+
+    # Get all the integrations entities for this device
+    for entry in entity_registry.async_entries_for_device(registry, device_id):
+        if not is_bt_climate_entity(entry):
+            continue
+
+        base_condition = {
+            CONF_CONDITION: "device",
+            CONF_DEVICE_ID: device_id,
+            CONF_DOMAIN: DOMAIN,
+            CONF_ENTITY_ID: entry.entity_id,
+        }
+
+        conditions.extend(
+            [{**base_condition, CONF_TYPE: cond} for cond in ConditionType]
+        )
+
+    return conditions
+
+
+@callback
+def async_condition_from_config(
+    hass: HomeAssistant, config: ConfigType
+) -> condition.ConditionCheckerType:
+    """Create a function to test a device condition."""
+    # A stored condition may name the entity by its registry id rather than by
+    # its entity id, which the schema accepts and ``hass.states`` does not.
+    entity_id = entity_registry.async_resolve_entity_id(
+        entity_registry.async_get(hass), config[CONF_ENTITY_ID]
+    )
+
+    if config[CONF_TYPE] == ConditionType.IS_HVAC_MODE:
+        hvac_mode = config[ATTR_HVAC_MODE]
+
+        def test_is_hvac_mode(
+            hass: HomeAssistant, variables: Mapping[str, object] | None
+        ) -> bool:
+            """Test if an HVAC mode condition is met.
+
+            A climate entity carries its mode as the state, not as an
+            attribute; ``hvac_action`` is the one that is an attribute.
+            """
+            if entity_id is None or (state := hass.states.get(entity_id)) is None:
+                return False
+            return state.state == hvac_mode
+
+        return test_is_hvac_mode
+
+    # The type is ConditionType.IS_HVAC_ACTION: the schema admits no other.
+    hvac_action = config[ATTR_HVAC_ACTION]
+
+    def test_is_hvac_action(
+        hass: HomeAssistant, variables: Mapping[str, object] | None
+    ) -> bool:
+        """Test if an HVAC action condition is met."""
+        if entity_id is None or (state := hass.states.get(entity_id)) is None:
+            return False
+        return state.attributes.get(ATTR_HVAC_ACTION) == hvac_action
+
+    return test_is_hvac_action
+
+
+async def async_get_condition_capabilities(
+    hass: HomeAssistant, config: ConfigType
+) -> dict[str, vol.Schema]:
+    """List condition capabilities."""
+    condition_type = config[CONF_TYPE]
+
+    if condition_type == ConditionType.IS_HVAC_MODE:
+        return {
+            "extra_fields": vol.Schema(
+                {
+                    vol.Required(ATTR_HVAC_MODE): vol.In(
+                        [HVACMode.OFF, HVACMode.HEAT, HVACMode.HEAT_COOL]
+                    )
+                }
+            )
+        }
+
+    if condition_type == ConditionType.IS_HVAC_ACTION:
+        return {
+            "extra_fields": vol.Schema(
+                {vol.Required(ATTR_HVAC_ACTION): vol.In(_HVAC_ACTIONS)}
+            )
+        }
+
+    return {}

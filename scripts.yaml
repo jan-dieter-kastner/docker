@@ -1,0 +1,62 @@
+awtrix_set_to_dnd:
+  alias: 'Set a do not disturb message on Matrix display'
+  sequence:
+    - service: mqtt.publish
+      data:
+        topic: "awtrix_1222c4/notify"
+        payload: '{text : "Nicht stören!","rainbow" : true,"icon": 651,"hold": true}'
+        qos: '2'
+        retain: true
+
+awtrix_set_to_welcome:
+  alias: 'Set a welcome message on Matrix display'
+  sequence:
+    - service: mqtt.publish
+      data:
+        topic: "awtrix_1222c4/notify"
+        payload: '{text : "abandon hope all ye who enter here!","rainbow" : true,"icon": 275,"hold": true}'
+        qos: '2'
+        retain: true
+
+awtrix_set_to_beer:
+  alias: 'Set a beer message on Matrix display'
+  sequence:
+    - service: mqtt.publish
+      data:
+        topic: "awtrix_1222c4/notify"
+        payload: '{text : "Hol Bier und zwar schnell Du armseliges Frettchen","rainbow" : true,"icon": 3253,"hold": true}'
+        qos: '2'
+        retain: true   
+
+govee_smart_heater_on:
+  alias: 'Smart Space Heater: On'
+  sequence:
+  - service: rest_command.govee_appliance_request
+    data:
+      device: 17:DA:60:74:F4:0C:53:72
+      model: H713A
+      cmd_name: mode
+      cmd_instance: workMode
+      cmd_value: 2  # Medium
+  - service: rest_command.govee_appliance_request
+    data:
+      device: 17:DA:60:74:F4:0C:53:72
+      model: H713A
+      cmd_name: on_off
+      cmd_instance: powerSwitch
+      cmd_value: 1  # On
+  mode: single
+  icon: mdi:radiator
+
+smart_space_heater_off:
+  alias: 'Smart Space Heater: Off'
+  sequence:
+  - service: rest_command.govee_appliance_request
+    data:
+      device: 17:DA:60:74:F4:0C:53:72
+      model: H713A
+      cmd_name: on_off
+      cmd_instance: powerSwitch
+      cmd_value: 0  # Off
+  mode: single
+  icon: mdi:radiator-off

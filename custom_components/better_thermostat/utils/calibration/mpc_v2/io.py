@@ -1,0 +1,58 @@
+"""MPC v2 I/O contract — the dataclasses exchanged with the dispatcher.
+
+Defines the per-cycle boundary types for the controller: :class:`MpcV2Input`
+(sensor readings and gating flags fed in each cycle), :class:`MpcV2Output`
+(the valve-percent recommendation handed back), and :class:`MpcV2Diagnostics`
+(observer/identifier internals surfaced as entity attributes). These types are
+deliberately HA-free so the controller core can be exercised in isolation.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass
+class MpcV2Input:
+    """Inputs for one MPC v2 control cycle (v2's own I/O contract)."""
+
+    key: str
+    target_temperature: float
+    room_temperature: float
+    trv_temperature: float | None = None
+    outdoor_temperature: float | None = None
+    window_open: bool = False
+    heating_allowed: bool = True
+    max_opening_percent: float = 100.0
+    # Last valve opening confirmed by the adapter or reported by the device.
+    # It is deliberately the previous applied input, not this cycle's MPC
+    # recommendation: writes can be deferred or fail after computation.
+    applied_valve_percent: float | None = None
+    # While set, the disturbance estimate and the error integral are held and
+    # the controller plans on them; the observer keeps tracking the room.
+    learning_paused: bool = False
+    # Set while the room sensor has failed and ``room_temperature`` is the
+    # mean of the TRVs' own readings. Their steps say nothing about the room
+    # sensor's reporting threshold, so each such reading counts as fresh.
+    room_temperature_from_trvs: bool = False
+    bt_name: str | None = None
+    entity_id: str | None = None
+
+
+@dataclass
+class MpcV2Diagnostics:
+    """Per-cycle controller diagnostics, surfaced as entity attributes."""
+
+    T_room_hat: float
+    T_rad_hat: float
+    D_hat_K_per_min: float
+    tau_room_min: float
+    coupling_rad_room: float
+
+
+@dataclass
+class MpcV2Output:
+    """Result of one MPC v2 control cycle."""
+
+    valve_percent: int
+    diagnostics: MpcV2Diagnostics

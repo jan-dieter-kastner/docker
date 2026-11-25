@@ -1,0 +1,24 @@
+{
+  "domain": "better_thermostat",
+  "name": "Better Thermostat",
+  "after_dependencies": [
+    "climate",
+    "recorder",
+    "zwave_js"
+  ],
+  "codeowners": [
+    "@kartoffeltoby"
+  ],
+  "config_flow": true,
+  "dependencies": [
+    "climate"
+  ],
+  "documentation": "https://better-thermostat.org/",
+  "integration_type": "device",
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/KartoffelToby/better_thermostat/issues",
+  "requirements": [
+    "numpy>=2"
+  ],
+  "version": "2.0.0"
+}

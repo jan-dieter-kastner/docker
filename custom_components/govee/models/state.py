@@ -1,0 +1,1264 @@
+"""Device state models.
+
+Mutable state that changes with device updates from API or MQTT.
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, field
+from collections.abc import Iterable
+from typing import Any, Protocol
+
+from .energy_counter import answers_other_client, uptime_from_sta
+
+# Candidate keys a thermometer/hygrometer reading may hide behind. The Govee
+# state shape varies by SKU and transport: REST returns either a plain number
+# under ``value`` or a STRUCT; AWS IoT pushes use flat keys whose naming is not
+# documented, so accept the known spellings defensively.
+#
+# The ``*_STRUCT_KEYS`` sets include the generic ``value`` for unwrapping a
+# nested object. The ``*_MQTT_KEYS`` sets deliberately omit ``value`` so a
+# top-level scan of a light's push (onOff/brightness/color/...) can't false-
+# match an unrelated ``value`` field.
+_SENSOR_TEMPERATURE_STRUCT_KEYS = (
+    "sensorTemperature",
+    "currentTemperature",
+    "temperature",
+    "value",
+    "tem",
+)
+_SENSOR_HUMIDITY_STRUCT_KEYS = (
+    "sensorHumidity",
+    "currentHumidity",
+    "humidity",
+    "value",
+    "hum",
+)
+_SENSOR_TEMPERATURE_MQTT_KEYS = (
+    "sensorTemperature",
+    "currentTemperature",
+    "temperature",
+    "tem",
+)
+_SENSOR_HUMIDITY_MQTT_KEYS = (
+    "sensorHumidity",
+    "currentHumidity",
+    "humidity",
+    "hum",
+)
+
+# Boilerplate/settings frame prefixes to skip when hunting for the H5106's
+# temperature/humidity/PM2.5 frame among an AWS IoT push's other op_frames —
+# ported from homebridge-govee's sensor-monitor.js, issue #200.
+_PM25_FRAME_IGNORED_PREFIXES = frozenset(
+    {"0000", "0003", "0100", "0101", "0102", "0103", "331a", "3315", "aa0d", "aa0e"}
+)
+
+
+def _coerce_int(value: Any) -> int | None:
+    """int(value), or None when value is empty/None/non-numeric.
+
+    The Govee cloud returns ``""`` for a capability's value when the device is
+    offline or hasn't reported (e.g. ``brightness``/``hdmiSource`` on an offline
+    device, #83). An unguarded ``int("")`` raises ValueError and fails the whole
+    device-state parse, so a single bad field would stop the device updating.
+    """
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_sensor_value(value: Any, keys: tuple[str, ...]) -> float | None:
+    """Extract a float reading from a number or a nested STRUCT.
+
+    Accepts a plain ``int``/``float`` or a dict where the reading lives under
+    one of ``keys``. Returns ``None`` when nothing usable is present so callers
+    can preserve the last-known value instead of clobbering it.
+    """
+    if isinstance(value, bool):  # bool is an int subclass — reject explicitly
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, dict):
+        for key in keys:
+            sub = value.get(key)
+            if isinstance(sub, bool):
+                continue
+            if isinstance(sub, (int, float)):
+                return float(sub)
+    return None
+
+
+@dataclass(frozen=True)
+class RGBColor:
+    """Immutable RGB color representation."""
+
+    r: int
+    g: int
+    b: int
+
+    def __post_init__(self) -> None:
+        """Validate color values are in range."""
+        # Use object.__setattr__ because dataclass is frozen
+        object.__setattr__(self, "r", max(0, min(255, self.r)))
+        object.__setattr__(self, "g", max(0, min(255, self.g)))
+        object.__setattr__(self, "b", max(0, min(255, self.b)))
+
+    @property
+    def as_tuple(self) -> tuple[int, int, int]:
+        """Return as (r, g, b) tuple."""
+        return (self.r, self.g, self.b)
+
+    @property
+    def as_packed_int(self) -> int:
+        """Return as packed integer for Govee API: (R << 16) + (G << 8) + B."""
+        return (self.r << 16) + (self.g << 8) + self.b
+
+    @classmethod
+    def from_packed_int(cls, value: int) -> RGBColor:
+        """Create from Govee API packed integer."""
+        r = (value >> 16) & 0xFF
+        g = (value >> 8) & 0xFF
+        b = value & 0xFF
+        return cls(r=r, g=g, b=b)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> RGBColor:
+        """Create from dict with r, g, b keys."""
+        return cls(
+            r=int(data.get("r", 0)),
+            g=int(data.get("g", 0)),
+            b=int(data.get("b", 0)),
+        )
+
+
+@dataclass(frozen=True)
+class SegmentState:
+    """State of a single segment in RGBIC device."""
+
+    index: int
+    color: RGBColor
+    brightness: int = 100
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any], index: int) -> SegmentState:
+        """Create from segment dict."""
+        color = RGBColor.from_dict(data.get("color", {}))
+        brightness = data.get("brightness", 100)
+        return cls(index=index, color=color, brightness=brightness)
+
+
+class LanDevStatusLike(Protocol):
+    """Structural shape of a parsed Govee LAN ``devStatus`` reply.
+
+    Declared here — rather than imported from :mod:`..api.lan_client` — so the
+    state model stays free of API-layer imports and no import cycle forms. Any
+    object exposing these four read-only fields satisfies it (the coordinator's
+    ``LanDevStatus`` does).
+
+    The Govee LAN protocol exposes only four readable fields, so this is the
+    full data ceiling. ``brightness`` is DEVICE-NATIVE: the caller rescales the
+    raw LAN 0-100 value into the device's brightness range before the overlay,
+    and the entity layer handles any native↔0-255 conversion.
+    """
+
+    on: bool | None
+    brightness: int | None
+    color: RGBColor | None
+    color_temp_kelvin: int | None
+
+
+@dataclass(frozen=True)
+class ProbeReading:
+    """One probe of a probe thermometer (H5192).
+
+    ``core`` and ``ambient`` are the live temperatures; the four limits are the
+    alarm corridor stored in the device. Every field is None when the device
+    reports the 0xFFFF sentinel — an unplugged probe for the readings, an unset
+    corridor for the limits. All values are degrees Celsius.
+    """
+
+    core: float | None = None
+    ambient: float | None = None
+    core_max: float | None = None
+    core_min: float | None = None
+    ambient_max: float | None = None
+    ambient_min: float | None = None
+
+
+@dataclass
+class GoveeDeviceState:
+    """Mutable device state updated from API or MQTT.
+
+    Unlike GoveeDevice (frozen), state changes frequently and needs
+    to be updated in-place for performance.
+    """
+
+    device_id: str
+    online: bool = True
+    power_state: bool = False
+    brightness: int = 100
+    color: RGBColor | None = None
+    color_temp_kelvin: int | None = None
+    active_scene: str | None = None
+    active_scene_name: str | None = None  # Display name of active scene
+    active_diy_scene: str | None = None  # DIY scene ID (separate from regular scenes)
+    active_snapshot: int | None = None  # Active saved snapshot id (issue #114)
+    segments: list[SegmentState] = field(default_factory=list)
+    diy_style: str | None = None  # DIY animation style (Fade, Jumping, etc.)
+    diy_style_value: int | None = None  # DIY animation style numeric value (0-4)
+    music_mode_enabled: bool | None = None  # Music mode on/off state (legacy BLE)
+
+    # STRUCT-based music mode state (for devices with music_setting capability)
+    music_mode_value: int | None = None  # Music mode value (1-11)
+    music_mode_name: str | None = None  # Music mode display name (e.g., "Rhythm")
+    music_sensitivity: int | None = None  # Microphone sensitivity (0-100)
+
+    # Fan state
+    oscillating: bool | None = None  # Fan oscillation on/off
+    work_mode: int | None = None  # Fan work mode: 1=gearMode, 3=Auto, 9=Fan
+    mode_value: int | None = None  # Fan speed for gearMode: 1=Low, 2=Medium, 3=High
+
+    # HDMI source state (for devices like AI Sync Box H6604)
+    hdmi_source: int | None = None  # HDMI port: 1, 2, 3, 4
+
+    # Aroma diffuser preset scene (H7161, issue #99): integer id of the active
+    # named scene. Often "" on poll, so the select is optimistic like HDMI/scene.
+    preset_scene: int | None = None
+
+    # Appliance nightlight scene (H5089/H7124, issue #114): integer id of the
+    # active named nightlightScene mode option.
+    nightlight_scene: int | None = None
+
+    # Probe thermometer readings, keyed by probe number (H5192). Frozen
+    # values, so a merge replaces the entry rather than mutating it.
+    # Diagnostics dumps state with dataclasses.asdict, so these appear in
+    # downloads without extra plumbing.
+    probes: dict[int, ProbeReading] = field(default_factory=dict)
+
+    # DreamView (Movie Mode) state
+    dreamview_enabled: bool | None = None  # DreamView on/off
+
+    # Heater state
+    heater_temperature: int | None = None  # Target temperature in Celsius
+    heater_auto_stop: int | None = None  # Auto-stop setting (0=Maintain, 1=Auto-stop)
+    heater_thermostat: bool | None = None  # thermostatToggle, optimistic only (device never reports it)
+    fan_speed: int | None = None  # Fan speed mode value (1=Low, 2=Medium, 3=High)
+    # Unit reported by the temperature_setting STRUCT state ("Celsius" /
+    # "Fahrenheit"). Heaters like the H713B run in °F internally and report
+    # sensorTemperature in the SAME unit — but the property capability itself
+    # carries no unit metadata. Capturing the STRUCT's unit lets the
+    # temperature sensor entity normalize without a SKU allowlist entry
+    # (issue #129).
+    # Unit the device declares in its temperature_setting STRUCT ("Celsius" /
+    # "Fahrenheit"). Not heater-specific despite the capability's origins —
+    # kettles declare it too, under a different instance name (issue #171).
+    device_temperature_unit: str | None = None
+    # Kettle target temperature (``sliderTemperature``), in the unit the
+    # kettle reports, not normalised to °C.
+    kettle_target_temperature: float | None = None
+    # H7175 kettle, from its AWS IoT frames (kettle/frames.py). The poll
+    # reports ``{"workMode": 1}`` alone for a custom slot, so the slot is
+    # remembered in ``kettle_mode_value``. Preset temperatures are
+    # ``{workMode: {modeValue: temperature}}`` in the kettle's unit; the DIY
+    # slot is the custom slot the Govee app marks "DIY", not the selection.
+    kettle_mode_value: int | None = None
+    kettle_preset_temperatures: dict[int, dict[int, float]] = field(default_factory=dict)
+    kettle_diy_slot: int | None = None
+    kettle_heating_status: str | None = None
+    kettle_keep_warm_enabled: bool | None = None
+    kettle_keep_warm_minutes: int | None = None
+    kettle_keep_warm_remaining: int | None = None
+    # Whether the kettle sits on its base, and the aa 17 frame as hex (for the
+    # diagnostics: its byte 4 top bit is an unknown flag, see kettle/frames.py).
+    kettle_on_base: bool | None = None
+    kettle_base_frame: str | None = None
+
+    # Purifier state
+    purifier_mode: int | None = None  # Purifier mode value (1=Sleep, 2=Low, 3=High, etc.)
+
+    # Humidifier / dehumidifier state.
+    # Target humidity (Auto mode) and manual speed are both carried in
+    # ``mode_value`` above; the humidifier entity interprets it based on
+    # ``work_mode``. Only the event flag needs its own field.
+    water_full: bool | None = None  # Dehumidifier water-tank-full event
+    # Configured humidity setpoint from the range::humidity capability (H7152,
+    # issue #114). Distinct from the Auto-mode modeValue setpoint used by the
+    # H7150 — see GoveeDevice.auto_mode_value_is_setpoint.
+    configured_humidity: int | None = None
+
+    # Pump-fault status for pump-model dehumidifiers (H7152 "Max"). Not
+    # advertised as a capability by the Developer API and never carried in the
+    # flat MQTT ``state`` keys or the OpenAPI event-push channel (confirmed by
+    # a live capture during an actual clogged-drain fault, with zero footprint
+    # on either channel) — only in the AWS IoT status push's ``op.command``
+    # BLE-format frames, decoded in :meth:`update_pump_state_from_frames`.
+    # Live/level flag, not edge-latched like water_full: it clears on its own
+    # once the app's pump-fault alert clears.
+    pump_state: bool | None = None
+
+    # Hose-connection mode for pump-model dehumidifiers (H7152 "Max"),
+    # decoded from byte offset 9 of the AWS IoT ``aa 19`` status frame.
+    # "pump" = drain hose physically connected (app's "Pump Mode"); "tank" =
+    # hose disconnected, draining into the bucket instead (app's "Water Tank
+    # Mode"). Confirmed directly against the app: repeatedly pressing and
+    # holding the device's physical hose-connection button (~5s per hold)
+    # toggled the app's own Mode label in exact lockstep with this byte on
+    # every single transition. See update_dehumidifier_mode_from_frames.
+    dehumidifier_mode: str | None = None  # "pump" | "tank"
+
+    # Live power-monitoring readings for smart-outlet SKUs (H5086, issue
+    # #200). No capability advertises these — they only arrive in the AWS
+    # IoT push's ``op.command`` BLE-format frames, decoded in
+    # :meth:`update_power_monitoring_from_frames`. ``power_factor`` is a
+    # raw percent (0-100); the rest are already scaled to their SI unit.
+    voltage: float | None = None  # Volts
+    current: float | None = None  # Amps
+    power_draw: float | None = None  # Watts
+    energy_total: float | None = None  # kWh used today; the device resets it at midnight
+    power_factor: int | None = None  # Percent, 0-100
+    on_time: int | None = None  # Seconds the outlet was on today; resets with energy_total
+    uptime: int | None = None  # Seconds since the plug booted, from the push's ``sta``
+
+    # Standalone water-leak detector trip (H5054, issue #62). True when water
+    # is detected. Arrives via the bodyAppearedEvent event capability — the
+    # developer-API device-state poll only returns `online`, so the trip
+    # normally lands via MQTT push.
+    water_leak: bool | None = None
+
+    # mmWave presence/occupancy detection (H5127, issue #124). True when a
+    # body is present. Shares the bodyAppearedEvent capability with the H5054
+    # leak detector but is reported with option value 1=Presence / 2=Absence,
+    # so it is mapped to a dedicated occupancy field rather than water_leak.
+    presence: bool | None = None
+
+    # Read-only sensor properties (devices.capabilities.property) for
+    # stand-alone sensors like H5109/H5179. None until first poll lands.
+    sensor_temperature: float | None = None  # Raw from API (°C or °F; entity may normalize)
+    # Second temperature probe on dual-probe SKUs (H5112, issue #150). Set
+    # only from the BFF ``tem2`` field — the Developer API exposes a single
+    # sensorTemperature and has no concept of a second probe. Independent of
+    # sensor_temperature: either probe can be unplugged while the other reads.
+    sensor_temperature_2: float | None = None
+    sensor_humidity: float | None = None  # Relative humidity 0-100 %
+    battery: int | None = None  # Battery level 0-100 % (BFF thermo-hygrometers)
+
+    # Read-only air-quality index + filter remaining-life (%), for air-quality
+    # monitors and air purifiers (H5106/H7124/H7126, issue #114).
+    air_quality: int | None = None
+    filter_life: int | None = None
+
+    # Live PM2.5 (micrograms/m3) for the H5106 AQI monitor, issue #200. The
+    # Developer API has no PM2.5 field at all for this SKU — only the coarse
+    # air_quality index above. Decoded from the same AWS IoT push frame that
+    # also refreshes sensor_temperature/sensor_humidity with a faster reading
+    # than the API poll — see update_pm25_from_frames.
+    pm25: int | None = None
+
+    # Read-only CO₂ concentration in ppm (H5140 Smart CO₂ Monitor, issue #117).
+    carbon_dioxide: int | None = None
+
+    # Live state of generic toggle capabilities keyed by instance (e.g.
+    # ``socketToggle1`` on the H5089). Only populated when the API returns a
+    # real 0/1 value; toggles reported as "" on poll (e.g. mainLightToggle)
+    # stay absent and the entity uses optimistic state instead (issue #114).
+    toggles: dict[str, bool] = field(default_factory=dict)
+
+    # Integrated ceiling fan on H1310/H1370-style combos (issue #181). The
+    # Developer API returns "" for fanToggle / fanSpeedMode /
+    # reverseAirflowToggle / fanOscillateToggle on every poll, so these are
+    # only ever set from the fan's own AWS IoT status frames
+    # (:meth:`update_ceiling_fan_from_frames`) or from an optimistic write.
+    # None until either lands; the fan entity falls back to its restored
+    # state until then.
+    ceiling_fan_on: bool | None = None
+    ceiling_fan_speed: int | None = None
+    ceiling_fan_reverse: bool | None = None
+    ceiling_fan_swing: bool | None = None
+
+    # Last activated scene (for restoring after music mode off)
+    last_scene_id: str | None = None
+    last_scene_name: str | None = None
+
+    # Last color/color_temp (for restoring when scene is cleared)
+    last_color: RGBColor | None = None
+    last_color_temp_kelvin: int | None = None
+
+    # Source tracking for state management
+    # "api" = from REST poll, "mqtt" = from push, "optimistic" = from command
+    source: str = "api"
+
+    # Monotonic timestamp of the most recent optimistic write. Used by the
+    # coordinator to apply a short grace period during which API polls don't
+    # overwrite optimistic power/brightness — covers out-of-range BLE devices
+    # and slow cloud round-trips. Reset by MQTT push confirmations.
+    last_optimistic_update: float | None = None
+
+    def _stamp_optimistic(self) -> None:
+        """Record that an optimistic write just happened."""
+        self.source = "optimistic"
+        self.last_optimistic_update = time.monotonic()
+
+    def clear_optimistic_window(self) -> None:
+        """End the optimistic grace period (e.g. on confirmed MQTT push)."""
+        self.last_optimistic_update = None
+
+    def update_from_api(self, data: dict[str, Any]) -> None:
+        """Update state from API response.
+
+        Args:
+            data: Device state dict from /device/state endpoint.
+        """
+        self.source = "api"
+
+        # Parse capabilities array for state values
+        # ``or []``: Govee has returned a null list for offline devices.
+        capabilities = data.get("capabilities") or []
+        for cap in capabilities:
+            cap_type = cap.get("type", "")
+            instance = cap.get("instance", "")
+            state = cap.get("state") or {}
+            value = state.get("value")
+
+            if cap_type == "devices.capabilities.online":
+                self.online = bool(value)
+
+            elif cap_type == "devices.capabilities.on_off":
+                if instance == "powerSwitch":
+                    self.power_state = bool(value)
+
+            elif cap_type == "devices.capabilities.range":
+                if instance == "brightness":
+                    parsed_brightness = _coerce_int(value)
+                    self.brightness = parsed_brightness if parsed_brightness is not None else 100
+                elif instance == "humidity":
+                    # Dehumidifier configured setpoint (H7152, issue #114).
+                    parsed_humidity = _coerce_int(value)
+                    if parsed_humidity is not None:
+                        self.configured_humidity = parsed_humidity
+
+            elif cap_type == "devices.capabilities.color_setting":
+                if instance == "colorRgb":
+                    if isinstance(value, int):
+                        self.color = RGBColor.from_packed_int(value)
+                    elif isinstance(value, dict):
+                        self.color = RGBColor.from_dict(value)
+                elif instance == "colorTemperatureK":
+                    self.color_temp_kelvin = _coerce_int(value) or None
+
+            elif cap_type == "devices.capabilities.toggle":
+                if instance == "oscillationToggle":
+                    self.oscillating = bool(value)
+                elif instance == "dreamViewToggle":
+                    self.dreamview_enabled = bool(value)
+                else:
+                    # Generic toggles (e.g. socketToggle1/2 on the H5089) that
+                    # report a live 0/1 value. Skip "" (offline / no value) so
+                    # the last-known state is preserved (issue #114).
+                    parsed_toggle = _coerce_int(value)
+                    if parsed_toggle is not None:
+                        self.toggles[instance] = bool(parsed_toggle)
+
+            elif cap_type == "devices.capabilities.work_mode":
+                if instance == "workMode" and isinstance(value, dict):
+                    self.work_mode = value.get("workMode")
+                    self.mode_value = value.get("modeValue")
+
+            elif cap_type == "devices.capabilities.mode":
+                if instance == "hdmiSource":
+                    self.hdmi_source = _coerce_int(value)
+                elif instance == "presetScene":
+                    self.preset_scene = _coerce_int(value)
+                elif instance == "nightlightScene":
+                    # Appliance nightlight named scene (H5089/H7124, #114).
+                    parsed_ns = _coerce_int(value)
+                    if parsed_ns is not None:
+                        self.nightlight_scene = parsed_ns
+
+            elif cap_type == "devices.capabilities.property":
+                # Read-only sensor properties on devices like H5109 and
+                # H5179 (issue #62). The state shape varies by SKU — some
+                # return a plain number under "value", others return a
+                # STRUCT. Accept both, plus the legacy "currentX" field
+                # naming used by older WiFi sensors.
+                if instance == "sensorTemperature":
+                    parsed = _coerce_sensor_value(value, _SENSOR_TEMPERATURE_STRUCT_KEYS)
+                    if parsed is not None:
+                        self.sensor_temperature = parsed
+                elif instance == "sensorHumidity":
+                    parsed = _coerce_sensor_value(value, _SENSOR_HUMIDITY_STRUCT_KEYS)
+                    if parsed is not None:
+                        self.sensor_humidity = parsed
+                elif instance == "airQuality":
+                    # Read-only air-quality index (H5106/H7124/H7126, #114).
+                    parsed_aq = _coerce_int(value)
+                    if parsed_aq is not None:
+                        self.air_quality = parsed_aq
+                elif instance == "filterLifeTime":
+                    # Read-only remaining filter life % (air purifiers, #114).
+                    parsed_fl = _coerce_int(value)
+                    if parsed_fl is not None:
+                        self.filter_life = parsed_fl
+                elif instance == "carbonDioxideConcentration":
+                    # Read-only CO₂ concentration in ppm (H5140, #117).
+                    parsed_co2 = _coerce_int(value)
+                    if parsed_co2 is not None:
+                        self.carbon_dioxide = parsed_co2
+
+            elif cap_type == "devices.capabilities.dynamic_scene":
+                if instance == "snapshot":
+                    # Saved snapshot recall (H1310 etc., #114). Often "" on
+                    # poll, so the select also tracks it optimistically.
+                    parsed_snap = _coerce_int(value)
+                    if parsed_snap is not None:
+                        self.active_snapshot = parsed_snap
+
+            elif cap_type == "devices.capabilities.event":
+                # Event capabilities (e.g. waterFullEvent) report a boolean-
+                # ish value when the event is active. Some backends also
+                # nest it under a STRUCT; accept either shape.
+                if instance == "waterFullEvent":
+                    if isinstance(value, dict):
+                        self.water_full = bool(value.get("state") or value.get("value"))
+                    elif value is not None:
+                        self.water_full = bool(value)
+                elif instance == "bodyAppearedEvent":
+                    # H5054 water-leak detector trip (issue #62).
+                    if isinstance(value, dict):
+                        self.water_leak = bool(value.get("state") or value.get("value"))
+                    elif value is not None:
+                        self.water_leak = bool(value)
+                    # H5127 mmWave presence sensor rides the SAME instance but
+                    # encodes option value 1=Presence / 2=Absence (issue #124).
+                    # A device is only ever a leak OR a presence sensor, so
+                    # populating both fields never conflicts — the right entity
+                    # reads the right field.
+                    raw_ev = value.get("value", value.get("state")) if isinstance(value, dict) else value
+                    num_ev = _coerce_int(raw_ev)
+                    if num_ev in (1, 2):
+                        self.presence = num_ev == 1
+
+            elif cap_type == "devices.capabilities.temperature_setting":
+                # Any temperature_setting STRUCT may declare the unit the
+                # device is working in, whatever the instance is called.
+                # Heaters use ``targetTemperature``; the H7170 kettle uses
+                # ``sliderTemperature`` and carries the same
+                # ``{"unit": ..., "targetTemperature": ...}`` shape. Reading
+                # the hint only from the heater instance left the kettle
+                # falling through to the SKU allowlist, which converted an
+                # already-Fahrenheit sensorTemperature a second time — 77 °F
+                # surfaced as 170.6 °F (issue #171).
+                unit = value.get("unit") if isinstance(value, dict) else None
+                if isinstance(unit, str) and unit:
+                    self.device_temperature_unit = unit
+                # Kettle setpoint, e.g. {"unit": "Fahrenheit", "targetTemperature": 176}.
+                if instance == "sliderTemperature" and isinstance(value, dict):
+                    slider = value.get("targetTemperature", value.get("temperature"))
+                    parsed_slider = _coerce_sensor_value(slider, ())
+                    if parsed_slider is not None:
+                        self.kettle_target_temperature = parsed_slider
+
+                # Heaters report target temperature + autoStop in a STRUCT.
+                # Capturing autoStop here lets temperature-change commands
+                # preserve the user's choice instead of resetting it to 0
+                # (issue #29).
+                if instance == "targetTemperature" and isinstance(value, dict):
+                    # The capability definition names the field ``temperature``
+                    # (and commands are sent that way), but the polled STATE
+                    # carries it as ``targetTemperature`` on devices like the
+                    # H713B — accept both shapes (issue #129).
+                    temp_val = value.get("temperature")
+                    if temp_val is None:
+                        temp_val = value.get("targetTemperature")
+                    if temp_val is not None:
+                        try:
+                            temp_int = int(temp_val)
+                        except (TypeError, ValueError):
+                            pass
+                        else:
+                            # heater_temperature is canonical °C (commands are
+                            # always sent with unit=Celsius) — normalize a
+                            # Fahrenheit-reporting device on read (issue #129).
+                            if isinstance(unit, str) and unit.lower() == "fahrenheit":
+                                temp_int = round((temp_int - 32) * 5 / 9)
+                            self.heater_temperature = temp_int
+                    auto_stop = value.get("autoStop")
+                    if auto_stop is not None:
+                        try:
+                            self.heater_auto_stop = int(auto_stop)
+                        except (TypeError, ValueError):
+                            pass
+
+    def update_from_mqtt(self, data: dict[str, Any], *, ceiling_fan: bool = False) -> None:
+        """Update state from MQTT push message.
+
+        MQTT format differs from REST API - uses onOff/brightness/color keys.
+
+        Args:
+            data: State dict from MQTT message.
+            ceiling_fan: The device is a ceiling-fan-with-light combo
+                (H1310/H1370). On those the device-wide ``onOff`` is the
+                whole unit having power — a fan reporting ``onOff: 1`` has
+                been captured with both lights AND the fan off in the same
+                status (homebridge-govee #1352) — so it must not speak for
+                the light. The lights' state comes from the ``aa 42`` /
+                ``aa 36`` frames via :meth:`update_ceiling_fan_from_frames`
+                instead (issue #181: switching the fan on lit the light
+                entity until the next poll).
+        """
+        self.source = "mqtt"
+
+        # Receiving an AWS IoT push from the device is direct proof of life.
+        # The Govee cloud's `online` flag can lag for many minutes after a
+        # power-cycle (issue #68); using the MQTT signal lets HA recover
+        # availability immediately without waiting for the cloud to catch up.
+        self.online = True
+
+        if "onOff" in data and not ceiling_fan:
+            self.power_state = bool(data["onOff"])
+            if not self.power_state:
+                # Music mode ends with power (#286)
+                self.music_mode_enabled = False
+                self.music_mode_value = None
+                self.music_mode_name = None
+
+        if "brightness" in data:
+            parsed_brightness = _coerce_int(data["brightness"])
+            if parsed_brightness is not None:
+                self.brightness = parsed_brightness
+
+        if "color" in data:
+            color_data = data["color"]
+            if isinstance(color_data, dict):
+                self.color = RGBColor.from_dict(color_data)
+            elif isinstance(color_data, int):
+                self.color = RGBColor.from_packed_int(color_data)
+
+        if "colorTemInKelvin" in data:
+            temp = data["colorTemInKelvin"]
+            self.color_temp_kelvin = _coerce_int(temp) or None
+
+        # Stand-alone thermometer/hygrometer readings (H5179, H5109, H5110,
+        # HS5108, HS5106). The mqtt.py docstring notes AWS IoT pushes carry
+        # temperature, but the flat-key spelling is undocumented — accept the
+        # known instance/short names. Without this the push was silently
+        # dropped and the entity only ever showed its first REST read (#83).
+        for key in _SENSOR_TEMPERATURE_MQTT_KEYS:
+            if key in data:
+                parsed = _coerce_sensor_value(data[key], _SENSOR_TEMPERATURE_STRUCT_KEYS)
+                if parsed is not None:
+                    self.sensor_temperature = parsed
+                    break
+        for key in _SENSOR_HUMIDITY_MQTT_KEYS:
+            if key in data:
+                parsed = _coerce_sensor_value(data[key], _SENSOR_HUMIDITY_STRUCT_KEYS)
+                if parsed is not None:
+                    self.sensor_humidity = parsed
+                    break
+
+        # mmWave presence (H5127) pushes a ``status`` message carrying
+        # ``triSta`` in the state object: 1 = present, 0 = absent (confirmed
+        # against the Govee app journal, issue #124). This is the only channel
+        # that delivers occupancy — the developer poll returns only ``online``.
+        if "triSta" in data:
+            parsed_tri = _coerce_int(data["triSta"])
+            if parsed_tri is not None:
+                self.presence = parsed_tri == 1
+
+        # A confirmed push ends the optimistic grace window — from this point
+        # on API polls are authoritative again for power/brightness.
+        self.clear_optimistic_window()
+
+    def update_light_zones_from_frames(self, frames: Iterable[bytes]) -> bool:
+        """Apply the Ceiling Light Pro's ``aa 30 <main> <ring>`` zone frame (H1252, #223).
+
+        Byte 2 is ``01`` while the main panel is lit, byte 3 while the RGBIC
+        ring is. The Developer API returns ``""`` for both toggles on poll,
+        so this frame is the only live source. Only a full 20-byte frame
+        with a valid XOR checksum counts. The device-wide ``onOff`` is left
+        alone: the zones were only verified with the fixture powered.
+
+        Args:
+            frames: Decoded (not base64) frames from ``op.command``.
+
+        Returns:
+            True if the zone frame was recognised.
+        """
+        for raw in frames:
+            if len(raw) != 20 or raw[0] != 0xAA or raw[1] != 0x30:
+                continue
+            checksum = 0
+            for byte in raw[:19]:
+                checksum ^= byte
+            if checksum != raw[19]:
+                continue
+            self.toggles["mainLightToggle"] = raw[2] == 0x01
+            self.toggles["backgroundLightToggle"] = raw[3] == 0x01
+            return True
+        return False
+
+    def update_dreamview_from_frames(self, frames: Iterable[bytes]) -> bool:
+        """Apply the light's own ``aa 05 <mode>`` mode report to DreamView (H66A0, #213).
+
+        Mode ``00`` is video mode (DreamView sync); any other mode means
+        something else is running. The Developer API never returns this, and
+        HA's optimistic ON is otherwise kept across polls, so the device's
+        report is the only way to see a sync started or stopped in the app.
+        Only a full 20-byte frame with a valid XOR checksum counts.
+
+        Args:
+            frames: Decoded (not base64) frames from ``op.command``.
+
+        Returns:
+            True if ``dreamview_enabled`` changed.
+        """
+        for raw in frames:
+            if len(raw) != 20 or raw[0] != 0xAA or raw[1] != 0x05:
+                continue
+            checksum = 0
+            for byte in raw[:19]:
+                checksum ^= byte
+            if checksum != raw[19]:
+                continue
+            enabled = raw[2] == 0x00
+            changed = self.dreamview_enabled != enabled
+            self.dreamview_enabled = enabled
+            return changed
+        return False
+
+    def update_ceiling_fan_from_frames(self, frames: Iterable[bytes]) -> bool:
+        """Apply the status frames a ceiling-fan combo carries in its AWS push.
+
+        The H1310/R1310/H1370 report the integrated fan and the two lights as
+        BLE-format frames in the push's ``op.command`` list, never in the
+        flat ``state`` keys and never in the Developer API poll. Layouts,
+        from labelled captures on real units (homebridge-govee
+        ``fan-ceiling.js``, issues #1352/#1358):
+
+        - ``aa 31 <running> <speed> <direction> .. .. <swing>`` — byte 2 is
+          ``01`` while the fan turns, byte 3 the speed step, byte 4 ``01``
+          when airflow is reversed (``reverseAirflowToggle`` on), byte 7
+          ``01`` while oscillating (H1370 only; the H1310 cannot).
+        - ``aa 42 <mask>`` — bit 0x40 main light, 0x20 background light,
+          0x80 set whenever either is lit.
+        - ``aa 36 <main> <background>`` — one byte per light, same fact.
+
+        The lights' frames also decide the light entity's ``power_state``
+        (either light lit), since the device-wide ``onOff`` does not.
+
+        Args:
+            frames: Decoded (not base64) frames from ``op.command``.
+
+        Returns:
+            True if at least one frame was recognised.
+        """
+        recognised = False
+        for raw in frames:
+            if len(raw) < 3 or raw[0] != 0xAA:
+                continue
+            opcode = raw[1]
+            if opcode == 0x31 and len(raw) >= 5:
+                self.ceiling_fan_on = raw[2] == 0x01
+                if raw[3] > 0:
+                    self.ceiling_fan_speed = raw[3]
+                self.ceiling_fan_reverse = raw[4] == 0x01
+                if len(raw) >= 8:
+                    self.ceiling_fan_swing = raw[7] == 0x01
+                recognised = True
+            elif opcode == 0x42:
+                mask = raw[2]
+                self._apply_ceiling_fan_lights(
+                    main=bool(mask & 0x40),
+                    background=bool(mask & 0x20),
+                    any_lit=bool(mask & 0x80) or bool(mask & 0x60),
+                )
+                recognised = True
+            elif opcode == 0x36 and len(raw) >= 4:
+                main = raw[2] == 0x01
+                background = raw[3] == 0x01
+                self._apply_ceiling_fan_lights(main=main, background=background, any_lit=main or background)
+                recognised = True
+        return recognised
+
+    def _apply_ceiling_fan_lights(self, *, main: bool, background: bool, any_lit: bool) -> None:
+        """Store the two named-light toggles and derive the light's power from them."""
+        # Same instance names the Developer API uses for the toggles
+        # (models.device INSTANCE_MAIN_LIGHT_TOGGLE / _BACKGROUND_LIGHT_TOGGLE);
+        # the named-light switches read these when present.
+        self.toggles["mainLightToggle"] = main
+        self.toggles["backgroundLightToggle"] = background
+        self.power_state = any_lit
+
+    def update_temperature_from_frames(self, frames: Iterable[bytes]) -> bool:
+        """Apply the live temperature and humidity readings a pump-model
+        dehumidifier (H7152) carries in its AWS IoT push.
+
+        The H7152 has no ``sensorTemperature``/``sensorHumidity`` capability
+        at all (confirmed: absent from the discovered capabilities list even
+        though the app shows live readings for both) — the app's ambient
+        readout is BLE-adjacent but reachable remotely, so it travels over
+        this same AWS IoT push, not local BLE (issue #114 follow-up).
+
+        The ``aa 10 81`` frame in ``op.command`` is the app's own BLE status
+        frame (opcode ``0x10``, sub-type ``0x81``, decoded app-side into a
+        ``ThermometerInfo``): bytes 3-5 are a single big-endian 3-byte
+        packed value, temperature and humidity each x10 and concatenated
+        (``temp_decidegrees * 1000 + humidity_decipercent``)::
+
+            raw = (frame[3] << 16) | (frame[4] << 8) | frame[5]
+            temperature_c = (raw // 1000) / 10.0
+            humidity_pct = (raw % 1000) / 10.0
+
+        Byte 3 is part of this packed value, not a fixed header byte — it
+        happens to read ``0x03`` across every captured sample because they
+        all fall in the ~19.7-26.2 degC room-temperature band, where that's
+        the packed value's high byte. Matching on it would silently stop
+        decoding outside that band, so the frame is identified by the
+        3-byte ``aa 10 81`` prefix alone.
+
+        Confirmed against real capture pairs spanning 20.9-22.4 degC with
+        zero residual error against the app's own displayed temperature and
+        humidity alike.
+
+        Args:
+            frames: Decoded (not base64) frames from ``op.command``.
+
+        Returns:
+            True if the frame was recognised.
+        """
+        for raw in frames:
+            if len(raw) >= 6 and raw[0] == 0xAA and raw[1] == 0x10 and raw[2] == 0x81:
+                packed = (raw[3] << 16) | (raw[4] << 8) | raw[5]
+                self.sensor_temperature = round((packed // 1000) / 10.0, 1)
+                self.sensor_humidity = round((packed % 1000) / 10.0, 1)
+                return True
+        return False
+
+    def update_from_lan(self, data: LanDevStatusLike, *, skip_power_brightness: bool = False) -> None:
+        """Overlay a Govee LAN ``devStatus`` reply onto the existing state.
+
+        A hardened sibling of :meth:`update_from_mqtt`. The Govee LAN protocol
+        exposes only four readable fields (onOff, brightness 0-100, color RGB,
+        colorTemInKelvin), so this method mutates ONLY ``power_state`` /
+        ``brightness`` / ``color`` / ``color_temp_kelvin`` and leaves every
+        other field (scenes, segments, sensors, heater, music, …) untouched by
+        simply not referencing it — the same in-place mechanism that keeps the
+        MQTT overlay safe.
+
+        Unlike the MQTT overlay it applies three guards the LAN data ceiling
+        forces:
+
+        * **Mode-aware** — while a scene, DIY scene, music mode, or DreamView
+          is active, ``color``/``color_temp_kelvin`` are NOT written (and
+          brightness is skipped too). LAN reports the live, non-zero per-frame
+          RGB of a running effect, so writing it would churn the color
+          attribute and flip the color mode every poll even though
+          ``active_scene`` itself is preserved. Color/CT are only adopted in a
+          plain RGB/CT mode.
+        * **{0,0,0} sentinel** — an incoming color that packs to 0 never
+          overwrites a real, non-zero ``color`` (mirrors the cloud-poll guard).
+        * **color/color_temp mutual exclusion** — ``devStatus`` carries both,
+          so a non-zero ``colorTemInKelvin`` adopts color temp and clears
+          ``color``; otherwise a non-zero color adopts ``color`` and clears
+          color temp. This stops per-poll RGB↔CT flapping.
+
+        Brightness is written DEVICE-NATIVE; the caller rescales the LAN 0-100
+        value into the device's brightness range before calling.
+
+        Args:
+            data: Parsed LAN ``devStatus`` exposing ``on`` (bool|None),
+                ``brightness`` (device-native int|None), ``color``
+                (RGBColor|None), and ``color_temp_kelvin`` (int|None).
+            skip_power_brightness: When True (the coordinator's optimistic
+                grace window) skip writing power/brightness AND preserve the
+                in-flight optimistic window — ``clear_optimistic_window`` is
+                NOT called.
+        """
+        # A devStatus reply is direct proof of life, mirroring update_from_mqtt
+        # and the BLE online-flip — flip availability immediately. But DO NOT
+        # stamp source="lan" during the optimistic grace window: the coordinator
+        # gates the window on source == "optimistic", so overwriting it here
+        # would end grace after the first read and let a later read in the same
+        # window revert the in-flight power/brightness. The cloud poll keeps the
+        # optimistic marker alive during grace for exactly this reason (#57).
+        self.online = True
+        if not skip_power_brightness:
+            self.source = "lan"
+
+        # An active effect (scene/DIY/music/DreamView) means the readable
+        # color/brightness no longer describe a static state — only power stays
+        # meaningful, so skip the rest to avoid per-poll churn.
+        in_effect = bool(
+            self.active_scene or self.active_diy_scene or self.music_mode_enabled or self.dreamview_enabled
+        )
+
+        if not skip_power_brightness:
+            if data.on is not None:
+                self.power_state = data.on
+            # Brightness is meaningless mid-effect, so only adopt it in a plain
+            # mode (and never during the optimistic grace window above).
+            if not in_effect and data.brightness is not None:
+                self.brightness = data.brightness
+
+        # Color / color temp are only trustworthy in a plain RGB/CT mode.
+        if not in_effect:
+            ct = data.color_temp_kelvin
+            incoming_color = data.color
+            if ct is not None and ct > 0:
+                # CT mode: adopt color temp, clear RGB (mutual exclusion).
+                self.color_temp_kelvin = ct
+                self.color = None
+            elif incoming_color is not None and incoming_color.as_packed_int != 0:
+                # RGB mode: adopt color, clear CT (mutual exclusion).
+                self.color = incoming_color
+                self.color_temp_kelvin = None
+            # else: incoming color is absent or the {0,0,0} sentinel — leave the
+            # existing color/color_temp untouched so a transient 0 frame can't
+            # erase a real color.
+
+        # Outside the grace window a confirmed read is authoritative again, so
+        # end the optimistic period (matches update_from_mqtt). During grace,
+        # leave it intact so an in-flight command isn't prematurely overwritten.
+        if not skip_power_brightness:
+            self.clear_optimistic_window()
+
+    def apply_optimistic_power(self, power_on: bool) -> None:
+        """Apply optimistic power state update."""
+        self.power_state = power_on
+        self._stamp_optimistic()
+        if not power_on:
+            # Music mode ends with power (#286)
+            self.music_mode_enabled = False
+            self.music_mode_value = None
+            self.music_mode_name = None
+
+    def apply_optimistic_brightness(self, brightness: int) -> None:
+        """Apply optimistic brightness update."""
+        self.brightness = brightness
+        self._stamp_optimistic()
+
+    def apply_optimistic_color(self, color: RGBColor) -> None:
+        """Apply optimistic color update."""
+        self.color = color
+        self.color_temp_kelvin = None  # RGB mode
+        self._stamp_optimistic()
+        # Setting a color overrides any running scene, DIY scenes included.
+        # A stale active_diy_scene would keep the light's effect and the DIY
+        # select showing the scene, and make LAN reads ignore the new color.
+        self.active_scene = None
+        self.active_scene_name = None
+        # ...and music mode (#286)
+        self.music_mode_enabled = False
+        self.music_mode_value = None
+        self.music_mode_name = None
+        self.active_diy_scene = None
+
+    def apply_optimistic_color_temp(self, kelvin: int) -> None:
+        """Apply optimistic color temperature update."""
+        self.color_temp_kelvin = kelvin
+        self.color = None  # Color temp mode
+        self._stamp_optimistic()
+        # Setting color temp overrides any running scene, DIY scenes included
+        # (same reasons as apply_optimistic_color)
+        self.active_scene = None
+        self.active_scene_name = None
+        # ...and music mode (#286)
+        self.music_mode_enabled = False
+        self.music_mode_value = None
+        self.music_mode_name = None
+        self.active_diy_scene = None
+
+    def apply_optimistic_scene(self, scene_id: str, scene_name: str | None = None) -> None:
+        """Apply optimistic scene activation.
+
+        Scenes, Music Mode, and DreamView are mutually exclusive.
+        When a Scene is activated, DreamView, music mode, and DIY scene are cleared.
+        """
+        self.active_scene = scene_id
+        self.active_scene_name = scene_name
+        self.last_scene_id = scene_id
+        self.last_scene_name = scene_name
+        self._stamp_optimistic()
+        # Save current color/color_temp before clearing so we can restore on scene clear.
+        # Only save when a value exists so scene A → scene B → clear restores pre-A color.
+        # Skip RGBColor(0,0,0) — the API returns colorRgb=0 when a scene is running,
+        # which is not a meaningful color to restore.
+        if self.color is not None and self.color.as_packed_int != 0:
+            self.last_color = self.color
+            self.last_color_temp_kelvin = None
+        elif self.color_temp_kelvin is not None:
+            self.last_color_temp_kelvin = self.color_temp_kelvin
+            self.last_color = None
+        # Clear stale color — scenes run dynamic patterns, no single color is accurate
+        self.color = None
+        self.color_temp_kelvin = None
+        # Mutual exclusion: clear other modes when activating scene
+        self.dreamview_enabled = False
+        self.music_mode_enabled = False
+        self.music_mode_value = None
+        self.music_mode_name = None
+        self.active_diy_scene = None
+
+    def apply_optimistic_diy_scene(self, scene_id: str) -> None:
+        """Apply optimistic DIY scene activation.
+
+        DIY Scenes, regular Scenes, Music Mode, and DreamView are mutually exclusive.
+        When a DIY Scene is activated, DreamView, music mode, and regular scene are cleared.
+        """
+        self.active_diy_scene = scene_id
+        self._stamp_optimistic()
+        # Save current color/color_temp before clearing (same logic as regular scenes)
+        if self.color is not None and self.color.as_packed_int != 0:
+            self.last_color = self.color
+            self.last_color_temp_kelvin = None
+        elif self.color_temp_kelvin is not None:
+            self.last_color_temp_kelvin = self.color_temp_kelvin
+            self.last_color = None
+        # Mutual exclusion: clear other modes when activating DIY scene
+        self.dreamview_enabled = False
+        self.music_mode_enabled = False
+        self.music_mode_value = None
+        self.music_mode_name = None
+        self.active_scene = None
+        self.active_scene_name = None
+
+    def apply_optimistic_diy_style(self, style: str, style_value: int | None = None) -> None:
+        """Apply optimistic DIY style update.
+
+        Args:
+            style: Style name (Fade, Jumping, Flicker, Marquee, Music).
+            style_value: Style numeric value (0-4). If None, will be looked up.
+        """
+        self.diy_style = style
+        self.diy_style_value = style_value
+        self._stamp_optimistic()
+
+    def apply_optimistic_music_mode(self, enabled: bool) -> None:
+        """Apply optimistic music mode update (legacy BLE).
+
+        Music Mode, DreamView, and Scenes are mutually exclusive.
+        When Music Mode is enabled, DreamView and scenes are cleared.
+        """
+        self.music_mode_enabled = enabled
+        self._stamp_optimistic()
+        # Mutual exclusion: clear other modes when enabling music mode
+        if enabled:
+            self.dreamview_enabled = False
+            self.active_scene = None
+            self.active_scene_name = None
+            self.active_diy_scene = None
+
+    def apply_optimistic_music_mode_struct(
+        self,
+        music_mode: int,
+        sensitivity: int,
+        mode_name: str | None = None,
+    ) -> None:
+        """Apply optimistic music mode update (STRUCT-based REST API).
+
+        Music Mode, DreamView, and Scenes are mutually exclusive.
+        When Music Mode is enabled, DreamView and active scene are cleared.
+
+        Args:
+            music_mode: Music mode value (1-11).
+            sensitivity: Microphone sensitivity (0-100).
+            mode_name: Optional display name for the mode.
+        """
+        self.music_mode_value = music_mode
+        self.music_sensitivity = sensitivity
+        self.music_mode_name = mode_name
+        self.music_mode_enabled = True  # Also set enabled for switch state
+        self._stamp_optimistic()
+        # Mutual exclusion: clear other modes when enabling music mode
+        self.dreamview_enabled = False
+        self.active_scene = None
+        self.active_scene_name = None
+        self.active_diy_scene = None
+
+    def apply_optimistic_oscillation(self, oscillating: bool) -> None:
+        """Apply optimistic oscillation update (fans)."""
+        self.oscillating = oscillating
+        self._stamp_optimistic()
+
+    def apply_optimistic_work_mode(self, work_mode: int, mode_value: int) -> None:
+        """Apply optimistic work mode update (fans)."""
+        self.work_mode = work_mode
+        self.mode_value = mode_value
+        self._stamp_optimistic()
+
+    def apply_optimistic_hdmi_source(self, source: int) -> None:
+        """Apply optimistic HDMI source update."""
+        self.hdmi_source = source
+        self._stamp_optimistic()
+
+    def apply_optimistic_dreamview(self, enabled: bool) -> None:
+        """Apply optimistic DreamView (Movie Mode) update.
+
+        DreamView, Music Mode, and Scenes are mutually exclusive.
+        When DreamView is enabled, music mode and scenes are cleared.
+        """
+        self.dreamview_enabled = enabled
+        self._stamp_optimistic()
+        # Mutual exclusion: clear other modes when enabling DreamView
+        if enabled:
+            self.music_mode_enabled = False
+            self.music_mode_value = None
+            self.music_mode_name = None
+            self.active_scene = None
+            self.active_scene_name = None
+            self.active_diy_scene = None
+
+    def update_pump_state_from_frames(self, frames: Iterable[bytes]) -> bool:
+        """Apply the pump-fault flag an H7152 carries in its AWS IoT push.
+
+        Reverse-engineered from a live clogged-drain capture: the app's
+        pump-fault alert corresponds to byte offset 12 of an ``aa 17``
+        status frame in the push's ``op.command`` list — ``0x00`` normally,
+        ``0x01`` while the fault is active, back to ``0x00`` once it clears.
+        Confirmed against three captures (before / during / after an actual
+        fault) with the checksum consistent across all three, and stable at
+        ``0x00`` across unrelated mode changes in between. Also confirmed
+        live against two independent real-world faults caught by the shipped
+        sensor, one of which lined up with Home Assistant's own recorded
+        state-transition timestamp to the second.
+
+        Args:
+            frames: Decoded (not base64) frames from ``op.command``.
+
+        Returns:
+            True if the frame was recognised.
+        """
+        for raw in frames:
+            if len(raw) >= 13 and raw[0] == 0xAA and raw[1] == 0x17:
+                self.pump_state = raw[12] == 0x01
+                return True
+        return False
+
+    def update_dehumidifier_mode_from_frames(self, frames: Iterable[bytes]) -> bool:
+        """Apply hose-connection mode from an H7152's AWS IoT ``aa 19``
+        status frame.
+
+        Reverse-engineered from a live test pressing and holding the
+        device's own hose-connection button repeatedly (~5s per hold):
+        byte offset 9 toggled in exact lockstep with the app's Mode label on
+        every single press, in both directions — ``0x01`` while the drain
+        hose reads as connected ("Pump Mode"), ``0x00`` once it doesn't
+        ("Water Tank Mode").
+
+        Args:
+            frames: Decoded (not base64) frames from ``op.command``.
+
+        Returns:
+            True if the frame was recognised.
+        """
+        for raw in frames:
+            if len(raw) >= 10 and raw[0] == 0xAA and raw[1] == 0x19:
+                self.dehumidifier_mode = "pump" if raw[9] == 0x01 else "tank"
+                return True
+        return False
+
+    def update_power_monitoring_from_frames(self, frames: Iterable[bytes], sta: Any = None) -> bool:
+        """Apply live power-monitoring readings from a smart outlet's (H5086)
+        AWS IoT ``aa 19`` status frame.
+
+        Register ``0x19`` is shared with the H7152's hose-connection mode
+        (:meth:`update_dehumidifier_mode_from_frames`) — an entirely
+        different device family with an entirely different frame layout on
+        the same register number. Safe only because the coordinator gates
+        each decoder to its own SKU set before ever calling it.
+
+        Byte layout, reverse-engineered against
+        https://github.com/egold555/Govee-Reverse-Engineering/blob/master/Products/H5086.md
+        and confirmed against the Govee app on two independent H5086 units
+        across all five fields (issue #200)::
+
+            offset 2-4   uint24  seconds powered on today (resets at midnight)
+            offset 5-7   uint24  energy used today, tenths of a Wh (resets at midnight)
+            offset 8-9   uint16  voltage, hundredths of a volt
+            offset 10-11 uint16  current, hundredths of an amp
+            offset 12-14 uint24  power, hundredths of a watt
+            offset 15    uint8   power factor, percent
+
+        The frame carries no XOR checksum consistent with the probe
+        thermometer's convention (byte 19 was ``0x00`` in both captures), so
+        none is checked here.
+
+        The plug's uptime comes along in the push's ``sta`` field, which
+        lets the energy sensor tell a reboot from a reset (see
+        :mod:`.energy_counter`). Replies to another client's status query
+        are ignored, as they can carry a bogus energy counter; our next
+        query gets the real readings.
+
+        Args:
+            frames: Decoded (not base64) frames from ``op.command``.
+            sta: The push's ``sta`` field.
+
+        Returns:
+            True if the frame was recognised.
+        """
+        if answers_other_client(sta):
+            return False
+        for raw in frames:
+            if len(raw) >= 16 and raw[0] == 0xAA and raw[1] == 0x19:
+                self.on_time = int.from_bytes(raw[2:5], "big")
+                self.uptime = uptime_from_sta(sta)
+                self.energy_total = round(int.from_bytes(raw[5:8], "big") / 10000.0, 4)
+                self.voltage = round(int.from_bytes(raw[8:10], "big") / 100.0, 2)
+                self.current = round(int.from_bytes(raw[10:12], "big") / 100.0, 2)
+                self.power_draw = round(int.from_bytes(raw[12:15], "big") / 100.0, 2)
+                self.power_factor = raw[15]
+                return True
+        return False
+
+    def update_pm25_from_frames(self, frames: Iterable[bytes]) -> bool:
+        """Apply live temperature/humidity/PM2.5 from an H5106 AQI monitor's
+        AWS IoT push (issue #200).
+
+        Unlike every other frame this module decodes, this one carries no
+        ``0xAA``/register-byte prefix to key on at all — reverse-engineered
+        from homebridge-govee's ``sensor-monitor.js``, which identifies the
+        useful frame by ruling out a fixed list of known boilerplate/settings
+        prefixes (``0000``, ``0003``, ``0100``, ``0101``, ``0102``, ``0103``,
+        ``331a``, ``3315``, ``aa0d``, ``aa0e``) rather than matching one in.
+        That is a weaker identification than this module uses everywhere
+        else, so a physical-plausibility check on the decoded temperature and
+        humidity guards against a frame this integration has never seen
+        being misread as a reading.
+
+        Confirmed against the Govee app on two independent H5106 units, all
+        three fields matching on each: 19.00 degC/54.2%/1 ug/m3, and 25.10
+        degC/54.8%/0 ug/m3.
+
+        Byte layout (20-byte frame, no XOR checksum found)::
+
+            offset 0-1   int16   temperature, hundredths of a degree Celsius
+            offset 9-10  uint16  relative humidity, hundredths of a percent
+            offset 18-19 uint16  PM2.5, micrograms per cubic meter
+
+        Args:
+            frames: Decoded (not base64) frames from ``op.command``.
+
+        Returns:
+            True if a frame was recognised and passed the plausibility check.
+        """
+        for raw in frames:
+            if len(raw) != 20 or raw[:2].hex() in _PM25_FRAME_IGNORED_PREFIXES:
+                continue
+            temp = int.from_bytes(raw[0:2], "big", signed=True) / 100.0
+            humidity = int.from_bytes(raw[9:11], "big") / 100.0
+            if not (-40.0 <= temp <= 125.0) or not (0.0 <= humidity <= 100.0):
+                continue
+            self.sensor_temperature = round(temp, 1)
+            self.sensor_humidity = round(humidity, 1)
+            self.pm25 = int.from_bytes(raw[18:20], "big")
+            return True
+        return False
+
+    @classmethod
+    def create_empty(cls, device_id: str) -> GoveeDeviceState:
+        """Create empty state for a device."""
+        return cls(device_id=device_id)

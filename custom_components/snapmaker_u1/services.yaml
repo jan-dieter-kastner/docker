@@ -1,0 +1,113 @@
+execute_gcode:
+  name: Execute G-code
+  description: >
+    Send a raw G-code command or macro to the Snapmaker U1.
+  fields:
+    config_entry_id:
+      name: Config Entry
+      description: The config entry ID for the printer you want to control.
+      required: true
+      selector:
+        config_entry:
+          integration: snapmaker_u1
+    script:
+      name: G-code script
+      description: The G-code command or macro to execute (e.g. "G28 X Y" or "BED_MESH_CALIBRATE").
+      required: true
+      example: "G28"
+      selector:
+        text:
+
+set_bed_temperature:
+  name: Set bed temperature
+  description: Set the heated bed target temperature.
+  fields:
+    config_entry_id:
+      name: Config Entry
+      description: The config entry ID for the printer.
+      required: true
+      selector:
+        config_entry:
+          integration: snapmaker_u1
+    temperature:
+      name: Temperature
+      description: Target temperature in °C. Use 0 to turn off.
+      required: true
+      example: 60
+      selector:
+        number:
+          min: 0
+          max: 120
+          unit_of_measurement: "°C"
+
+set_nozzle_temperature:
+  name: Set nozzle temperature
+  description: Set a nozzle (extruder) target temperature.
+  fields:
+    config_entry_id:
+      name: Config Entry
+      description: The config entry ID for the printer.
+      required: true
+      selector:
+        config_entry:
+          integration: snapmaker_u1
+    temperature:
+      name: Temperature
+      description: Target temperature in °C. Use 0 to turn off.
+      required: true
+      example: 215
+      selector:
+        number:
+          min: 0
+          max: 300
+          unit_of_measurement: "°C"
+    extruder_index:
+      name: Extruder index
+      description: Which nozzle to set (0 = T0, 1 = T1, etc.).
+      required: false
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 3
+          mode: box
+
+start_print:
+  name: Start print
+  description: Start printing a G-code file already on the printer's storage.
+  fields:
+    config_entry_id:
+      name: Config Entry
+      description: The config entry ID for the printer.
+      required: true
+      selector:
+        config_entry:
+          integration: snapmaker_u1
+    filename:
+      name: Filename
+      description: The name of the G-code file to print (as returned by the file list).
+      required: true
+      example: "benchy.gcode"
+      selector:
+        text:
+
+exclude_object:
+  name: Exclude object
+  description: >
+    Stop printing one labelled object of the running print (EXCLUDE_OBJECT).
+    Needs object labels from the slicer. Can't be undone for this print.
+  fields:
+    config_entry_id:
+      name: Config Entry
+      description: The config entry ID for the printer.
+      required: true
+      selector:
+        config_entry:
+          integration: snapmaker_u1
+    name:
+      name: Object name
+      description: The object's name, as listed in the Current Object sensor's "objects" attribute.
+      required: true
+      example: "PART_1.STL_ID_0_COPY_0"
+      selector:
+        text:

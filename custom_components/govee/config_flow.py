@@ -1,0 +1,1156 @@
+"""Config flow for Govee integration.
+
+Supports API key authentication with optional account login for MQTT,
+handles Govee 2FA (email verification code) when required, and provides the
+options, reauth, and reconfigure flows. Entry schema versions are migrated in
+``__init__.async_migrate_entry``.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import asdict, is_dataclass
+from typing import Any
+
+import voluptuous as vol
+from homeassistant.config_entries import (
+    SOURCE_BLUETOOTH,
+    ConfigEntry,
+    ConfigFlow,
+    ConfigFlowResult,
+    OptionsFlow,
+)
+from homeassistant.core import callback
+from homeassistant.data_entry_flow import AbortFlow
+from homeassistant.helpers import config_validation as cv, device_registry as dr, issue_registry as ir
+from homeassistant.helpers.service_info.bluetooth import BluetoothServiceInfo
+from homeassistant.helpers.selector import (
+    SelectSelector,
+    SelectSelectorConfig,
+    SelectSelectorMode,
+)
+
+from .api import (
+    Govee2FACodeInvalidError,
+    Govee2FARequiredError,
+    GoveeApiError,
+    GoveeAuthClient,
+    GoveeAuthError,
+    GoveeIotCredentials,
+    GoveeLoginRejectedError,
+    validate_govee_credentials,
+)
+from .api.auth import _derive_client_id
+from .api.client import validate_api_key
+from .kettle.labels import slot_keys, validate_slot_labels
+from .models import GoveeDevice
+from .registry import get_registry_device
+from .const import (
+    CONF_API_KEY,
+    CONF_API_TEMPERATURE_UNIT,
+    CONF_EMAIL,
+    CONF_ENABLE_DIY_SCENES,
+    CONF_ENABLE_GROUPS,
+    CONF_CONFIRM_COMMANDS,
+    CONF_ENABLE_MQTT_CONTROL,
+    CONF_ENABLE_H6104_BLE,
+    CONF_ENABLE_SCENES,
+    CONF_KETTLE_SLOT_LABELS,
+    CONF_EXPOSE_TRANSPORT_ENTITIES,
+    CONF_LAN_TARGETS,
+    CONF_MQTT_STATUS_INTERVAL,
+    CONF_PASSWORD,
+    CONF_DAILY_REQUEST_BUDGET,
+    CONF_POLL_INTERVAL,
+    CONF_PROBE_POLL_INTERVAL,
+    CONF_SEGMENT_MODE_BY_DEVICE,
+    CONF_WATER_DETECTOR_POLL_INTERVAL,
+    CONFIG_VERSION,
+    DEFAULT_API_TEMPERATURE_UNIT,
+    DEFAULT_DAILY_REQUEST_BUDGET,
+    DEFAULT_ENABLE_DIY_SCENES,
+    DEFAULT_ENABLE_GROUPS,
+    DEFAULT_CONFIRM_COMMANDS,
+    DEFAULT_ENABLE_MQTT_CONTROL,
+    DEFAULT_ENABLE_H6104_BLE,
+    DEFAULT_ENABLE_SCENES,
+    DEFAULT_EXPOSE_TRANSPORT_ENTITIES,
+    DEFAULT_LAN_TARGETS,
+    DEFAULT_MQTT_STATUS_INTERVAL,
+    DEFAULT_POLL_INTERVAL,
+    DEFAULT_PROBE_POLL_INTERVAL,
+    DEFAULT_SEGMENT_MODE,
+    DEFAULT_WATER_DETECTOR_POLL_INTERVAL,
+    DOMAIN,
+    KEY_IOT_CREDENTIALS,
+    KEY_IOT_LOGIN_FAILED,
+    MAX_MQTT_STATUS_INTERVAL,
+    MAX_DAILY_REQUEST_BUDGET,
+    MAX_POLL_INTERVAL,
+    MAX_PROBE_POLL_INTERVAL,
+    MAX_WATER_DETECTOR_POLL_INTERVAL,
+    MIN_MQTT_STATUS_INTERVAL,
+    MIN_DAILY_REQUEST_BUDGET,
+    MIN_POLL_INTERVAL,
+    MIN_PROBE_POLL_INTERVAL,
+    MIN_WATER_DETECTOR_POLL_INTERVAL,
+    MQTT_STATUS_POLL_OFF,
+    SEGMENT_MODE_BOTH,
+    SEGMENT_MODE_DISABLED,
+    SEGMENT_MODE_GROUPED,
+    SEGMENT_MODE_INDIVIDUAL,
+)
+from .api.lan import (
+    LanTargetError,
+    expand_lan_targets,
+    validate_lan_device_overrides,
+)
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def _validate_api_key_format(api_key: str) -> tuple[str, str | None]:
+    """Validate API key format before making API call.
+
+    Returns (cleaned_key, error_key or None).
+    """
+    if not api_key:
+        return api_key, "invalid_api_key_format"
+
+    cleaned = api_key.strip()
+
+    # Govee API keys are UUID format (36 chars with hyphens) or similar
+    if len(cleaned) < 36:
+        return api_key, "invalid_api_key_format"
+
+    # Check for obvious mistakes - spaces in the middle
+    if " " in cleaned:
+        return api_key, "invalid_api_key_format"
+
+    return cleaned, None
+
+
+class GoveeConfigFlow(ConfigFlow, domain=DOMAIN):
+    """Handle a config flow for Govee.
+
+    Steps:
+    1. User enters API key (required)
+    2. Optionally enter email/password for MQTT real-time updates
+    3. Create config entry
+    """
+
+    VERSION = CONFIG_VERSION
+
+    def __init__(self) -> None:
+        """Initialize the config flow."""
+        self._api_key: str | None = None
+        self._email: str | None = None
+        self._password: str | None = None
+        self._client_id: str | None = None
+        self._iot_credentials: GoveeIotCredentials | None = None
+        self._discovered_name: str | None = None
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry: ConfigEntry) -> OptionsFlow:
+        """Get the options flow for this handler.
+
+        The OptionsFlow base class exposes ``self.config_entry`` as a property —
+        do not pass it to ``__init__`` (deprecated in HA 2025.12).
+        """
+        return GoveeOptionsFlow()
+
+    async def async_step_bluetooth(self, discovery_info: BluetoothServiceInfo) -> ConfigFlowResult:
+        """Offer the cloud set-up when a Govee device advertises nearby.
+
+        The manifest's Bluetooth matchers make Home Assistant start this flow
+        for any Govee advertisement. Every device belongs to the same cloud
+        account, so one prompt is enough: the flow aborts when an entry
+        already exists (including an ignored one) or another discovery flow is
+        open. Bluetooth is only a transport here; the entry is still created
+        from the API key in the user step.
+        """
+        await self.async_set_unique_id(DOMAIN)
+        self._abort_if_unique_id_configured()
+        self._async_abort_entries_match()
+        self._discovered_name = discovery_info.name or discovery_info.address
+        self.context["title_placeholders"] = {"name": self._discovered_name}
+        return await self.async_step_bluetooth_confirm()
+
+    async def async_step_bluetooth_confirm(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Ask before continuing to the API key step."""
+        if user_input is not None:
+            return await self.async_step_user()
+
+        self._set_confirm_only()
+        return self.async_show_form(
+            step_id="bluetooth_confirm",
+            description_placeholders={"name": self._discovered_name or "Govee device"},
+        )
+
+    async def async_step_user(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Handle the initial step - API key entry."""
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            api_key = user_input[CONF_API_KEY]
+
+            # Validate format before making API call
+            cleaned_key, format_error = _validate_api_key_format(api_key)
+            if format_error:
+                errors["base"] = format_error
+            else:
+                # One entry per API key (quality-scale rule unique-config-entry).
+                self._async_abort_entries_match({CONF_API_KEY: cleaned_key})
+                try:
+                    await validate_api_key(cleaned_key, hass=self.hass)
+                    self._api_key = cleaned_key
+
+                    # Proceed to optional account step for MQTT
+                    return await self.async_step_account()
+
+                except GoveeAuthError as err:
+                    _LOGGER.warning(
+                        "API key validation failed: %s (code=%s)",
+                        err,
+                        getattr(err, "code", None),
+                    )
+                    errors["base"] = "invalid_auth"
+                except GoveeApiError as err:
+                    _LOGGER.error("API validation failed: %s", err)
+                    errors["base"] = "cannot_connect"
+                except Exception:
+                    _LOGGER.exception("Unexpected error during API validation")
+                    errors["base"] = "unknown"
+
+        return self.async_show_form(
+            step_id="user",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_API_KEY): str,
+                }
+            ),
+            errors=errors,
+            description_placeholders={
+                "api_url": "https://developer.govee.com/",
+            },
+        )
+
+    async def async_step_account(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Handle optional account credentials for MQTT.
+
+        Users can skip this step if they don't want real-time updates.
+        """
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            email = user_input.get(CONF_EMAIL, "").strip()
+            password = user_input.get(CONF_PASSWORD, "").strip()
+
+            # Both empty = skip MQTT
+            if not email and not password:
+                return self._create_entry()
+
+            # Basic email format check
+            if email and "@" not in email:
+                errors["base"] = "invalid_email_format"
+            # One provided without the other
+            elif email and not password:
+                errors["base"] = "email_without_password"
+            elif password and not email:
+                errors["base"] = "password_without_email"
+            else:
+                # Both provided - validate with API
+                # Derive deterministic client_id from email so the same
+                # ID is used across login, verification code request,
+                # and all subsequent reconfigurations for this account
+                self._client_id = _derive_client_id(email)
+                try:
+                    self._iot_credentials = await validate_govee_credentials(
+                        email,
+                        password,
+                        client_id=self._client_id,
+                        hass=self.hass,
+                    )
+                    self._email = email
+                    self._password = password
+
+                    return self._create_entry()
+
+                except Govee2FARequiredError:
+                    _LOGGER.debug("Govee 2FA required; requesting verification code")
+                    self._email = email
+                    self._password = password
+                    try:
+                        async with GoveeAuthClient(hass=self.hass) as client:
+                            await client.request_verification_code(email, self._client_id)
+                    except GoveeApiError as err:
+                        _LOGGER.warning("Failed to request verification code: %s", err)
+                        # Govee refusing to send (rate limit ...) is not a network fault.
+                        errors["base"] = (
+                            "login_rejected" if isinstance(err, GoveeLoginRejectedError) else "cannot_connect"
+                        )
+                    else:
+                        return await self.async_step_verification_code()
+                except GoveeAuthError as err:
+                    _LOGGER.warning(
+                        "Govee account validation failed: %s (code=%s)",
+                        err,
+                        getattr(err, "code", None),
+                    )
+                    errors["base"] = "invalid_account"
+                except GoveeLoginRejectedError as err:
+                    _LOGGER.warning("Govee login rejected: %s", err)
+                    errors["base"] = "login_rejected"
+                except GoveeApiError as err:
+                    _LOGGER.error("Account validation failed: %s", err)
+                    errors["base"] = "cannot_connect"
+                except Exception:
+                    _LOGGER.exception("Unexpected error during account validation")
+                    errors["base"] = "unknown"
+
+        return self.async_show_form(
+            step_id="account",
+            data_schema=vol.Schema(
+                {
+                    vol.Optional(CONF_EMAIL): str,
+                    vol.Optional(CONF_PASSWORD): str,
+                }
+            ),
+            errors=errors,
+        )
+
+    async def async_step_verification_code(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Handle 2FA verification code entry.
+
+        Shown when Govee requires a verification code sent to the user's email.
+        """
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            code = user_input["verification_code"].strip()
+            if self._email is None or self._password is None:
+                # Defensive — the verification step should never be reached
+                # without these already set by the preceding account step.
+                return self.async_abort(reason="missing_credentials")
+            try:
+                self._iot_credentials = await validate_govee_credentials(
+                    self._email,
+                    self._password,
+                    code=code,
+                    client_id=self._client_id,
+                    hass=self.hass,
+                )
+                # Route based on flow source
+                if self.source == "reconfigure":
+                    reconfigure_entry = self._get_reconfigure_entry()
+                    new_data: dict[str, Any] = {
+                        **reconfigure_entry.data,
+                        CONF_EMAIL: self._email,
+                        CONF_PASSWORD: self._password,
+                    }
+                    if self._api_key:
+                        new_data[CONF_API_KEY] = self._api_key
+                    self._clear_mqtt_cache(reconfigure_entry.entry_id)
+                    # Pre-cache the IoT credentials so the reload
+                    # doesn't try to login again (which would hit 2FA)
+                    self._cache_iot_credentials(reconfigure_entry.entry_id)
+                    self._sync_cached_creds(new_data, reconfigure_entry)
+                    # new_data is the complete replacement; data_updates would
+                    # merge and could never drop a removed email or password.
+                    return self.async_update_reload_and_abort(
+                        reconfigure_entry,
+                        data=new_data,
+                    )
+                return self._create_entry()
+
+            except Govee2FACodeInvalidError:
+                _LOGGER.warning("Govee 2FA code invalid or expired")
+                errors["base"] = "invalid_verification_code"
+            except GoveeAuthError as err:
+                _LOGGER.warning("Govee auth failed during 2FA: %s", err)
+                errors["base"] = "invalid_account"
+            except GoveeApiError as err:
+                _LOGGER.warning("API error during 2FA verification: %s", err)
+                errors["base"] = "cannot_connect"
+            except Exception:
+                _LOGGER.exception("Unexpected error during 2FA verification")
+                errors["base"] = "unknown"
+
+        return self.async_show_form(
+            step_id="verification_code",
+            data_schema=vol.Schema(
+                {
+                    vol.Required("verification_code"): str,
+                }
+            ),
+            errors=errors,
+            description_placeholders={
+                "email": self._email or "",
+            },
+        )
+
+    @staticmethod
+    def _sync_cached_creds(new_data: dict[str, Any], entry: ConfigEntry) -> None:
+        """Carry freshly cached credential keys into a ``data_updates`` payload.
+
+        ``_clear_mqtt_cache`` and ``_cache_iot_credentials`` write straight to
+        ``entry.data``, but the payload passed to
+        ``async_update_reload_and_abort`` is snapshotted from ``entry.data``
+        *before* those calls run, and it replaces the entry data wholesale.
+        Without re-syncing, the stale token in that snapshot is written back
+        over the fresh one the flow just obtained: the user sees
+        "Reconfiguration successful" and keeps the expired credentials.
+
+        That is worse than it sounds, because reconfiguring is the obvious
+        user-side recovery from an expired token — so the recovery silently
+        did nothing (issues #178, #179).
+
+        Both completion paths call this, so a future edit to one can't
+        reintroduce the bug in the other.
+        """
+        for key in (KEY_IOT_CREDENTIALS, KEY_IOT_LOGIN_FAILED):
+            if key in entry.data:
+                new_data[key] = entry.data[key]
+            else:
+                new_data.pop(key, None)
+
+    def _cache_iot_credentials(self, entry_id: str) -> None:
+        """Pre-cache IoT credentials in entry.data so reload can skip login.
+
+        When 2FA is required, the config flow obtains IoT credentials during
+        the verification step. Without caching, the reload would try to login
+        again (without the code) and hit 2FA again.
+        """
+        if not self._iot_credentials:
+            return
+
+        entry = self.hass.config_entries.async_get_entry(entry_id)
+        if entry is None:
+            _LOGGER.debug("Cannot cache IoT creds — entry %s not found", entry_id)
+            return
+
+        creds = self._iot_credentials
+        if is_dataclass(creds) and not isinstance(creds, type):
+            cred_dict: dict[str, Any] = asdict(creds)
+        else:
+            # Tolerate mock objects in tests by extracting fields explicitly.
+            cred_dict = {
+                f: getattr(creds, f, None)
+                for f in (
+                    "token",
+                    "refresh_token",
+                    "account_topic",
+                    "iot_cert",
+                    "iot_key",
+                    "iot_ca",
+                    "client_id",
+                    "endpoint",
+                )
+            }
+
+        new_data = dict(entry.data)
+        new_data[KEY_IOT_CREDENTIALS] = cred_dict
+        new_data.pop(KEY_IOT_LOGIN_FAILED, None)
+        self.hass.config_entries.async_update_entry(entry, data=new_data)
+        _LOGGER.debug("Pre-cached IoT credentials for entry %s", entry_id)
+
+    def _clear_mqtt_cache(self, entry_id: str) -> None:
+        """Clear cached MQTT credentials and login-failure marker.
+
+        This allows a fresh login attempt after reconfigure.
+        Also dismisses the 2FA and token-expired repairs issues for this entry.
+        """
+        entry = self.hass.config_entries.async_get_entry(entry_id)
+        if entry is not None:
+            new_data = dict(entry.data)
+            mutated = False
+            if KEY_IOT_CREDENTIALS in new_data:
+                new_data.pop(KEY_IOT_CREDENTIALS, None)
+                mutated = True
+            if KEY_IOT_LOGIN_FAILED in new_data:
+                new_data.pop(KEY_IOT_LOGIN_FAILED, None)
+                mutated = True
+            if mutated:
+                self.hass.config_entries.async_update_entry(entry, data=new_data)
+
+        # Dismiss the repairs that told the user to reconfigure: 2FA needed,
+        # and an expired token the coordinator could not refresh itself.
+        ir.async_delete_issue(self.hass, DOMAIN, f"mqtt_2fa_required_{entry_id}")
+        ir.async_delete_issue(self.hass, DOMAIN, f"mqtt_token_expired_{entry_id}")
+
+        _LOGGER.debug("Cleared MQTT cache for entry %s", entry_id)
+
+    def _create_entry(self) -> ConfigFlowResult:
+        """Create the config entry."""
+        data: dict[str, Any] = {
+            CONF_API_KEY: self._api_key,
+        }
+
+        # Add account credentials if provided
+        if self._email and self._password:
+            data[CONF_EMAIL] = self._email
+            data[CONF_PASSWORD] = self._password
+            # Persist the IoT credentials the flow already obtained so the
+            # first setup reuses them instead of logging in again (and, with
+            # 2FA, being asked for a second verification code).
+            if self._iot_credentials is not None and is_dataclass(self._iot_credentials):
+                data[KEY_IOT_CREDENTIALS] = asdict(self._iot_credentials)
+
+        # Home Assistant only closes a discovery card for an entry with the
+        # same unique ID, which an entry set up by hand doesn't have
+        for flow in self._async_in_progress():
+            if flow["context"].get("source") == SOURCE_BLUETOOTH:
+                self.hass.config_entries.flow.async_abort(flow["flow_id"])
+
+        return self.async_create_entry(
+            title="Govee",
+            data=data,
+            options={
+                CONF_POLL_INTERVAL: DEFAULT_POLL_INTERVAL,
+                CONF_ENABLE_GROUPS: DEFAULT_ENABLE_GROUPS,
+                CONF_ENABLE_SCENES: DEFAULT_ENABLE_SCENES,
+                CONF_ENABLE_DIY_SCENES: DEFAULT_ENABLE_DIY_SCENES,
+                CONF_WATER_DETECTOR_POLL_INTERVAL: (DEFAULT_WATER_DETECTOR_POLL_INTERVAL),
+                CONF_PROBE_POLL_INTERVAL: DEFAULT_PROBE_POLL_INTERVAL,
+                CONF_MQTT_STATUS_INTERVAL: DEFAULT_MQTT_STATUS_INTERVAL,
+            },
+        )
+
+    def _abort_if_key_used_elsewhere(self, api_key: str, own_entry: ConfigEntry) -> None:
+        """Abort when another entry already uses this API key.
+
+        Reauth and reconfigure may keep or rotate the key of ``own_entry``, but
+        must not turn it into a duplicate of a second entry (quality-scale rule
+        unique-config-entry).
+        """
+        for entry in self._async_current_entries(include_ignore=False):
+            if entry.entry_id == own_entry.entry_id:
+                continue
+            if entry.data.get(CONF_API_KEY) == api_key:
+                raise AbortFlow("already_configured")
+
+    async def async_step_reauth(
+        self,
+        entry_data: dict[str, Any],
+    ) -> ConfigFlowResult:
+        """Handle re-authentication request."""
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Handle re-authentication confirmation."""
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            api_key = user_input[CONF_API_KEY]
+
+            # Validate format before API call
+            cleaned_key, format_error = _validate_api_key_format(api_key)
+            if format_error:
+                errors["base"] = format_error
+            else:
+                reauth_entry = self._get_reauth_entry()
+                # Abort before spending an API call on a key another entry owns.
+                self._abort_if_key_used_elsewhere(cleaned_key, reauth_entry)
+                try:
+                    await validate_api_key(cleaned_key, hass=self.hass)
+                    return self.async_update_reload_and_abort(
+                        reauth_entry,
+                        data_updates={CONF_API_KEY: cleaned_key},
+                    )
+
+                except GoveeAuthError as err:
+                    _LOGGER.warning(
+                        "API key validation failed during reauth: %s (code=%s)",
+                        err,
+                        getattr(err, "code", None),
+                    )
+                    errors["base"] = "invalid_auth"
+                except GoveeApiError as err:
+                    _LOGGER.warning("API validation failed during reauth: %s", err)
+                    errors["base"] = "cannot_connect"
+                except Exception:
+                    _LOGGER.exception("Unexpected error during reauth")
+                    errors["base"] = "unknown"
+
+        return self.async_show_form(
+            step_id="reauth_confirm",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_API_KEY): str,
+                }
+            ),
+            errors=errors,
+        )
+
+    async def async_step_reconfigure(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Handle reconfiguration of the integration.
+
+        Allows users to update API key and account credentials without
+        removing and re-adding the integration.
+        """
+        errors: dict[str, str] = {}
+        reconfigure_entry = self._get_reconfigure_entry()
+
+        if user_input is not None:
+            api_key = user_input[CONF_API_KEY]
+
+            # Validate API key format first
+            cleaned_key, format_error = _validate_api_key_format(api_key)
+            if format_error:
+                errors["base"] = format_error
+            else:
+                # Abort before spending an API call on a key another entry owns.
+                self._abort_if_key_used_elsewhere(cleaned_key, reconfigure_entry)
+                try:
+                    await validate_api_key(cleaned_key, hass=self.hass)
+
+                    # Build updated data
+                    new_data: dict[str, Any] = {
+                        **reconfigure_entry.data,
+                        CONF_API_KEY: cleaned_key,
+                    }
+
+                    # Handle optional account credentials
+                    email = user_input.get(CONF_EMAIL, "").strip()
+                    password = user_input.get(CONF_PASSWORD, "").strip()
+
+                    if email and password:
+                        # Validate account credentials if provided
+                        # Derive deterministic client_id from email
+                        self._client_id = _derive_client_id(email)
+                        try:
+                            self._iot_credentials = await validate_govee_credentials(
+                                email,
+                                password,
+                                client_id=self._client_id,
+                                hass=self.hass,
+                            )
+                            new_data[CONF_EMAIL] = email
+                            new_data[CONF_PASSWORD] = password
+                        except Govee2FARequiredError:
+                            _LOGGER.debug("Govee 2FA required during reconfigure")
+                            self._email = email
+                            self._password = password
+                            self._api_key = cleaned_key
+                            try:
+                                async with GoveeAuthClient(hass=self.hass) as client:
+                                    await client.request_verification_code(email, self._client_id)
+                            except GoveeApiError as err:
+                                _LOGGER.warning(
+                                    "Failed to request verification code: %s",
+                                    err,
+                                )
+                                errors["base"] = (
+                                    "login_rejected" if isinstance(err, GoveeLoginRejectedError) else "cannot_connect"
+                                )
+                            else:
+                                return await self.async_step_verification_code()
+                        except GoveeAuthError as err:
+                            _LOGGER.warning(
+                                "Govee account validation failed during reconfigure: %s (code=%s)",
+                                err,
+                                getattr(err, "code", None),
+                            )
+                            errors["base"] = "invalid_account"
+                        except GoveeLoginRejectedError as err:
+                            _LOGGER.warning("Govee login rejected during reconfigure: %s", err)
+                            errors["base"] = "login_rejected"
+                        except GoveeApiError as err:
+                            _LOGGER.warning("Account validation failed during reconfigure: %s", err)
+                            errors["base"] = "cannot_connect"
+                    elif email and not password:
+                        # Email without password - check if keeping existing password
+                        existing_email = reconfigure_entry.data.get(CONF_EMAIL, "")
+                        existing_password = reconfigure_entry.data.get(CONF_PASSWORD, "")
+                        if email == existing_email and existing_password:
+                            # Keeping same email with existing password - OK
+                            new_data[CONF_EMAIL] = email
+                            new_data[CONF_PASSWORD] = existing_password
+                        else:
+                            # New email without password
+                            errors["base"] = "email_without_password"
+                    elif password and not email:
+                        errors["base"] = "password_without_email"
+                    else:
+                        # Both empty - remove account credentials
+                        new_data.pop(CONF_EMAIL, None)
+                        new_data.pop(CONF_PASSWORD, None)
+
+                    if not errors:
+                        # Clear cached MQTT credentials/failure to allow fresh login attempt
+                        self._clear_mqtt_cache(reconfigure_entry.entry_id)
+                        # Pre-cache IoT credentials so reload doesn't re-login
+                        self._cache_iot_credentials(reconfigure_entry.entry_id)
+                        self._sync_cached_creds(new_data, reconfigure_entry)
+
+                        # Complete replacement, see async_step_reconfigure.
+                        return self.async_update_reload_and_abort(
+                            reconfigure_entry,
+                            data=new_data,
+                        )
+
+                except GoveeAuthError as err:
+                    _LOGGER.warning(
+                        "API key validation failed during reconfigure: %s (code=%s)",
+                        err,
+                        getattr(err, "code", None),
+                    )
+                    errors["base"] = "invalid_auth"
+                except GoveeApiError as err:
+                    _LOGGER.warning("API validation failed during reconfigure: %s", err)
+                    errors["base"] = "cannot_connect"
+                except Exception:
+                    _LOGGER.exception("Unexpected error during reconfigure")
+                    errors["base"] = "unknown"
+
+        # Pre-fill current values (except sensitive data)
+        current_email = reconfigure_entry.data.get(CONF_EMAIL, "")
+
+        return self.async_show_form(
+            step_id="reconfigure",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_API_KEY): str,
+                    vol.Optional(CONF_EMAIL, default=current_email): str,
+                    vol.Optional(CONF_PASSWORD): str,
+                }
+            ),
+            errors=errors,
+            description_placeholders={
+                "current_email": current_email or "not configured",
+            },
+        )
+
+
+class GoveeOptionsFlow(OptionsFlow):
+    """Handle options for Govee integration.
+
+    Per HA 2025.12 deprecation: do not store config_entry on __init__.
+    The base class exposes ``self.config_entry`` as a property.
+    """
+
+    def __init__(self) -> None:
+        """Initialize options flow."""
+        self._global_options: dict[str, Any] = {}
+        self._selected_devices: list[str] = []
+        self._device_modes: dict[str, str] = {}
+        self._device_index: int = 0
+        # Kettle slot labels (the "kettle_slots" menu entry).
+        self._slot_labels: dict[str, dict[str, str]] = {}
+        self._kettles: list[GoveeDevice] = []
+        self._kettle_index: int = 0
+
+    def _coordinator_devices(self) -> list[GoveeDevice]:
+        """Devices of the running coordinator, or none if the entry is not loaded.
+
+        Options can be opened on an entry whose setup failed; it then has no
+        ``runtime_data`` and the flow must fall back to the global options only.
+        """
+        coordinator = getattr(self.config_entry, "runtime_data", None)
+        devices = getattr(coordinator, "devices", None)
+        if not devices:
+            return []
+        return list(devices.values())
+
+    def _unknown_override_device_ids(self, overrides: dict[str, tuple[str, bool]]) -> set[str]:
+        """Return override device_ids that aren't devices on this account (#164).
+
+        A LAN override binds a coordinator ``device_id`` straight to an IP, so
+        a mistyped id silently binds nothing. The coordinator is the only place
+        that knows the real ids, which is why this check can't live in
+        ``api.lan``. If the entry has no coordinator yet (options opened before
+        setup finished), skip the check rather than reject a correct id we
+        simply can't confirm.
+        """
+        if not overrides:
+            return set()
+        coordinator = getattr(self.config_entry, "runtime_data", None)
+        known = getattr(coordinator, "devices", None)
+        if not known:
+            return set()
+        return {device_id for device_id in overrides if device_id not in known}
+
+    def _options_with_segment_modes(self, data: dict[str, Any], edits: dict[str, str]) -> dict[str, Any]:
+        """Return ``data`` with the saved per-device segment modes plus ``edits``.
+
+        Options are replaced wholesale on save, so the stored map must be carried
+        over: a device not walked through in this run (unticked, or the entry is
+        not loaded and no device list exists) keeps the mode it already had.
+        """
+        modes = {**self.config_entry.options.get(CONF_SEGMENT_MODE_BY_DEVICE, {}), **edits}
+        if not modes:
+            return dict(data)
+        return {**data, CONF_SEGMENT_MODE_BY_DEVICE: modes}
+
+    async def async_step_init(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Open the options: a menu when an H7175 kettle has custom slots, else the general settings."""
+        if user_input is None and self._kettles_with_slots():
+            return self.async_show_menu(step_id="init", menu_options=["general", "kettle_slots"])
+        return await self.async_step_general(user_input)
+
+    async def async_step_general(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Handle global options flow."""
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            # Validate the free-text LAN targets before saving so a bad subnet
+            # is rejected in the form, not silently dropped at scan time (#57).
+            try:
+                raw_lan_targets = user_input.get(CONF_LAN_TARGETS, "")
+                expand_lan_targets(raw_lan_targets)
+                # device_id=ip[!] overrides get the same treatment (#164). The
+                # runtime parser skips a bad one silently so the rest still
+                # bind; here a typo must surface, or the user saves an option
+                # that quietly does nothing.
+                overrides = validate_lan_device_overrides(raw_lan_targets)
+            except LanTargetError as err:
+                _LOGGER.debug("Invalid LAN targets entered: %s", err)
+                errors[CONF_LAN_TARGETS] = "invalid_lan_targets"
+            else:
+                # A device_id typo is the likeliest mistake and the only check
+                # the parser can't make for itself — it has no device list.
+                unknown = self._unknown_override_device_ids(overrides)
+                if unknown:
+                    _LOGGER.debug(
+                        "LAN override names unknown device_id(s): %s",
+                        ", ".join(sorted(unknown)),
+                    )
+                    errors[CONF_LAN_TARGETS] = "unknown_lan_device"
+
+            if not errors:
+                # Save global options and proceed to device selection if needed.
+                self._global_options = user_input
+                _LOGGER.debug("Global options saved: %s", user_input)
+
+                rgbic_devices = [d for d in self._coordinator_devices() if d.segment_count > 0]
+
+                if rgbic_devices:
+                    _LOGGER.debug(
+                        "Found %d RGBIC devices, proceeding to device selection",
+                        len(rgbic_devices),
+                    )
+                    return await self.async_step_select_segment_devices()
+                _LOGGER.debug("No RGBIC devices found, saving options")
+                return self._async_finish(self._options_with_segment_modes(user_input, {}))
+
+        # On a validation error, re-show the form with the user's entries kept;
+        # otherwise seed it from the saved options.
+        source = user_input if user_input is not None else self.config_entry.options
+        _LOGGER.debug("Showing global options form with current values: %s", source)
+
+        return self.async_show_form(
+            step_id="general",
+            data_schema=vol.Schema(
+                {
+                    vol.Optional(
+                        CONF_POLL_INTERVAL,
+                        default=source.get(CONF_POLL_INTERVAL, DEFAULT_POLL_INTERVAL),
+                    ): vol.All(vol.Coerce(int), vol.Range(min=MIN_POLL_INTERVAL, max=MAX_POLL_INTERVAL)),
+                    vol.Optional(
+                        CONF_DAILY_REQUEST_BUDGET,
+                        default=source.get(CONF_DAILY_REQUEST_BUDGET, DEFAULT_DAILY_REQUEST_BUDGET),
+                    ): vol.All(
+                        vol.Coerce(int),
+                        vol.Range(min=MIN_DAILY_REQUEST_BUDGET, max=MAX_DAILY_REQUEST_BUDGET),
+                    ),
+                    vol.Optional(
+                        CONF_WATER_DETECTOR_POLL_INTERVAL,
+                        default=source.get(
+                            CONF_WATER_DETECTOR_POLL_INTERVAL,
+                            DEFAULT_WATER_DETECTOR_POLL_INTERVAL,
+                        ),
+                    ): vol.All(
+                        vol.Coerce(int),
+                        vol.Range(
+                            min=MIN_WATER_DETECTOR_POLL_INTERVAL,
+                            max=MAX_WATER_DETECTOR_POLL_INTERVAL,
+                        ),
+                    ),
+                    vol.Optional(
+                        CONF_PROBE_POLL_INTERVAL,
+                        default=source.get(
+                            CONF_PROBE_POLL_INTERVAL,
+                            DEFAULT_PROBE_POLL_INTERVAL,
+                        ),
+                    ): vol.All(
+                        vol.Coerce(int),
+                        vol.Range(
+                            min=MIN_PROBE_POLL_INTERVAL,
+                            max=MAX_PROBE_POLL_INTERVAL,
+                        ),
+                    ),
+                    vol.Optional(
+                        CONF_MQTT_STATUS_INTERVAL,
+                        default=source.get(
+                            CONF_MQTT_STATUS_INTERVAL,
+                            DEFAULT_MQTT_STATUS_INTERVAL,
+                        ),
+                    ): vol.All(
+                        vol.Coerce(int),
+                        # 0 is the documented "off" value; anything else must
+                        # sit inside the bounds.
+                        vol.Any(
+                            MQTT_STATUS_POLL_OFF,
+                            vol.Range(
+                                min=MIN_MQTT_STATUS_INTERVAL,
+                                max=MAX_MQTT_STATUS_INTERVAL,
+                            ),
+                        ),
+                    ),
+                    vol.Optional(
+                        CONF_ENABLE_GROUPS,
+                        default=source.get(CONF_ENABLE_GROUPS, DEFAULT_ENABLE_GROUPS),
+                    ): bool,
+                    vol.Optional(
+                        CONF_ENABLE_SCENES,
+                        default=source.get(CONF_ENABLE_SCENES, DEFAULT_ENABLE_SCENES),
+                    ): bool,
+                    vol.Optional(
+                        CONF_ENABLE_DIY_SCENES,
+                        default=source.get(CONF_ENABLE_DIY_SCENES, DEFAULT_ENABLE_DIY_SCENES),
+                    ): bool,
+                    vol.Optional(
+                        CONF_EXPOSE_TRANSPORT_ENTITIES,
+                        default=source.get(
+                            CONF_EXPOSE_TRANSPORT_ENTITIES,
+                            DEFAULT_EXPOSE_TRANSPORT_ENTITIES,
+                        ),
+                    ): bool,
+                    vol.Optional(
+                        CONF_ENABLE_MQTT_CONTROL,
+                        default=source.get(
+                            CONF_ENABLE_MQTT_CONTROL,
+                            DEFAULT_ENABLE_MQTT_CONTROL,
+                        ),
+                    ): bool,
+                    vol.Optional(
+                        CONF_CONFIRM_COMMANDS,
+                        default=source.get(CONF_CONFIRM_COMMANDS, DEFAULT_CONFIRM_COMMANDS),
+                    ): bool,
+                    vol.Optional(
+                        CONF_ENABLE_H6104_BLE,
+                        default=source.get(CONF_ENABLE_H6104_BLE, DEFAULT_ENABLE_H6104_BLE),
+                    ): bool,
+                    vol.Optional(
+                        CONF_API_TEMPERATURE_UNIT,
+                        default=source.get(CONF_API_TEMPERATURE_UNIT, DEFAULT_API_TEMPERATURE_UNIT),
+                    ): SelectSelector(
+                        SelectSelectorConfig(
+                            options=["auto", "celsius", "fahrenheit"],
+                            translation_key=CONF_API_TEMPERATURE_UNIT,
+                            mode=SelectSelectorMode.DROPDOWN,
+                        )
+                    ),
+                    vol.Optional(
+                        CONF_LAN_TARGETS,
+                        default=source.get(CONF_LAN_TARGETS, DEFAULT_LAN_TARGETS),
+                    ): str,
+                }
+            ),
+            errors=errors,
+        )
+
+    def _kettles_with_slots(self) -> list[GoveeDevice]:
+        """Loaded H7175 kettles with custom slots to label."""
+        return [
+            device
+            for device in self._coordinator_devices()
+            if device.decodes_kettle_frames and not device.is_group and slot_keys(device)
+        ]
+
+    def _saved_slot_labels(self) -> dict[str, dict[str, str]]:
+        """Saved slot labels, without kettles removed from Home Assistant.
+
+        Only devices gone from the device registry are dropped, so a kettle
+        missing from one device-list fetch keeps its labels.
+        """
+        saved = self.config_entry.options.get(CONF_KETTLE_SLOT_LABELS)
+        if not isinstance(saved, dict):
+            return {}
+        registry = dr.async_get(self.hass)
+        return {
+            str(device_id): dict(labels)
+            for device_id, labels in saved.items()
+            if isinstance(labels, dict)
+            and get_registry_device(registry, (DOMAIN, str(device_id)), self.config_entry.entry_id)
+        }
+
+    def _async_finish(self, data: dict[str, Any], labels: dict[str, dict[str, str]] | None = None) -> ConfigFlowResult:
+        """Save the options. Saving replaces them all, so the slot labels are carried over."""
+        result = {key: value for key, value in data.items() if key != CONF_KETTLE_SLOT_LABELS}
+        labels = self._saved_slot_labels() if labels is None else labels
+        if labels:
+            result[CONF_KETTLE_SLOT_LABELS] = labels
+        return self.async_create_entry(title="", data=result)
+
+    async def async_step_kettle_slots(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Label a kettle's custom slots, one kettle at a time (opt-in, from the menu).
+
+        Fields are ``slot_1``..``slot_N`` in slot order; a blank field means
+        no label. Labels are display text only: the mode stays ``custom_N``.
+        """
+        if not self._kettles:
+            self._kettles = self._kettles_with_slots()
+            self._slot_labels = self._saved_slot_labels()
+            self._kettle_index = 0
+        loaded = {device.device_id for device in self._coordinator_devices()}
+        if self._kettle_index >= len(self._kettles) or self._kettles[self._kettle_index].device_id not in loaded:
+            return self.async_abort(reason="kettle_unavailable")
+        device = self._kettles[self._kettle_index]
+        fields = {f"slot_{index}": key for index, key in enumerate(slot_keys(device), start=1)}
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            labels = {key: str(user_input.get(field) or "").strip() for field, key in fields.items()}
+            slot_errors = validate_slot_labels(device, labels)
+            errors = {field: slot_errors[key] for field, key in fields.items() if key in slot_errors}
+            if not errors:
+                kept = {key: label for key, label in labels.items() if label}
+                if kept:
+                    self._slot_labels[device.device_id] = kept
+                else:
+                    self._slot_labels.pop(device.device_id, None)
+                self._kettle_index += 1
+                if self._kettle_index < len(self._kettles):
+                    return await self.async_step_kettle_slots()
+                return self._async_finish(dict(self.config_entry.options), self._slot_labels)
+        saved = self._slot_labels.get(device.device_id, {})
+        current = (
+            user_input if user_input is not None else {field: saved.get(key, "") for field, key in fields.items()}
+        )
+        return self.async_show_form(
+            step_id="kettle_slots",
+            data_schema=vol.Schema(
+                {vol.Optional(field, description={"suggested_value": current.get(field, "")}): str for field in fields}
+            ),
+            errors=errors,
+            description_placeholders={"device_name": device.name},
+        )
+
+    async def async_step_select_segment_devices(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Select which RGBIC devices to configure individually."""
+        rgbic_devices = {
+            d.device_id: f"{d.name} ({d.device_id})" for d in self._coordinator_devices() if d.segment_count > 0
+        }
+
+        if user_input is not None:
+            # User selected devices to configure
+            self._selected_devices = user_input.get("devices", list(rgbic_devices.keys()))
+            _LOGGER.debug(
+                "Selected %d devices for per-device configuration: %s",
+                len(self._selected_devices),
+                self._selected_devices,
+            )
+
+            if self._selected_devices:
+                self._device_index = 0
+                self._device_modes = {}
+                return await self.async_step_configure_device_mode()
+            else:
+                # No devices selected, save global options only
+                _LOGGER.debug("No devices selected, saving global options only")
+                return self._async_finish(self._options_with_segment_modes(self._global_options, {}))
+
+        # Show device selector
+        all_device_ids = list(rgbic_devices.keys())
+        _LOGGER.debug("Showing device selector with %d RGBIC devices", len(rgbic_devices))
+
+        return self.async_show_form(
+            step_id="select_segment_devices",
+            data_schema=vol.Schema(
+                {
+                    vol.Optional(
+                        "devices",
+                        default=all_device_ids,
+                    ): cv.multi_select(rgbic_devices),
+                }
+            ),
+        )
+
+    async def async_step_configure_device_mode(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Configure segment mode for one device at a time."""
+        if user_input is not None:
+            device_id = self._selected_devices[self._device_index]
+            self._device_modes[device_id] = user_input["segment_mode"]
+            self._device_index += 1
+
+            # More devices? Loop back. Otherwise save.
+            if self._device_index < len(self._selected_devices):
+                return await self.async_step_configure_device_mode()
+
+            # Done — build final data and save
+            new_data = self._options_with_segment_modes(self._global_options, self._device_modes)
+            _LOGGER.debug("Options saved: %s", new_data)
+            return self._async_finish(new_data)
+
+        # Show form for the current device
+        current_device_modes = self.config_entry.options.get(CONF_SEGMENT_MODE_BY_DEVICE, {})
+
+        device_id = self._selected_devices[self._device_index]
+        device = next((d for d in self._coordinator_devices() if d.device_id == device_id), None)
+        device_name = device.name if device else device_id
+        default_mode = current_device_modes.get(device_id, DEFAULT_SEGMENT_MODE)
+
+        _LOGGER.debug(
+            "Showing segment mode form for device %d/%d: %s (%s)",
+            self._device_index + 1,
+            len(self._selected_devices),
+            device_name,
+            device_id,
+        )
+
+        return self.async_show_form(
+            step_id="configure_device_mode",
+            data_schema=vol.Schema(
+                {
+                    vol.Optional("segment_mode", default=default_mode): SelectSelector(
+                        SelectSelectorConfig(
+                            options=[
+                                SEGMENT_MODE_DISABLED,
+                                SEGMENT_MODE_GROUPED,
+                                SEGMENT_MODE_INDIVIDUAL,
+                                SEGMENT_MODE_BOTH,
+                            ],
+                            translation_key="segment_mode",
+                            mode=SelectSelectorMode.DROPDOWN,
+                        )
+                    ),
+                }
+            ),
+            description_placeholders={
+                "device_name": device_name,
+                "device_id": device_id,
+            },
+        )

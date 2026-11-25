@@ -1,0 +1,590 @@
+"""Helpers to load per-model quirks for TRVs.
+
+This module dynamically imports model-specific quirk modules and exposes
+small shim functions that delegate into the model-specific implementations.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+import logging
+import re
+
+from homeassistant.components.climate.const import HVACMode
+from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
+from homeassistant.core import State
+from homeassistant.helpers.importlib import async_import_module
+
+from custom_components.better_thermostat.model_fixes.types import (
+    IgnoredOffsetQuirk,
+    InitialTweakQuirk,
+    InvertedOffsetQuirk,
+    LowestSetpointQuirk,
+    ModelFixHost,
+    ModelQuirks,
+    OffsetConventionHost,
+    OffsetRangeQuirk,
+    QuirkLoaderHost,
+    SetpointOffsetQuirk,
+    UnknownStateQuirk,
+    ValveQuirk,
+    ValveReading,
+    ValveReadingsQuirk,
+)
+from custom_components.better_thermostat.utils.retry import device_call_deadline
+
+_LOGGER = logging.getLogger(__name__)
+
+# Model strings that no quirk module of their own answers for, mapped to the
+# module that drives them instead. The Eurotronic Spirit Z and the Aeotec
+# ZWA021 are one device sold under two names, so one module covers both.
+# ZVIDAR Z-TRV-V01 is a clone of the same device and drives its valve the same
+# way, so it resolves onto that module too. Zigbee2MQTT drives the Danfoss
+# Ally 014G2463, the Popp 701721 and the Hive UK7004240 through the
+# definition of the Danfoss Ally 014G2461, under their own model names. Home
+# Assistant's Shelly integration registers the Shelly BLU TRV with the model
+# id SBTR-001AEU and the model name Shelly BLU TRV; a device entry that
+# carries only the name resolves onto the module of the id. Zigbee2MQTT names
+# the Bosch BTH-RA Radiator thermostat II; a release that publishes no model
+# id leaves only that name, and it resolves onto the module of the id too.
+_QUIRK_MODULE_ALIASES = {
+    "Spirit": "ZWA021",
+    "Z-TRV-V01": "ZWA021",
+    "014G2463": "014G2461",
+    "701721": "014G2461",
+    "UK7004240": "014G2461",
+    "Shelly BLU TRV": "SBTR-001AEU",
+    "Radiator thermostat II": "BTH-RA",
+}
+
+
+def get_model_quirks_name(model: str) -> str:
+    """Return the name of the quirk module a device model is driven by.
+
+    Parameters
+    ----------
+    model : str
+        Model string the device registry reports.
+
+    Returns
+    -------
+    str
+        Module name to load: the model itself, unless another model's
+        module answers for it.
+    """
+    return _QUIRK_MODULE_ALIASES.get(model, model)
+
+
+async def _import_quirks(self: QuirkLoaderHost, module_path: str) -> ModelQuirks:
+    """Import a quirk module and hold it to the :class:`ModelQuirks` surface.
+
+    Parameters
+    ----------
+    self : QuirkLoaderHost
+        Caller whose Home Assistant core runs the import.
+    module_path : str
+        Dotted path of the quirk module.
+
+    Returns
+    -------
+    ModelQuirks
+        The imported module.
+
+    Raises
+    ------
+    ImportError
+        When the module cannot be imported, or lacks part of the surface
+        every quirk module provides.
+    """
+    module: object = await async_import_module(self.hass, module_path)
+    if not isinstance(module, ModelQuirks):
+        raise ImportError(
+            f"quirks module '{module_path}' lacks part of the model quirk surface"
+        )
+    return module
+
+
+async def load_model_quirks(
+    self: QuirkLoaderHost, model: str, entity_id: str
+) -> ModelQuirks:
+    """Load model quirks module for a given TRV model, falling back to default.
+
+    A module that imports but lacks part of the :class:`ModelQuirks`
+    surface is passed over like one that does not import. Emits debug
+    logs for both the success and the fallback path.
+    """
+
+    # Normalize model to a safe module suffix
+    model_str = get_model_quirks_name(model)
+    # Replace path separators and any non-alphanumeric/underscore with underscore
+    model_sanitized = (
+        re.sub(r"[^A-Za-z0-9_-]+", "_", model_str.replace("/", "_")).strip("_")
+        or "default"
+    )
+    module_path = f"custom_components.better_thermostat.model_fixes.{model_sanitized}"
+
+    try:
+        model_quirks = await _import_quirks(self, module_path)
+        _LOGGER.debug(
+            "better_thermostat %s: using quirks module '%s' for model '%s' (trv %s)",
+            self.device_name,
+            module_path,
+            model_str,
+            entity_id,
+        )
+    except ImportError as e:
+        # Fallback to default and log the reason
+        default_module = "custom_components.better_thermostat.model_fixes.default"
+        try:
+            model_quirks = await _import_quirks(self, default_module)
+            _LOGGER.debug(
+                "better_thermostat %s: quirks module '%s' not available for model '%s' (trv %s): %s; using default",
+                self.device_name,
+                module_path,
+                model_str,
+                entity_id,
+                e,
+            )
+        except ImportError as e2:
+            # This should never happen, but make it visible if it does
+            _LOGGER.error(
+                "better_thermostat %s: failed to import default quirks module '%s' after error loading '%s' for model '%s' (trv %s): %s",
+                self.device_name,
+                default_module,
+                module_path,
+                model_str,
+                entity_id,
+                e2,
+            )
+            raise
+
+    return model_quirks
+
+
+def _quirks(self: ModelFixHost, entity_id: str) -> ModelQuirks:
+    return self.real_trvs[entity_id].model_quirks
+
+
+def quirk_writes_valve(model_quirks: object) -> bool:
+    """Answer whether a model's own quirk drives that model's valve.
+
+    A quirk module carrying ``override_set_valve`` reaches the valve through
+    the entities its device family exposes, which is a channel of the model
+    and not of the ecosystem the device happens to be paired through. So the
+    answer holds for every adapter, including the generic one a device
+    without an adapter of its own falls back to.
+
+    Parameters
+    ----------
+    model_quirks : object
+        Quirk module loaded for a TRV.
+
+    Returns
+    -------
+    bool
+        True when the module carries ``override_set_valve``.
+    """
+    return isinstance(model_quirks, ValveQuirk)
+
+
+def quirk_ignores_calibration_offset(model_quirks: object) -> bool:
+    """Answer whether a model's quirk declares that its device ignores the offset.
+
+    A device that takes the offset into its entity and leaves it out of
+    the temperature it reports and regulates on cannot be calibrated by
+    offset: every correction written to it stays without effect.
+
+    Parameters
+    ----------
+    model_quirks : object
+        Quirk module loaded for a TRV.
+
+    Returns
+    -------
+    bool
+        True when the module declares ``CALIBRATION_OFFSET_IGNORED``.
+    """
+    return (
+        isinstance(model_quirks, IgnoredOffsetQuirk)
+        and model_quirks.CALIBRATION_OFFSET_IGNORED
+    )
+
+
+def lowest_applied_calibration_offset(
+    model_quirks: object, published_lowest: float
+) -> float:
+    """Return the lowest offset a device applies, given the lowest its entity takes.
+
+    Parameters
+    ----------
+    model_quirks : object
+        Quirk module loaded for the TRV.
+    published_lowest : float
+        Lowest offset the calibration entity accepts, in the device's
+        convention.
+
+    Returns
+    -------
+    float
+        ``published_lowest``, raised to the lowest offset the model's
+        quirk declares the device applies.
+    """
+    if not isinstance(model_quirks, OffsetRangeQuirk):
+        return published_lowest
+    return max(published_lowest, model_quirks.MIN_CALIBRATION_OFFSET)
+
+
+def highest_applied_calibration_offset(
+    model_quirks: object, published_highest: float
+) -> float:
+    """Return the highest offset a device applies, given the highest its entity takes.
+
+    Parameters
+    ----------
+    model_quirks : object
+        Quirk module loaded for the TRV.
+    published_highest : float
+        Highest offset the calibration entity accepts, in the device's
+        convention.
+
+    Returns
+    -------
+    float
+        ``published_highest``, lowered to the highest offset the model's
+        quirk declares the device applies.
+    """
+    if not isinstance(model_quirks, OffsetRangeQuirk):
+        return published_highest
+    return min(published_highest, model_quirks.MAX_CALIBRATION_OFFSET)
+
+
+def valve_readings(
+    self: ModelFixHost, entity_id: str, percent: int
+) -> Sequence[ValveReading] | None:
+    """Ask a TRV's valve quirk which entities a write of ``percent`` set.
+
+    Parameters
+    ----------
+    self :
+        self instance of better_thermostat
+    entity_id : str
+        Entity id of the TRV whose valve was written
+    percent : int
+        The valve opening that was written, in percent
+
+    Returns
+    -------
+    Sequence[ValveReading] | None
+        The entities the quirk wrote, each with the value it holds once the
+        device took the write; None when the TRV's quirk names none
+    """
+    trv = self.real_trvs.get(entity_id)
+    quirks: object = trv.model_quirks if trv is not None else None
+    if not isinstance(quirks, ValveReadingsQuirk):
+        return None
+    return quirks.valve_readings(self, entity_id, percent)
+
+
+def local_calibration_shifts_setpoint(self: ModelFixHost, entity_id: str) -> bool:
+    """Answer whether a TRV applies its calibration offset to the setpoint.
+
+    Most devices add the offset to the temperature they measure and report
+    that sum. A device that adds it to its setpoint instead keeps reporting
+    the bare reading, and an offset raises its effective setpoint where it
+    would lower the reading of the others, so the offset acts with the
+    opposite sign. Only the model's own quirk module knows which kind a
+    device is; a device without that answer offsets its reading.
+
+    Parameters
+    ----------
+    self :
+        self instance of better_thermostat
+    entity_id : str
+        Entity id of the TRV the offset is written to
+
+    Returns
+    -------
+    bool
+        True when the device adds the offset to its setpoint and reports
+        its reading without it
+    """
+    trv = self.real_trvs.get(entity_id)
+    quirks: object = trv.model_quirks if trv is not None else None
+    if not isinstance(quirks, SetpointOffsetQuirk):
+        return False
+    return quirks.local_calibration_shifts_setpoint(self, entity_id)
+
+
+def local_calibration_inverted(self: OffsetConventionHost, entity_id: str) -> bool:
+    """Answer whether a TRV applies its calibration offset with the opposite sign.
+
+    Better Thermostat's offset is what a device adds to the temperature it
+    measures before it reports the reading. A device that subtracts its
+    offset instead reports the same reading for the negated offset, so the
+    offset it holds is the negation of Better Thermostat's. Only the
+    model's own quirk module knows which kind a device is; a device without
+    that answer adds its offset.
+
+    Parameters
+    ----------
+    self :
+        self instance of better_thermostat
+    entity_id : str
+        Entity id of the TRV the offset is read from and written to
+
+    Returns
+    -------
+    bool
+        True when the device subtracts the offset from its reading
+    """
+    trv = self.real_trvs.get(entity_id)
+    quirks: object = trv.model_quirks if trv is not None else None
+    if not isinstance(quirks, InvertedOffsetQuirk):
+        return False
+    return quirks.local_calibration_inverted(self, entity_id)
+
+
+def _negated_offset(calibration_offset: float) -> float:
+    """Return the offset with the opposite sign; a zero offset stays ``0.0``."""
+    return 0.0 - calibration_offset
+
+
+def offset_from_device(
+    self: OffsetConventionHost, entity_id: str, device_offset: float
+) -> float:
+    """Take an offset the device holds into Better Thermostat's convention.
+
+    Better Thermostat's offset is what a device adds to the temperature it
+    measures. A device whose quirk declares that it subtracts its offset
+    holds the negation of Better Thermostat's; every other device holds
+    Better Thermostat's offset itself.
+
+    Parameters
+    ----------
+    self : OffsetConventionHost
+        Host providing Home Assistant access and the per-TRV records
+    entity_id : str
+        Entity ID of the TRV the offset belongs to
+    device_offset : float
+        Offset in Kelvin as the device holds it
+
+    Returns
+    -------
+    float
+        Offset in Kelvin as Better Thermostat counts it
+    """
+    if local_calibration_inverted(self, entity_id):
+        return _negated_offset(device_offset)
+    return device_offset
+
+
+def offset_to_device(
+    self: OffsetConventionHost, entity_id: str, calibration_offset: float
+) -> float:
+    """Take an offset in Better Thermostat's convention to the one the device holds.
+
+    The conversion is a negation or nothing, so it is its own inverse.
+
+    Parameters
+    ----------
+    self : OffsetConventionHost
+        Host providing Home Assistant access and the per-TRV records
+    entity_id : str
+        Entity ID of the TRV the offset is written to
+    calibration_offset : float
+        Offset in Kelvin as Better Thermostat counts it
+
+    Returns
+    -------
+    float
+        Offset in Kelvin as the device is to hold it
+    """
+    return offset_from_device(self, entity_id, calibration_offset)
+
+
+def trv_state_unknown_as_available(self: ModelFixHost, entity_id: str) -> bool:
+    """Answer whether a TRV is operating while its state reads ``unknown``.
+
+    A device driven through a thermostat mode its climate entity does not
+    describe reports ``unknown`` for as long as that mode holds, while it
+    stays reachable and takes commands. Only the model's own quirk module
+    knows that, so the answer comes from there; for every other device an
+    entity that says nothing leaves the device unaccounted for.
+
+    Parameters
+    ----------
+    self :
+        self instance of better_thermostat
+    entity_id : str
+        Entity id of the TRV whose state reads ``unknown``
+
+    Returns
+    -------
+    bool
+        True when ``unknown`` is this model's way of reporting an
+        operating device
+    """
+    trv = self.real_trvs.get(entity_id)
+    quirks: object = trv.model_quirks if trv is not None else None
+    # Only a record whose quirks define the function can answer. The check
+    # reads attributes statically, so a mock that would make the function
+    # up on lookup is read the way an unquirked device is.
+    if not isinstance(quirks, UnknownStateQuirk):
+        return False
+    return quirks.trv_state_unknown_as_available(self, entity_id)
+
+
+def trv_report_is_unreadable(
+    self: ModelFixHost, entity_id: str, state: State | None
+) -> bool:
+    """Answer whether a TRV state carries nothing the inbound handler can read.
+
+    A missing state and an unavailable one carry nothing. ``unknown`` carries
+    nothing either, unless the model reports an operating device that way.
+
+    Parameters
+    ----------
+    self :
+        self instance of better_thermostat
+    entity_id : str
+        Entity id of the TRV the state belongs to
+    state : State | None
+        The state the TRV publishes
+
+    Returns
+    -------
+    bool
+        True when the state is to be read as the device being gone
+    """
+    return (
+        state is None
+        or state.state == STATE_UNAVAILABLE
+        or (
+            state.state == STATE_UNKNOWN
+            and not trv_state_unknown_as_available(self, entity_id)
+        )
+    )
+
+
+def fix_local_calibration(
+    self: ModelFixHost, entity_id: str, calibration_offset: float
+) -> float:
+    """Apply model-specific local calibration fix.
+
+    Call the configured model quirks implementation to normalize the given
+    local calibration offset.
+    """
+
+    _new_offset = _quirks(self, entity_id).fix_local_calibration(
+        self, entity_id, calibration_offset
+    )
+
+    _new_offset = round(_new_offset, 1)
+
+    if calibration_offset != _new_offset:
+        _LOGGER.debug(
+            "better_thermostat %s: %s - calibration offset model fix: %s to %s",
+            self.device_name,
+            entity_id,
+            calibration_offset,
+            _new_offset,
+        )
+
+    return _new_offset
+
+
+def fix_target_temperature_calibration(
+    self: ModelFixHost, entity_id: str, temperature: float
+) -> float:
+    """Apply model-specific setpoint calibration fix.
+
+    Delegates to the loaded model quirks module for any adjustments to the
+    requested setpoint temperature.
+    """
+
+    _new_temperature = _quirks(self, entity_id).fix_target_temperature_calibration(
+        self, entity_id, temperature
+    )
+
+    if temperature != _new_temperature:
+        _LOGGER.debug(
+            "better_thermostat %s: %s - temperature offset model fix: %s to %s",
+            self.device_name,
+            entity_id,
+            temperature,
+            _new_temperature,
+        )
+
+    return _new_temperature
+
+
+async def override_set_hvac_mode(
+    self: ModelFixHost, entity_id: str, hvac_mode: HVACMode | str
+) -> bool:
+    """Invoke model-specific HVAC mode override, if implemented.
+
+    Returns the model-quirks module's response (True if handled). An
+    override still running after ``DEVICE_CALL_TIMEOUT_S`` is cancelled and
+    raises ``DeviceCallTimeoutError``.
+    """
+    async with device_call_deadline():
+        return await _quirks(self, entity_id).override_set_hvac_mode(
+            self, entity_id, hvac_mode
+        )
+
+
+async def override_set_temperature(
+    self: ModelFixHost, entity_id: str, temperature: float
+) -> bool:
+    """Invoke model-specific temperature override, if implemented.
+
+    Returns the model-quirks module's response (True if handled). An
+    override still running after ``DEVICE_CALL_TIMEOUT_S`` is cancelled and
+    raises ``DeviceCallTimeoutError``.
+    """
+    async with device_call_deadline():
+        return await _quirks(self, entity_id).override_set_temperature(
+            self, entity_id, temperature
+        )
+
+
+async def initial_tweak(self: ModelFixHost, entity_id: str) -> None:
+    """Run initial tweaks for the device."""
+    quirks: object = self.real_trvs[entity_id].model_quirks
+    if isinstance(quirks, InitialTweakQuirk):
+        await quirks.initial_tweak(self, entity_id)
+
+
+def lowest_setpoint(self: ModelFixHost, entity_id: str, min_temp: float) -> float:
+    """Return the lowest setpoint Better Thermostat writes to a TRV.
+
+    That is the minimum the TRV publishes, unless the model's quirk module
+    knows a setpoint there means something else to the device.
+
+    Parameters
+    ----------
+    self :
+        self instance of better_thermostat
+    entity_id : str
+        Entity id of the TRV
+    min_temp : float
+        Minimum setpoint the TRV publishes, in Celsius
+
+    Returns
+    -------
+    float
+        The lowest setpoint to write, in Celsius
+    """
+    quirks: object = self.real_trvs[entity_id].model_quirks
+    if not isinstance(quirks, LowestSetpointQuirk):
+        return min_temp
+    lowest = quirks.lowest_setpoint(self, entity_id, min_temp)
+    if lowest != min_temp:
+        _LOGGER.debug(
+            "better_thermostat %s: %s - lowest setpoint model fix: %s to %s",
+            self.device_name,
+            entity_id,
+            min_temp,
+            lowest,
+        )
+    return lowest

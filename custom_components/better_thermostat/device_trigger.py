@@ -1,0 +1,583 @@
+"""Device trigger helpers for Better Thermostat.
+
+This module implements the device trigger helpers and validators used by
+Home Assistant's device trigger integration for Better Thermostat climate
+devices.
+
+Purpose-specific triggers (HA 2025.12+):
+  - heating_active          hvac_action becomes "heating"
+  - heating_stopped         hvac_action leaves "heating"
+  - humidity_high           humidity exceeds a configurable threshold (default 60 %)
+  - window_opened           window_open attribute becomes True
+  - window_closed           window_open attribute becomes False
+  - battery_low             minimum TRV battery level drops below threshold (default 20 %)
+  - device_error            at least one device error is present
+  - target_temp_reached     current temperature reaches the target temperature
+
+Classic triggers (kept for backwards compatibility):
+  - hvac_mode_changed
+  - current_temperature_changed
+  - current_humidity_changed
+"""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+from enum import StrEnum
+import logging
+
+from homeassistant.components.climate.const import HVAC_MODES, HVACAction
+from homeassistant.components.device_automation import DEVICE_TRIGGER_BASE_SCHEMA
+from homeassistant.components.device_automation.exceptions import (
+    InvalidDeviceAutomationConfig,
+)
+from homeassistant.components.homeassistant.triggers import (
+    numeric_state as numeric_state_trigger,
+    state as state_trigger,
+)
+from homeassistant.components.homeassistant.triggers.state import (
+    CONF_FROM,
+    CONF_NOT_FROM,
+    CONF_NOT_TO,
+    CONF_TO,
+)
+from homeassistant.const import (
+    CONF_ABOVE,
+    CONF_ATTRIBUTE,
+    CONF_BELOW,
+    CONF_DEVICE_ID,
+    CONF_DOMAIN,
+    CONF_ENTITY_ID,
+    CONF_FOR,
+    CONF_PLATFORM,
+    CONF_TYPE,
+    PERCENTAGE,
+)
+from homeassistant.core import CALLBACK_TYPE, HomeAssistant
+from homeassistant.helpers import config_validation as cv, entity_registry
+from homeassistant.helpers.trigger import TriggerActionType, TriggerInfo
+from homeassistant.helpers.typing import ConfigType
+import probatio as vol
+
+from . import DOMAIN
+from .utils.const import CONF_HUMIDITY_SENSOR
+from .utils.helpers import entry_settings, is_bt_climate_entity, setting_str
+
+_LOGGER = logging.getLogger(__name__)
+
+
+class TriggerType(StrEnum):
+    """The trigger types this platform offers, as stored in an automation."""
+
+    # Purpose-specific triggers
+    HEATING_ACTIVE = "heating_active"
+    HEATING_STOPPED = "heating_stopped"
+    HUMIDITY_HIGH = "humidity_high"
+    WINDOW_OPENED = "window_opened"
+    WINDOW_CLOSED = "window_closed"
+    BATTERY_LOW = "battery_low"
+    DEVICE_ERROR = "device_error"
+    TARGET_TEMP_REACHED = "target_temp_reached"
+    # Legacy triggers (kept for backwards compatibility)
+    HVAC_MODE_CHANGED = "hvac_mode_changed"
+    CURRENT_TEMPERATURE_CHANGED = "current_temperature_changed"
+    CURRENT_HUMIDITY_CHANGED = "current_humidity_changed"
+
+
+TRIGGER_TYPES = frozenset(TriggerType)
+
+
+# Static TRIGGER_SCHEMA required by HA 2025.12 device automation framework.
+# Extra fields are validated dynamically via async_get_trigger_capabilities.
+TRIGGER_SCHEMA = DEVICE_TRIGGER_BASE_SCHEMA.extend(
+    {
+        vol.Required(CONF_TYPE): vol.In(TRIGGER_TYPES),
+        # The automation editor stores the entity alongside the device, and
+        # the base schema does not carry the key, so without it every trigger
+        # this platform offers fails validation. It stays optional because the
+        # blueprints shipped with the integration pick a device only.
+        vol.Optional(CONF_ENTITY_ID): cv.entity_id_or_uuid,
+        # Fields used by classic triggers
+        vol.Optional(CONF_TO): vol.Any(str, [str]),
+        # Fields used by numeric triggers
+        vol.Optional(CONF_ABOVE): vol.Coerce(float),
+        vol.Optional(CONF_BELOW): vol.Coerce(float),
+        # Shared optional field
+        vol.Optional(CONF_FOR): cv.positive_time_period_dict,
+    }
+)
+
+# The value each classic trigger compares against its threshold.
+#
+# Home Assistant publishes these attributes only while they hold a value, so a
+# sensor that goes unavailable takes the attribute with it. Reading through
+# ``get`` renders ``None``, which the numeric-state trigger treats as "nothing
+# to compare"; a plain attribute lookup renders the empty string and makes it
+# log a conversion error on every state change for as long as the sensor is
+# away.
+CLASSIC_VALUE_ATTRIBUTES = {
+    "current_temperature_changed": "current_temperature",
+    "current_humidity_changed": "current_humidity",
+}
+CLASSIC_VALUE_TEMPLATES = {
+    trigger_type: f"{{{{ state.attributes.get('{attribute}') }}}}"
+    for trigger_type, attribute in CLASSIC_VALUE_ATTRIBUTES.items()
+}
+
+# Default threshold values
+DEFAULT_HUMIDITY_THRESHOLD = 60.0  # %
+DEFAULT_BATTERY_THRESHOLD = 20.0  # %
+# What a state trigger on an attribute matches: one value, or any of several.
+type _AttributeMatch = str | bool | Sequence[str]
+
+# The actions a thermostat reports while it is not heating. A thermostat that
+# is unavailable has no action, which is not one of them.
+_NOT_HEATING_ACTIONS = [action for action in HVACAction if action != HVACAction.HEATING]
+
+
+async def async_get_triggers(
+    hass: HomeAssistant, device_id: str
+) -> list[dict[str, str | dict[str, bool]]]:
+    """List device triggers for Better Thermostat devices."""
+    registry = entity_registry.async_get(hass)
+    triggers: list[dict[str, str | dict[str, bool]]] = []
+
+    for entry in entity_registry.async_entries_for_device(registry, device_id):
+        if not is_bt_climate_entity(entry):
+            continue
+
+        if not hass.states.get(entry.entity_id):
+            continue
+
+        base = {
+            CONF_PLATFORM: "device",
+            CONF_DEVICE_ID: device_id,
+            CONF_DOMAIN: DOMAIN,
+            CONF_ENTITY_ID: entry.entity_id,
+        }
+
+        # A thermostat configured without a humidity sensor publishes no
+        # humidity, so the two triggers that watch it would attach to an
+        # automation and never fire. The entry's settings are the same place
+        # the climate entity reads the sensor from.
+        config_entry = (
+            hass.config_entries.async_get_entry(entry.config_entry_id)
+            if entry.config_entry_id
+            else None
+        )
+        watches_humidity = config_entry is not None and bool(
+            setting_str(entry_settings(config_entry), CONF_HUMIDITY_SENSOR)
+        )
+
+        # Purpose-specific triggers (primary – shown first in the UI)
+        primary_types = [
+            TriggerType.HEATING_ACTIVE,
+            TriggerType.HEATING_STOPPED,
+            TriggerType.WINDOW_OPENED,
+            TriggerType.WINDOW_CLOSED,
+            TriggerType.TARGET_TEMP_REACHED,
+            TriggerType.DEVICE_ERROR,
+        ]
+        for trigger_type in primary_types:
+            triggers.append(
+                {**base, CONF_TYPE: trigger_type, "metadata": {"secondary": False}}
+            )
+
+        # Purpose-specific triggers (secondary – sensor / diagnostic info)
+        secondary_types = [TriggerType.BATTERY_LOW]
+        if watches_humidity:
+            secondary_types.insert(0, TriggerType.HUMIDITY_HIGH)
+        for trigger_type in secondary_types:
+            triggers.append(
+                {**base, CONF_TYPE: trigger_type, "metadata": {"secondary": True}}
+            )
+
+        # Classic / legacy triggers
+        triggers.extend(
+            [
+                {
+                    **base,
+                    CONF_TYPE: TriggerType.HVAC_MODE_CHANGED,
+                    "metadata": {"secondary": True},
+                },
+                {
+                    **base,
+                    CONF_TYPE: TriggerType.CURRENT_TEMPERATURE_CHANGED,
+                    "metadata": {"secondary": True},
+                },
+            ]
+        )
+        if watches_humidity:
+            triggers.append(
+                {
+                    **base,
+                    CONF_TYPE: TriggerType.CURRENT_HUMIDITY_CHANGED,
+                    "metadata": {"secondary": True},
+                }
+            )
+
+    return triggers
+
+
+def _resolve_entity_id(hass: HomeAssistant, config: ConfigType) -> str | None:
+    """Return the thermostat entity a trigger config watches.
+
+    The automation editor stores the entity next to the device; the blueprints
+    shipped with the integration pick a device only, so the entity has to be
+    recoverable from the device alone as well.
+
+    A configured value is passed through as it stands, including a registry id:
+    every branch below hands it to a state or numeric-state trigger, and those
+    resolve a registry id to an entity id themselves.
+
+    Parameters
+    ----------
+    hass : HomeAssistant
+        The running Home Assistant instance.
+    config : ConfigType
+        A validated trigger configuration.
+
+    Returns
+    -------
+    str or None
+        The entity or registry id to watch, or None when the device carries no
+        Better Thermostat climate entity.
+    """
+    if configured := config.get(CONF_ENTITY_ID):
+        return configured
+    registry = entity_registry.async_get(hass)
+    for entry in entity_registry.async_entries_for_device(
+        registry, config[CONF_DEVICE_ID]
+    ):
+        if is_bt_climate_entity(entry):
+            return entry.entity_id
+    return None
+
+
+async def async_attach_trigger(
+    hass: HomeAssistant,
+    config: ConfigType,
+    action: TriggerActionType,
+    trigger_info: TriggerInfo,
+) -> CALLBACK_TYPE:
+    """Attach a trigger and return an unsubscribe callback."""
+    trigger_type = TriggerType(config[CONF_TYPE])
+    entity_id = _resolve_entity_id(hass, config)
+    if entity_id is None:
+        raise InvalidDeviceAutomationConfig(
+            f"No Better Thermostat climate entity found for device "
+            f"{config[CONF_DEVICE_ID]}"
+        )
+
+    # Helpers
+    def _build_state(
+        attribute: str, to: _AttributeMatch, from_: _AttributeMatch
+    ) -> ConfigType:
+        trigger_config: ConfigType = {
+            state_trigger.CONF_PLATFORM: "state",
+            state_trigger.CONF_ENTITY_ID: entity_id,
+            CONF_ATTRIBUTE: attribute,
+            CONF_TO: to,
+            CONF_FROM: from_,
+        }
+        if CONF_FOR in config:
+            trigger_config[CONF_FOR] = config[CONF_FOR]
+        return trigger_config
+
+    def _build_numeric(template: str) -> ConfigType:
+        trigger_config: ConfigType = {
+            numeric_state_trigger.CONF_PLATFORM: "numeric_state",
+            numeric_state_trigger.CONF_ENTITY_ID: entity_id,
+            numeric_state_trigger.CONF_VALUE_TEMPLATE: template,
+        }
+        if CONF_ABOVE in config:
+            trigger_config[CONF_ABOVE] = config[CONF_ABOVE]
+        if CONF_BELOW in config:
+            trigger_config[CONF_BELOW] = config[CONF_BELOW]
+        if CONF_FOR in config:
+            trigger_config[CONF_FOR] = config[CONF_FOR]
+        return trigger_config
+
+    # Purpose-specific trigger: heating_active
+    #   Fires when hvac_action changes from another action TO "heating".
+    if trigger_type == TriggerType.HEATING_ACTIVE:
+        state_config = _build_state(
+            "hvac_action", to="heating", from_=_NOT_HEATING_ACTIONS
+        )
+        state_config = await state_trigger.async_validate_trigger_config(
+            hass, state_config
+        )
+        return await state_trigger.async_attach_trigger(
+            hass, state_config, action, trigger_info, platform_type="device"
+        )
+
+    # Purpose-specific trigger: heating_stopped
+    #   Fires when hvac_action changes FROM "heating" to another action.
+    if trigger_type == TriggerType.HEATING_STOPPED:
+        state_config = _build_state(
+            "hvac_action", to=_NOT_HEATING_ACTIONS, from_="heating"
+        )
+        state_config = await state_trigger.async_validate_trigger_config(
+            hass, state_config
+        )
+        return await state_trigger.async_attach_trigger(
+            hass, state_config, action, trigger_info, platform_type="device"
+        )
+
+    # Purpose-specific trigger: window_opened
+    #   Fires when the window_open attribute changes from False to True.
+    if trigger_type == TriggerType.WINDOW_OPENED:
+        state_config = _build_state("window_open", to=True, from_=False)
+        state_config = await state_trigger.async_validate_trigger_config(
+            hass, state_config
+        )
+        return await state_trigger.async_attach_trigger(
+            hass, state_config, action, trigger_info, platform_type="device"
+        )
+
+    # Purpose-specific trigger: window_closed
+    #   Fires when the window_open attribute changes from True to False. A
+    #   thermostat that is unavailable has no such attribute, so going away
+    #   and coming back fires neither window trigger.
+    if trigger_type == TriggerType.WINDOW_CLOSED:
+        state_config = _build_state("window_open", to=False, from_=True)
+        state_config = await state_trigger.async_validate_trigger_config(
+            hass, state_config
+        )
+        return await state_trigger.async_attach_trigger(
+            hass, state_config, action, trigger_info, platform_type="device"
+        )
+
+    # Purpose-specific trigger: humidity_high
+    #   Fires when the BT humidity attribute exceeds the threshold.
+    #   Threshold is configurable (CONF_ABOVE); default is DEFAULT_HUMIDITY_THRESHOLD.
+    if trigger_type == TriggerType.HUMIDITY_HIGH:
+        numeric_config = _build_numeric(
+            "{{ state.attributes.get('current_humidity', 0) | float(0) }}"
+        )
+        if CONF_ABOVE not in numeric_config:
+            numeric_config[CONF_ABOVE] = DEFAULT_HUMIDITY_THRESHOLD
+        numeric_config = await numeric_state_trigger.async_validate_trigger_config(
+            hass, numeric_config
+        )
+        return await numeric_state_trigger.async_attach_trigger(
+            hass, numeric_config, action, trigger_info, platform_type="device"
+        )
+
+    # Purpose-specific trigger: battery_low
+    #   Fires when the minimum TRV battery level drops below the threshold.
+    #   Threshold is configurable (CONF_BELOW); default is DEFAULT_BATTERY_THRESHOLD.
+    #   Template extracts the minimum 'battery' value from the batteries JSON dict.
+    #   Each level is the battery entity's state, a string, so the levels are
+    #   converted to numbers before the minimum is taken; a level that is no
+    #   finite number, such as "unavailable" or "nan", is left out.
+    if trigger_type == TriggerType.BATTERY_LOW:
+        battery_template = (
+            "{%- set bat = state.attributes.get('batteries', '{}') | from_json -%}"
+            "{%- set levels = bat.values() | map(attribute='battery')"
+            " | select('is_number') | map('float') | list -%}"
+            "{{ (levels | min) if levels else 101 }}"
+        )
+        numeric_config = _build_numeric(battery_template)
+        if CONF_BELOW not in numeric_config:
+            numeric_config[CONF_BELOW] = DEFAULT_BATTERY_THRESHOLD
+        numeric_config = await numeric_state_trigger.async_validate_trigger_config(
+            hass, numeric_config
+        )
+        return await numeric_state_trigger.async_attach_trigger(
+            hass, numeric_config, action, trigger_info, platform_type="device"
+        )
+
+    # Purpose-specific trigger: device_error
+    #   Fires when the errors attribute contains at least one entry.
+    if trigger_type == TriggerType.DEVICE_ERROR:
+        error_template = (
+            "{{ (state.attributes.get('errors', '[]') | from_json | length) }}"
+        )
+        numeric_config = {
+            numeric_state_trigger.CONF_PLATFORM: "numeric_state",
+            numeric_state_trigger.CONF_ENTITY_ID: entity_id,
+            numeric_state_trigger.CONF_VALUE_TEMPLATE: error_template,
+            CONF_ABOVE: 0,
+        }
+        if CONF_FOR in config:
+            numeric_config[CONF_FOR] = config[CONF_FOR]
+        numeric_config = await numeric_state_trigger.async_validate_trigger_config(
+            hass, numeric_config
+        )
+        return await numeric_state_trigger.async_attach_trigger(
+            hass, numeric_config, action, trigger_info, platform_type="device"
+        )
+
+    # Purpose-specific trigger: target_temp_reached
+    #   Fires when current_temperature >= target_temperature. The template
+    #   renders 1 then and 0 otherwise, also while either value is missing.
+    #   A thermostat with a cooler publishes a range instead of a single
+    #   target, and its heating target is the lower end of that range.
+    if trigger_type == TriggerType.TARGET_TEMP_REACHED:
+        reached_template = (
+            "{%- set current = state.attributes.get('current_temperature') -%}"
+            "{%- set single = state.attributes.get('temperature') -%}"
+            "{%- set target = single if single is number"
+            " else state.attributes.get('target_temp_low') -%}"
+            "{{ 1 if current is number and target is number"
+            " and current >= target else 0 }}"
+        )
+        numeric_config = {
+            numeric_state_trigger.CONF_PLATFORM: "numeric_state",
+            numeric_state_trigger.CONF_ENTITY_ID: entity_id,
+            numeric_state_trigger.CONF_VALUE_TEMPLATE: reached_template,
+            CONF_ABOVE: 0.5,
+        }
+        if CONF_FOR in config:
+            numeric_config[CONF_FOR] = config[CONF_FOR]
+        numeric_config = await numeric_state_trigger.async_validate_trigger_config(
+            hass, numeric_config
+        )
+        return await numeric_state_trigger.async_attach_trigger(
+            hass, numeric_config, action, trigger_info, platform_type="device"
+        )
+
+    # Classic trigger: hvac_mode_changed
+    if trigger_type == TriggerType.HVAC_MODE_CHANGED:
+        if CONF_TO not in config:
+            # Refused here rather than in the schema: a schema error disables
+            # the whole automation, this leaves its other triggers working.
+            _LOGGER.error(
+                "Better Thermostat trigger hvac_mode_changed on %s names no mode "
+                "to watch for; add 'to' with the mode, the trigger watches "
+                "nothing until then",
+                entity_id,
+            )
+            return lambda: None
+        state_config = {
+            state_trigger.CONF_PLATFORM: "state",
+            state_trigger.CONF_ENTITY_ID: entity_id,
+            CONF_TO: config[CONF_TO],
+            CONF_FROM: [mode for mode in HVAC_MODES if mode != config[CONF_TO]],
+        }
+        if CONF_FOR in config:
+            state_config[CONF_FOR] = config[CONF_FOR]
+        state_config = await state_trigger.async_validate_trigger_config(
+            hass, state_config
+        )
+        return await state_trigger.async_attach_trigger(
+            hass, state_config, action, trigger_info, platform_type="device"
+        )
+
+    # Classic triggers: current_temperature_changed / current_humidity_changed
+    #   Without a threshold the trigger fires on every change of the value. A
+    #   value that goes missing or comes back is no change, so a sensor
+    #   dropping out fires nothing.
+    if CONF_ABOVE not in config and CONF_BELOW not in config:
+        state_config = {
+            state_trigger.CONF_PLATFORM: "state",
+            state_trigger.CONF_ENTITY_ID: entity_id,
+            CONF_ATTRIBUTE: CLASSIC_VALUE_ATTRIBUTES[trigger_type],
+            CONF_NOT_FROM: [None],
+            CONF_NOT_TO: [None],
+        }
+        if CONF_FOR in config:
+            state_config[CONF_FOR] = config[CONF_FOR]
+        state_config = await state_trigger.async_validate_trigger_config(
+            hass, state_config
+        )
+        return await state_trigger.async_attach_trigger(
+            hass, state_config, action, trigger_info, platform_type="device"
+        )
+    numeric_config = _build_numeric(CLASSIC_VALUE_TEMPLATES[trigger_type])
+    numeric_config = await numeric_state_trigger.async_validate_trigger_config(
+        hass, numeric_config
+    )
+    return await numeric_state_trigger.async_attach_trigger(
+        hass, numeric_config, action, trigger_info, platform_type="device"
+    )
+
+
+async def async_get_trigger_capabilities(
+    hass: HomeAssistant, config: ConfigType
+) -> dict[str, vol.Schema]:
+    """List trigger capabilities (extra fields shown in the automation editor)."""
+    trigger_type = config[CONF_TYPE]
+
+    # Triggers with a "for" duration option only
+    if trigger_type in {
+        TriggerType.HEATING_ACTIVE,
+        TriggerType.HEATING_STOPPED,
+        TriggerType.WINDOW_OPENED,
+        TriggerType.WINDOW_CLOSED,
+        TriggerType.DEVICE_ERROR,
+        TriggerType.TARGET_TEMP_REACHED,
+    }:
+        return {
+            "extra_fields": vol.Schema(
+                {vol.Optional(CONF_FOR): cv.positive_time_period_dict}
+            )
+        }
+
+    # humidity_high: configurable threshold + duration
+    if trigger_type == TriggerType.HUMIDITY_HIGH:
+        return {
+            "extra_fields": vol.Schema(
+                {
+                    vol.Optional(
+                        CONF_ABOVE,
+                        description={"suffix": PERCENTAGE},
+                        default=DEFAULT_HUMIDITY_THRESHOLD,
+                    ): vol.Coerce(float),
+                    vol.Optional(CONF_FOR): cv.positive_time_period_dict,
+                }
+            )
+        }
+
+    # battery_low: configurable threshold + duration
+    if trigger_type == TriggerType.BATTERY_LOW:
+        return {
+            "extra_fields": vol.Schema(
+                {
+                    vol.Optional(
+                        CONF_BELOW,
+                        description={"suffix": PERCENTAGE},
+                        default=DEFAULT_BATTERY_THRESHOLD,
+                    ): vol.Coerce(float),
+                    vol.Optional(CONF_FOR): cv.positive_time_period_dict,
+                }
+            )
+        }
+
+    # Classic trigger: hvac_mode_changed
+    if trigger_type == TriggerType.HVAC_MODE_CHANGED:
+        return {
+            "extra_fields": vol.Schema(
+                {
+                    vol.Required(CONF_TO): vol.In(HVAC_MODES),
+                    vol.Optional(CONF_FOR): cv.positive_time_period_dict,
+                }
+            )
+        }
+
+    # Classic triggers: temperature / humidity value thresholds
+    if trigger_type in {
+        TriggerType.CURRENT_TEMPERATURE_CHANGED,
+        TriggerType.CURRENT_HUMIDITY_CHANGED,
+    }:
+        unit = (
+            hass.config.units.temperature_unit
+            if trigger_type == TriggerType.CURRENT_TEMPERATURE_CHANGED
+            else PERCENTAGE
+        )
+        return {
+            "extra_fields": vol.Schema(
+                {
+                    vol.Optional(CONF_ABOVE, description={"suffix": unit}): vol.Coerce(
+                        float
+                    ),
+                    vol.Optional(CONF_BELOW, description={"suffix": unit}): vol.Coerce(
+                        float
+                    ),
+                    vol.Optional(CONF_FOR): cv.positive_time_period_dict,
+                }
+            )
+        }
+
+    return {}

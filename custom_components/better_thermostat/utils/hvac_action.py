@@ -1,0 +1,196 @@
+"""HVAC action computation with tolerance-based hysteresis."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+from homeassistant.components.climate.const import HVACAction, HVACMode
+
+
+@dataclass
+class ToleranceHysteresis:
+    """Mutable hysteresis state for the tolerance state-machine."""
+
+    last_action: HVACAction = field(default=HVACAction.IDLE)
+    hold_active: bool = False
+
+
+@dataclass(frozen=True)
+class HvacActionResult:
+    """Immutable result of a single HVAC-action computation."""
+
+    action: HVACAction
+    tolerance_decision: HVACAction
+    new_last_action: HVACAction
+    new_hold_active: bool
+
+
+def parse_hvac_action(value: object) -> HVACAction | None:
+    """Return the HVAC action a device reports, or None for one it does not name.
+
+    The value is matched regardless of case and surrounding whitespace. A
+    device can carry values in its action attribute that are no HVAC action
+    at all, and those name none.
+    """
+    try:
+        return HVACAction(str(value).strip().lower())
+    except ValueError:
+        return None
+
+
+def should_heat_with_tolerance(
+    room_temperature: float,
+    heat_target_temperature: float,
+    tolerance: float,
+    previous_action: HVACAction | None,
+) -> bool:
+    """Determine whether heating should be active based on hysteresis.
+
+    Band: ``[target - tolerance, target)``
+    * Start heating when ``room_temperature < target - tolerance``.
+    * Continue heating (if already heating) until ``room_temperature >= target``.
+    * Stop at ``target`` – never heat *above* target.
+    """
+    tolerance = max(0.0, tolerance)
+    heat_off_threshold = heat_target_temperature
+    heat_on_threshold = heat_target_temperature - tolerance
+    if previous_action == HVACAction.HEATING:
+        return room_temperature < heat_off_threshold
+    return room_temperature < heat_on_threshold
+
+
+# Minimum width of the cooling decision band. A tolerance narrower than this
+# leaves the room temperature resting on an edge, where it flips the decision —
+# and produces a write — on every control cycle; the missing width is taken
+# from below the cooling target to keep the switch-on edge where the tolerance
+# puts it. Two steps of a 0.1 °C room sensor, which is what the flip is made
+# of; and well under the 0.5 °C a cooling setpoint is set in, so the extra run
+# time the band costs is finer than the user can express in the target anyway.
+COOLER_MODE_HYSTERESIS_K = 0.2
+
+
+def should_cool_with_tolerance(
+    room_temperature: float,
+    cool_target_temperature: float,
+    tolerance: float,
+    previously_cooling: bool,
+    min_band: float = 0.0,
+) -> bool:
+    """Determine whether cooling should be active based on hysteresis.
+
+    Band: ``[cool_target_temperature, cool_target_temperature + tolerance]``
+    * Start cooling when ``room_temperature >= cool_target_temperature + tolerance``.
+    * Continue cooling (if already cooling) until ``room_temperature < cool_target_temperature``.
+    * A band narrower than ``min_band`` takes the missing width from below
+      ``cool_target_temperature``, so a room temperature resting on an edge cannot flip
+      the decision on every cycle. The switch-on edge never moves for it.
+    """
+    tolerance = max(0.0, tolerance)
+    if previously_cooling:
+        return room_temperature >= cool_target_temperature - max(
+            0.0, min_band - tolerance
+        )
+    return room_temperature >= cool_target_temperature + tolerance
+
+
+def compute_hvac_action(
+    hysteresis: ToleranceHysteresis,
+    room_temperature: float | None,
+    heat_target_temperature: float,
+    cool_target_temperature: float | None,
+    hvac_mode: HVACMode | None,
+    bt_hvac_mode: HVACMode | None,
+    window_open: bool | None,
+    tolerance: float,
+    cool_previously_active: bool = False,
+) -> HvacActionResult:
+    """Compute the current HVAC action without mutating *hysteresis*.
+
+    Rules
+    -----
+    - OFF mode → OFF regardless of temperatures.
+    - Open window → IDLE (suppresses active heating/cooling).
+    - Heating uses a hysteresis band ``[target - tolerance, target]``.
+    - Cooling when ``heat_cool``, the cooling hysteresis calls for it and the
+      room is above the heating target. ``cool_previously_active`` carries the
+      band's hold edge, which the caller seeds the way the cooler command does.
+    - Otherwise IDLE. What a TRV reports about its own valve does not enter:
+      the action is the room's decision, not a mirror of the devices.
+    """
+    prev_action = hysteresis.last_action
+
+    if HVACMode.OFF in (hvac_mode, bt_hvac_mode):
+        return HvacActionResult(
+            action=HVACAction.OFF,
+            tolerance_decision=HVACAction.OFF,
+            new_last_action=HVACAction.IDLE,
+            new_hold_active=False,
+        )
+
+    if room_temperature is None:
+        return HvacActionResult(
+            action=HVACAction.IDLE,
+            tolerance_decision=HVACAction.IDLE,
+            new_last_action=HVACAction.IDLE,
+            new_hold_active=False,
+        )
+
+    if window_open:
+        return HvacActionResult(
+            action=HVACAction.IDLE,
+            tolerance_decision=HVACAction.IDLE,
+            new_last_action=HVACAction.IDLE,
+            new_hold_active=False,
+        )
+
+    # Tolerance-based heating decision
+    heating_allowed = hvac_mode in (HVACMode.HEAT, HVACMode.HEAT_COOL)
+    action = HVACAction.IDLE
+    tolerance_hold = False
+
+    if heating_allowed:
+        if should_heat_with_tolerance(
+            room_temperature, heat_target_temperature, tolerance, prev_action
+        ):
+            action = HVACAction.HEATING
+        else:
+            tolerance_hold = True
+
+    tolerance_decision = action
+
+    # Cooling decision: the same predicate, the same minimum band and the same
+    # heating-target floor the cooler command applies, so the reported action
+    # and the command agree by construction rather than by two implementations
+    # staying in step. COOLING means the cooler is being commanded on, not that
+    # the room is being cooled by something. The report may lag the command by
+    # one cycle, which is correct: it reports what is running.
+    if (
+        hvac_mode == HVACMode.HEAT_COOL
+        and cool_target_temperature is not None
+        and should_cool_with_tolerance(
+            room_temperature,
+            cool_target_temperature,
+            tolerance,
+            cool_previously_active,
+            min_band=COOLER_MODE_HYSTERESIS_K,
+        )
+        and room_temperature > heat_target_temperature
+    ):
+        action = HVACAction.COOLING
+        tolerance_hold = False
+
+    # The heating hysteresis remembers the heating decision; a cooling action
+    # leaves it idle.
+    new_last_action = (
+        HVACAction.HEATING
+        if tolerance_decision == HVACAction.HEATING
+        else HVACAction.IDLE
+    )
+    new_hold_active = tolerance_hold and action != HVACAction.COOLING
+
+    return HvacActionResult(
+        action=action,
+        tolerance_decision=tolerance_decision,
+        new_last_action=new_last_action,
+        new_hold_active=new_hold_active,
+    )

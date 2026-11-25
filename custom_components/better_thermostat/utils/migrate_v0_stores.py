@@ -1,0 +1,236 @@
+"""One-time migration from four separate Store files to unified StateManager.
+
+Before the unified ``StateManager`` was introduced, Better Thermostat
+persisted calibration state across four independent HA Store files:
+
+- ``better_thermostat_mpc_states``
+- ``better_thermostat_pid_states``
+- ``better_thermostat_tpi_states``
+- ``better_thermostat_thermal_stats``
+
+This module reads those files (if present), filters entries belonging to
+the current config entry, and imports them into the unified store.  It
+runs once on startup when the unified store is still empty.
+
+Once enough time has passed for all installations to have migrated, this
+entire module can be deleted and its single call site in ``climate.py``
+removed.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+import logging
+
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.storage import Store
+
+from .const import DOMAIN
+from .state_manager import (
+    StateManager,
+    ThermalStats,
+    deserialize_mpc,
+    deserialize_pid,
+    deserialize_tpi,
+)
+from .stored_values import finite_or_none, is_json_object
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def _legacy_thermal_stat(
+    thermal_data: Mapping[str, object], field: str
+) -> float | None:
+    """Read one thermal statistic from a legacy store, unset if unusable.
+
+    A legacy file can hold a value ``float()`` refuses or a non-finite
+    number. Importing it as unset lets the rest of the migration finish and
+    be saved; letting the parse error out would abandon the import halfway
+    and leave the migration to run again on every start.
+
+    Parameters
+    ----------
+    thermal_data : Mapping[str, object]
+        the legacy store's thermal section
+    field : str
+        name of the statistic to read from it
+
+    Returns
+    -------
+    float | None
+        the statistic as a finite float, or None when it is unusable
+    """
+    raw_value = thermal_data.get(field)
+    value = finite_or_none(raw_value)
+    if value is None and raw_value is not None:
+        _LOGGER.warning(
+            "better_thermostat: legacy thermal stat %s holds %r, which is not a "
+            "finite number; importing it as unset",
+            field,
+            raw_value,
+        )
+    return value
+
+
+def _import_legacy_data(
+    state_mgr: StateManager,
+    *,
+    mpc_data: Mapping[str, Mapping[str, object]] | None = None,
+    pid_data: Mapping[str, Mapping[str, object]] | None = None,
+    tpi_data: Mapping[str, Mapping[str, object]] | None = None,
+    thermal_data: Mapping[str, object] | None = None,
+) -> None:
+    """Deserialize raw dicts from legacy stores into the unified state.
+
+    Parameters
+    ----------
+    state_mgr:
+        The StateManager to populate.
+    mpc_data:
+        Key → raw-dict mapping loaded from the legacy MPC store,
+        already filtered to the current entity prefix.
+    pid_data:
+        Key → raw-dict mapping loaded from the legacy PID store,
+        already filtered to the current entity prefix.
+    tpi_data:
+        Key → raw-dict mapping loaded from the legacy TPI store,
+        already filtered to the current entity prefix.
+    thermal_data:
+        Raw dict for the thermal stats entry of this config entry.
+    """
+    if mpc_data:
+        for key, state_dict in mpc_data.items():
+            state_mgr.set_mpc(key, deserialize_mpc(state_dict, key=key))
+
+    if pid_data:
+        for key, state_dict in pid_data.items():
+            state_mgr.set_pid(key, deserialize_pid(state_dict, key=key))
+
+    if tpi_data:
+        for key, state_dict in tpi_data.items():
+            state_mgr.set_tpi(key, deserialize_tpi(state_dict, key=key))
+
+    if thermal_data:
+        state_mgr.thermal = ThermalStats(
+            heating_power=_legacy_thermal_stat(thermal_data, "heating_power"),
+            heat_loss_rate=_legacy_thermal_stat(thermal_data, "heat_loss_rate"),
+        )
+
+
+def _filter_by_prefix(
+    raw: Mapping[str, object], prefix: str
+) -> dict[str, Mapping[str, object]]:
+    """Return only entries whose key starts with *prefix* and whose value is an object."""
+    return {k: v for k, v in raw.items() if k.startswith(prefix) and is_json_object(v)}
+
+
+async def migrate_v0_stores(
+    hass: HomeAssistant,
+    state_mgr: StateManager,
+    entity_prefix: str,
+    config_entry_id: str,
+) -> None:
+    """Migrate data from the four legacy Store files into the unified store.
+
+    Skips silently when the unified store already contains data (i.e. the
+    migration has already run or the user started fresh).  After a
+    successful import the unified store is saved immediately, unless the
+    entity was removed in the meantime and its final flush saves it.  The
+    legacy files are **not** deleted so that a rollback to the previous
+    version remains possible.
+
+    Parameters
+    ----------
+    hass:
+        The Home Assistant instance.
+    state_mgr:
+        The (already loaded) unified StateManager.
+    entity_prefix:
+        The entity-scoped key prefix, typically ``f"{unique_id}:"``.
+    config_entry_id:
+        The config entry ID (used to look up thermal stats).
+    """
+    # If the unified store already has data, skip migration.
+    current_state = state_mgr.state
+    if current_state.mpc or current_state.pid or current_state.tpi:
+        return
+    if (
+        current_state.thermal.heating_power is not None
+        or current_state.thermal.heat_loss_rate is not None
+    ):
+        return
+
+    any_imported = False
+
+    # MPC legacy
+    try:
+        mpc_store: Store[Mapping[str, object]] = Store(hass, 1, f"{DOMAIN}_mpc_states")
+        mpc_raw = await mpc_store.async_load()
+        if is_json_object(mpc_raw):
+            entity_entries = _filter_by_prefix(mpc_raw, entity_prefix)
+            if entity_entries:
+                _import_legacy_data(state_mgr, mpc_data=entity_entries)
+                any_imported = True
+    except Exception:
+        _LOGGER.debug(
+            "better_thermostat [%s]: legacy MPC store not imported",
+            config_entry_id,
+            exc_info=True,
+        )
+
+    # PID legacy
+    try:
+        pid_store: Store[Mapping[str, object]] = Store(hass, 1, f"{DOMAIN}_pid_states")
+        pid_raw = await pid_store.async_load()
+        if is_json_object(pid_raw):
+            entity_entries = _filter_by_prefix(pid_raw, entity_prefix)
+            if entity_entries:
+                _import_legacy_data(state_mgr, pid_data=entity_entries)
+                any_imported = True
+    except Exception:
+        _LOGGER.debug(
+            "better_thermostat [%s]: legacy PID store not imported",
+            config_entry_id,
+            exc_info=True,
+        )
+
+    # TPI legacy
+    try:
+        tpi_store: Store[Mapping[str, object]] = Store(hass, 1, f"{DOMAIN}_tpi_states")
+        tpi_raw = await tpi_store.async_load()
+        if is_json_object(tpi_raw):
+            entity_entries = _filter_by_prefix(tpi_raw, entity_prefix)
+            if entity_entries:
+                _import_legacy_data(state_mgr, tpi_data=entity_entries)
+                any_imported = True
+    except Exception:
+        _LOGGER.debug(
+            "better_thermostat [%s]: legacy TPI store not imported",
+            config_entry_id,
+            exc_info=True,
+        )
+
+    # Thermal legacy
+    try:
+        thermal_store: Store[Mapping[str, object]] = Store(
+            hass, 1, f"{DOMAIN}_thermal_stats"
+        )
+        thermal_raw = await thermal_store.async_load()
+        if is_json_object(thermal_raw):
+            thermal_entry = thermal_raw.get(config_entry_id)
+            if is_json_object(thermal_entry):
+                _import_legacy_data(state_mgr, thermal_data=thermal_entry)
+                any_imported = True
+    except Exception:
+        _LOGGER.debug(
+            "better_thermostat [%s]: legacy thermal store not imported",
+            config_entry_id,
+            exc_info=True,
+        )
+
+    if any_imported:
+        await state_mgr.save_unless_closed()
+        _LOGGER.info(
+            "better_thermostat [%s]: migrated v0 stores to unified state",
+            config_entry_id,
+        )
