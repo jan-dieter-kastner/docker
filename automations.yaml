@@ -1,73 +1,57 @@
 - id: '1718632821688'
   alias: awtrixx_dnd_button
-  description: ''
-  trigger:
-  - platform: state
-    entity_id:
-    - input_button.awtrixx_dnd
-  condition: []
-  action:
-  - service: script.awtrix_set_to_dnd
-    metadata: {}
-    data: {}
+  description: Shows Nicht stören on the matrix display.
+  triggers:
+  - entity_id: input_button.awtrixx_dnd
+    trigger: state
+  conditions: []
+  actions:
+  - action: script.awtrix_set_to_dnd
   mode: single
 - id: '1718632884473'
   alias: awtrixx_welcome_button
-  description: ''
-  trigger:
-  - platform: state
-    entity_id:
-    - input_button.awtrixx_welcome
-  condition: []
-  action:
-  - service: script.awtrix_set_to_welcome
-    metadata: {}
-    data: {}
+  description: Shows the welcome text on the matrix display.
+  triggers:
+  - entity_id: input_button.awtrixx_welcome
+    trigger: state
+  conditions: []
+  actions:
+  - action: script.awtrix_set_to_welcome
   mode: single
 - id: '1718702805965'
   alias: awtrixx_clear_button
-  description: ''
-  trigger:
-  - platform: state
-    entity_id:
-    - input_button.awtrixx_clear
-  condition: []
-  action:
-  - device_id: f03f08f2c21c84c4c13beec2b790406a
-    domain: button
-    entity_id: 88964ad6ea86e296e0715cad577105e3
-    type: press
+  description: Dismisses the held notification on the matrix display.
+  triggers:
+  - entity_id: input_button.awtrixx_clear
+    trigger: state
+  conditions: []
+  actions:
+  - action: button.press
+    target:
+      entity_id: button.awtrix_1222c4_dismiss_notification
   mode: single
 - id: '1719141497062'
   alias: AWTRIXX Beer
-  description: ''
-  trigger:
-  - platform: state
-    entity_id:
-    - input_button.awtrixx_beer
-  condition: []
-  action:
-  - service: script.awtrix_set_to_beer
-    metadata: {}
-    data: {}
+  description: Shows the beer text on the matrix display.
+  triggers:
+  - entity_id: input_button.awtrixx_beer
+    trigger: state
+  conditions: []
+  actions:
+  - action: script.awtrix_set_to_beer
   mode: single
 - id: '1729632853989'
   alias: Tiffanylampe an
-  description: ''
+  description: Turns the Tiffany lamp on at sunset.
   triggers:
-  - trigger: sun
-    event: sunset
-    offset: 0
+  - event: sunset
+    offset: 00:00:00
+    trigger: sun
   conditions: []
   actions:
-  - type: turn_on
-    device_id: 34a0af945ed27f5b3b1dbffc4dd9be79
-    entity_id: 9d89f40d6cee465787828b3c74adaa52
-    domain: switch
-  - type: turn_on
-    device_id: 1a2dd87db233625cc9378de977958f21
-    entity_id: 3bd503df2d4f94f899a37f79022d83c3
-    domain: switch
+  - action: switch.turn_on
+    target:
+      entity_id: switch.tz3000_w0qqde0g_ts011f_3
   mode: single
 - id: '1730374885954'
   alias: Badlicht an
@@ -126,42 +110,35 @@
   mode: single
 - id: '1732974471631'
   alias: Tiffanylampe aus
-  description: ''
+  description: Turns the Tiffany lamp off six hours after sunset.
   triggers:
-  - trigger: sun
-    event: sunset
+  - event: sunset
     offset: 06:00:00
+    trigger: sun
   conditions: []
   actions:
-  - type: turn_off
-    device_id: 34a0af945ed27f5b3b1dbffc4dd9be79
-    entity_id: 9d89f40d6cee465787828b3c74adaa52
-    domain: switch
-  - type: turn_off
-    device_id: 1a2dd87db233625cc9378de977958f21
-    entity_id: 3bd503df2d4f94f899a37f79022d83c3
-    domain: switch
+  - action: switch.turn_off
+    target:
+      entity_id: switch.tz3000_w0qqde0g_ts011f_3
   mode: single
 - id: '1733346185394'
   alias: Tablet Strom aus
-  description: ''
+  description: Turns the tablet socket off once the Fire Tablet battery stays above
+    80%.
   triggers:
-  - type: battery_level
-    device_id: d66c89541af77f63edf01e7b52e49047
-    entity_id: 41a3aad67e4fa09996fcc9d188480ded
-    domain: sensor
-    trigger: device
-    above: 80
+  - above: 80
+    entity_id: sensor.fire_tablet_batterie
     for:
-      hours: 0
-      minutes: 0
       seconds: 1
-  conditions: []
+    trigger: numeric_state
+  conditions:
+  - condition: template
+    value_template: '{{ trigger.from_state.state not in [''unavailable'', ''unknown'',
+      ''none''] }}'
   actions:
-  - type: turn_off
-    device_id: 1a2dd87db233625cc9378de977958f21
-    entity_id: 3bd503df2d4f94f899a37f79022d83c3
-    domain: switch
+  - action: switch.turn_off
+    target:
+      entity_id: switch.tz3000_w0qqde0g_ts011f
   mode: single
 - id: '1733346265885'
   alias: Tablet Strom an
@@ -218,72 +195,58 @@
   mode: single
 - id: '1733852211333'
   alias: Gästebad heizung fenster
-  description: ''
+  description: 'Setzt die Fensterkennung der Gästebadheizung passend zum Fenster:
+    an bei offen, aus bei zu.'
   triggers:
-  - trigger: state
-    entity_id:
-    - binary_sensor.fenster_gastebad_contact
-  conditions: []
+  - entity_id: binary_sensor.fenster_gastebad_offnung
+    to:
+    - 'on'
+    - 'off'
+    trigger: state
+  - event: start
+    trigger: homeassistant
   actions:
-  - type: toggle
-    device_id: d01857fa86a1d1ebae843e96f5df5964
-    entity_id: c69b87e4c8f47333e93534e989c58b65
-    domain: switch
+  - choose:
+    - conditions:
+      - condition: state
+        entity_id: binary_sensor.fenster_gastebad_offnung
+        state: 'on'
+      sequence:
+      - action: switch.turn_on
+        target:
+          entity_id: switch.heizung_gastebad_geoffnetes_fenster
+    - conditions:
+      - condition: state
+        entity_id: binary_sensor.fenster_gastebad_offnung
+        state: 'off'
+      sequence:
+      - action: switch.turn_off
+        target:
+          entity_id: switch.heizung_gastebad_geoffnetes_fenster
   mode: single
 - id: '1739628863820'
   alias: Alle aus dem Haus
-  description: ''
+  description: When both Jan and Sylvia have left, enable motion detection on the
+    front-door camera.
   triggers:
-  - trigger: state
-    entity_id:
-    - device_tracker.unifi_default_46_4a_c7_41_d1_70
-    - device_tracker.iphone_4
+  - entity_id:
+    - person.jan_dieter_kastner
+    - person.sylvia_kastner
     to: not_home
+    trigger: state
   conditions:
-  - condition: not
-    conditions:
-    - condition: state
-      entity_id: device_tracker.unifi_default_46_4a_c7_41_d1_70
-      state: home
-    - condition: and
-      conditions:
-      - condition: state
-        entity_id: device_tracker.iphone_4
-        state: home
+  - condition: state
+    entity_id:
+    - person.jan_dieter_kastner
+    - person.sylvia_kastner
+    state: not_home
   actions:
   - action: camera.enable_motion_detection
-    metadata: {}
-    data: {}
     target:
-      device_id:
-      - 67a2fc80e59534b5d96d33cc8a46b209
-      - 0d0fe49841647f1a5cd38c08a598e013
-      - eca7ac8782408f521b81735dc2204aab
+      entity_id:
+      - camera.haustur
+      - camera.haustur_live_ansicht
   mode: single
-- id: '1739818641006'
-  alias: Mindestens einer zu Hause
-  description: ''
-  triggers:
-  - trigger: state
-    entity_id:
-    - device_tracker.unifi_default_46_4a_c7_41_d1_70
-    - device_tracker.iphone_4
-    to: home
-  conditions: []
-  actions:
-  - action: camera.disable_motion_detection
-    metadata: {}
-    data: {}
-    target:
-      device_id:
-      - 67a2fc80e59534b5d96d33cc8a46b209
-      - 0d0fe49841647f1a5cd38c08a598e013
-  mode: single
-- id: '1774518977784'
-  alias: low battery
-  description: ''
-  use_blueprint:
-    path: andrew-codechimp/battery_notes_battery_threshold.yaml
 - id: '1774519019544'
   alias: low battery
   description: ''
@@ -291,35 +254,441 @@
     path: andrew-codechimp/battery_notes_battery_threshold.yaml
 - id: '1793206472619'
   alias: wasserleck spüle
-  description: ''
+  description: Sirene im Flur und Nachricht an beide Telefone, wenn der Sensor unter
+    der Spüle Wasser meldet.
   triggers:
-  - trigger: moisture.detected
-    target:
-      device_id: 141dbc36b3ad0b266e41ab4d1ec63459
-    options:
+  - options:
       behavior: each
-  conditions: []
+    target:
+      entity_id: binary_sensor.wasserleck_spule
+    trigger: moisture.detected
   actions:
   - action: siren.turn_on
-    metadata: {}
     target:
       entity_id: siren.flur_sirene
-    data: {}
+  - action: notify.mobile_app_jdk_iphone_16
+    data:
+      message: Wasser unter der Spüle.
+      title: Wasserleck
+  - action: notify.mobile_app_sylvias_iphone
+    data:
+      message: Wasser unter der Spüle.
+      title: Wasserleck
   mode: single
 - id: '1793206566448'
   alias: wasserleck waschmaschine
-  description: ''
+  description: Sirene im Flur und Nachricht an beide Telefone, wenn der Sensor an
+    der Waschmaschine Wasser meldet.
   triggers:
-  - trigger: moisture.detected
-    target:
-      device_id: 50399cde9cadebc75c24995b69053e3d
-    options:
+  - options:
       behavior: each
-  conditions: []
+    target:
+      entity_id: binary_sensor.wasserleck_waschmaschine
+    trigger: moisture.detected
   actions:
   - action: siren.turn_on
-    metadata: {}
     target:
       entity_id: siren.flur_sirene
-    data: {}
+  - action: notify.mobile_app_jdk_iphone_16
+    data:
+      message: Wasser an der Waschmaschine.
+      title: Wasserleck
+  - action: notify.mobile_app_sylvias_iphone
+    data:
+      message: Wasser an der Waschmaschine.
+      title: Wasserleck
+  mode: single
+- id: '1795645967935'
+  alias: Büro heizen im Homeoffice
+  description: Weekdays at 08:00, if the Google working location is Home and the work
+    calendar has no Out of office, and the office is below 19°C, turn on the office
+    fan heater and the floor heating.
+  triggers:
+  - at: 08:00:00
+    note: Once each morning. The weekday filter is a condition so Saturday and Sunday
+      do nothing.
+    trigger: time
+  conditions:
+  - condition: time
+    weekday:
+    - mon
+    - tue
+    - wed
+    - thu
+    - fri
+  - below: 19
+    condition: numeric_state
+    entity_id: sensor.thermometer_buro_temperatur
+    note: Office thermometer. An unavailable reading is false, so the heaters stay
+      off.
+  actions:
+  - action: calendar.get_events
+    data:
+      duration:
+        hours: 24
+      start_date_time: '{{ today_at(''00:00'') }}'
+    response_variable: agenda
+    target:
+      entity_id:
+      - calendar.arbeitsort
+      - calendar.jan_dieter_kastner_ext_veolia_com
+  - if:
+    - '{% set locations = agenda[''calendar.arbeitsort''].events | default([]) %}
+
+      {% set work = agenda[''calendar.jan_dieter_kastner_ext_veolia_com''].events
+      | default([]) %}
+
+      {% set ns = namespace(home=false, ooo=false) %}
+
+      {% for event in locations %}
+
+      {% set summary = (event.summary | default('''')) | lower %}
+
+      {% if summary in [''home'', ''zuhause''] %}
+
+      {% set ns.home = true %}
+
+      {% endif %}
+
+      {% endfor %}
+
+      {% for event in work %}
+
+      {% set summary = (event.summary | default('''')) | lower %}
+
+      {% if ''out of office'' in summary or ''abwesend'' in summary %}
+
+      {% set ns.ooo = true %}
+
+      {% endif %}
+
+      {% endfor %}
+
+      {{ ns.home and not ns.ooo }}'
+    then:
+    - action: switch.turn_on
+      target:
+        entity_id:
+        - switch.smart_heater_buro
+        - switch.tz3000_w0qqde0g_ts011f_6
+  mode: single
+- id: '1795649011295'
+  alias: Matrix nach Kalender
+  description: While the office light is on and Jan's iPhone is home, show Do not
+    disturb during a Veolia calendar event and the welcome text when that calendar
+    is clear.
+  triggers:
+  - trigger: state
+    entity_id: light.tz3000_hafsqare_ts0011
+    to: 'on'
+    id: in_office
+    note: Office light coming on is one half of being at the desk.
+  - trigger: state
+    entity_id: device_tracker.jdk_iphone_16
+    to: home
+    id: in_office
+    note: Companion-app tracker that currently locates Jan.
+  - trigger: calendar
+    entity_id: calendar.jan_dieter_kastner_ext_veolia_com
+    event: start
+    id: event_start
+  - trigger: calendar
+    entity_id: calendar.jan_dieter_kastner_ext_veolia_com
+    event: end
+    id: event_end
+  - trigger: homeassistant
+    event: start
+    id: restart
+  conditions:
+  - condition: state
+    entity_id: light.tz3000_hafsqare_ts0011
+    state: 'on'
+  - condition: state
+    entity_id: device_tracker.jdk_iphone_16
+    state: home
+  actions:
+  - if:
+    - condition: trigger
+      id: event_end
+    then:
+    - delay:
+        seconds: 5
+      note: Let the calendar state settle so an overlapping event stays on Do not
+        disturb.
+  - if:
+    - condition: or
+      conditions:
+      - condition: trigger
+        id: event_start
+      - condition: state
+        entity_id: calendar.jan_dieter_kastner_ext_veolia_com
+        state: 'on'
+    then:
+    - action: script.awtrix_set_to_dnd
+    else:
+    - action: script.awtrix_set_to_welcome
+  mode: queued
+  max: 5
+- id: '1795649540370'
+  alias: Büroheizung aus
+  description: Schaltet Heizlüfter und Fußbodenheizung im Büro aus, wenn das Bürolicht
+    aus geht, das iPhone das Haus verlässt oder es 18:00 ist.
+  triggers:
+  - entity_id: light.tz3000_hafsqare_ts0011
+    id: light_off
+    to: 'off'
+    trigger: state
+  - entity_id: device_tracker.jdk_iphone_16
+    id: left_home
+    to: not_home
+    trigger: state
+  - at: '18:00:00'
+    id: evening
+    trigger: time
+  actions:
+  - action: switch.turn_off
+    target:
+      entity_id:
+      - switch.smart_heater_buro
+      - switch.tz3000_w0qqde0g_ts011f_6
+  mode: single
+- id: '1795649558603'
+  alias: Batterie fast leer
+  description: Nachricht an beide Telefone, wenn eine Batterie 10 Minuten unter 15
+    % bleibt. Jedes Gerät nur über seinen eigenen Batteriesensor, nicht über die Batterie-Notizen-Kopie.
+  triggers:
+  - below: 15
+    entity_id:
+    - sensor.fenster_bad_batterie
+    - sensor.fenster_flur_batterie
+    - sensor.fenster_gastebad_batterie
+    - sensor.fenster_schlafzimmer_links_batterie
+    - sensor.fenster_schlafzimmer_rechts_batterie
+    - sensor.haustur_batterie
+    - sensor.haustur_batterie_2
+    - sensor.heizung_flur_batterie
+    - sensor.heizung_gastebad_batterie
+    - sensor.heizung_kinderzimmer_batterie
+    - sensor.heizung_wohnzimmer_links_batterie
+    - sensor.heizung_wohnzimmer_rechts_batterie
+    - sensor.sonoff_trvzb_batterie
+    - sensor.sonoff_trvzb_batterie_3
+    - sensor.ikea_of_sweden_rodret_dimmer_batterie
+    - sensor.sonoff_snzb_02d_batterie_2
+    - sensor.sonoff_snzb_02d_batterie_3
+    - sensor.sonoff_snzb_02d_batterie_6
+    - sensor.terassentur_batterie
+    - sensor.thermometer_buro_batterie
+    - sensor.thermometer_kuche_batterie
+    - sensor.thermomter_wohnzimmer_batterie
+    - sensor.wasserleck_spule_batterie
+    - sensor.wasserleck_waschmaschine_batterie
+    for:
+      minutes: 10
+    trigger: numeric_state
+  conditions:
+  - condition: template
+    value_template: '{{ trigger.platform == ''numeric_state'' and trigger.from_state
+      is not none and is_number(trigger.from_state.state) }}'
+  actions:
+  - action: notify.mobile_app_jdk_iphone_16
+    data:
+      message: '{{ trigger.to_state.name }} ist bei {{ trigger.to_state.state }} %.'
+      title: Batterie fast leer
+  - action: notify.mobile_app_sylvias_iphone
+    data:
+      message: '{{ trigger.to_state.name }} ist bei {{ trigger.to_state.state }} %.'
+      title: Batterie fast leer
+  max: 10
+  mode: parallel
+- id: '1795649562045'
+  alias: Licht aus wenn niemand zu Hause
+  description: Schaltet Tiffany, beide Wagenfeld-Lampen, den Stern, Arco, die Schrankbeleuchtung
+    und die Raumlichtschalter aus, wenn Jan und Sylvia beide nicht zu Hause sind.
+    Tabletsteckdose und Fußbodenheizung bleiben unberührt.
+  triggers:
+  - entity_id:
+    - person.jan_dieter_kastner
+    - person.sylvia_kastner
+    to: not_home
+    trigger: state
+  conditions:
+  - condition: state
+    entity_id:
+    - person.jan_dieter_kastner
+    - person.sylvia_kastner
+    state: not_home
+  actions:
+  - action: homeassistant.turn_off
+    target:
+      entity_id:
+      - switch.tz3000_w0qqde0g_ts011f_3
+      - switch.tz3000_w0qqde0g_ts011f_4
+      - switch.tz3000_w0qqde0g_ts011f_5
+      - switch.tz3000_w0qqde0g_ts011f_2
+      - light.arco
+      - light.ikea_of_sweden_tradfri_driver_30w
+      - light.tz3000_hafsqare_ts0011
+      - light.tz3000_hafsqare_ts0011_2
+      - light.tz3000_hafsqare_ts0011_3
+      - light.tz3000_hafsqare_ts0011_4
+      - light.tz3000_hafsqare_ts0011_5
+  mode: single
+- id: '1795649569877'
+  alias: Heizung Nachtabsenkung
+  description: Senkt Schlafzimmer, Kinderzimmer und Wohnzimmer um 22:30 auf 17 °C
+    und stellt werktags um 06:30 die gespeicherte Tagestemperatur wieder her. Ein
+    Thermostat, das aus ist, bleibt aus.
+  triggers:
+  - at: '22:30:00'
+    id: night
+    trigger: time
+  - at: 06:30:00
+    id: morning
+    trigger: time
+  conditions:
+  - condition: or
+    conditions:
+    - condition: trigger
+      id: night
+    - condition: time
+      weekday:
+      - mon
+      - tue
+      - wed
+      - thu
+      - fri
+  actions:
+  - choose:
+    - conditions:
+      - condition: trigger
+        id: night
+      sequence:
+      - if:
+        - condition: state
+          entity_id: climate.schlafzimmer
+          state: heat
+        - above: 17.5
+          attribute: temperature
+          condition: numeric_state
+          entity_id: climate.schlafzimmer
+        then:
+        - action: input_number.set_value
+          data:
+            value: '{{ state_attr(''climate.schlafzimmer'', ''temperature'') }}'
+          target:
+            entity_id: input_number.tagestemperatur_schlafzimmer
+        - action: climate.set_temperature
+          data:
+            temperature: 17
+          target:
+            entity_id: climate.schlafzimmer
+      - if:
+        - condition: state
+          entity_id: climate.kinderzimmer
+          state: heat
+        - above: 17.5
+          attribute: temperature
+          condition: numeric_state
+          entity_id: climate.kinderzimmer
+        then:
+        - action: input_number.set_value
+          data:
+            value: '{{ state_attr(''climate.kinderzimmer'', ''temperature'') }}'
+          target:
+            entity_id: input_number.tagestemperatur_kinderzimmer
+        - action: climate.set_temperature
+          data:
+            temperature: 17
+          target:
+            entity_id: climate.kinderzimmer
+      - if:
+        - condition: state
+          entity_id: climate.wohnzimmer_heizung_wohnzimmer
+          state: heat
+        - above: 17.5
+          attribute: temperature
+          condition: numeric_state
+          entity_id: climate.wohnzimmer_heizung_wohnzimmer
+        then:
+        - action: input_number.set_value
+          data:
+            value: '{{ state_attr(''climate.wohnzimmer_heizung_wohnzimmer'', ''temperature'')
+              }}'
+          target:
+            entity_id: input_number.tagestemperatur_wohnzimmer
+        - action: climate.set_temperature
+          data:
+            temperature: 17
+          target:
+            entity_id: climate.wohnzimmer_heizung_wohnzimmer
+    - conditions:
+      - condition: trigger
+        id: morning
+      sequence:
+      - if:
+        - condition: state
+          entity_id: climate.schlafzimmer
+          state: heat
+        then:
+        - action: climate.set_temperature
+          data:
+            temperature: '{{ states(''input_number.tagestemperatur_schlafzimmer'')
+              | float(19) }}'
+          target:
+            entity_id: climate.schlafzimmer
+      - if:
+        - condition: state
+          entity_id: climate.kinderzimmer
+          state: heat
+        then:
+        - action: climate.set_temperature
+          data:
+            temperature: '{{ states(''input_number.tagestemperatur_kinderzimmer'')
+              | float(19.5) }}'
+          target:
+            entity_id: climate.kinderzimmer
+      - if:
+        - condition: state
+          entity_id: climate.wohnzimmer_heizung_wohnzimmer
+          state: heat
+        then:
+        - action: climate.set_temperature
+          data:
+            temperature: '{{ states(''input_number.tagestemperatur_wohnzimmer'') |
+              float(22) }}'
+          target:
+            entity_id: climate.wohnzimmer_heizung_wohnzimmer
+  mode: single
+- id: '1795649571672'
+  alias: Haustür offen
+  description: Nachricht an beide Telefone, wenn die Haustür 10 Minuten offen bleibt.
+  triggers:
+  - entity_id: binary_sensor.haustur_offnung
+    for:
+      minutes: 10
+    to: 'on'
+    trigger: state
+  actions:
+  - action: notify.mobile_app_jdk_iphone_16
+    data:
+      message: Die Haustür ist seit 10 Minuten offen.
+      title: Haustür offen
+  - action: notify.mobile_app_sylvias_iphone
+    data:
+      message: Die Haustür ist seit 10 Minuten offen.
+      title: Haustür offen
+  mode: single
+- id: '1795649573303'
+  alias: Matrix aus beim Verlassen des Büros
+  description: Nimmt die festgehaltene Anzeige vom Matrix-Display, wenn das Bürolicht
+    aus geht.
+  triggers:
+  - entity_id: light.tz3000_hafsqare_ts0011
+    to: 'off'
+    trigger: state
+  actions:
+  - action: button.press
+    target:
+      entity_id: button.awtrix_1222c4_dismiss_notification
   mode: single

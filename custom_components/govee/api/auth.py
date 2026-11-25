@@ -1152,10 +1152,10 @@ class GoveeAuthClient:
                     # (H5110 via H5151), so the BFF list is the only source (#83).
                     settings = _as_dict(device_ext.get("deviceSettings"))
                     battery = settings.get("battery")
-                    # Dehumidifier (H7150/H7152) water-tank-full flag (0/1). The
-                    # developer /device/state poll never carries the
-                    # waterFullEvent value, so the BFF deviceSettings is the only
-                    # readable source (issue #118).
+                    # Dehumidifier (H7150/H7152) ``waterFull`` (0/1). Passed through
+                    # but unused: it is the app's "Full Bucket Alert" notification
+                    # setting, not live tank state. Tank-full comes from the
+                    # OpenAPI ``waterFullEvent`` instead (issue #118).
                     water_full = settings.get("waterFull")
                     tem = ld.get("tem")
                     hum = ld.get("hum")
@@ -1490,6 +1490,25 @@ class GoveeAuthClient:
                     entry[section] = _redact_bff_values(raw)
             out.append(entry)
         return out
+
+    def bff_segment_counts(self) -> dict[str, int]:
+        """Positive ``deviceSettings.segmentCount`` per device of the last BFF list (#301).
+
+        Accepts ints and digit strings; zero, negative, boolean and garbage
+        values are skipped so the Developer API count stays in force.
+        """
+        counts: dict[str, int] = {}
+        for device in self._last_bff_raw_devices:
+            if not isinstance(device, dict):
+                continue
+            device_id = device.get("device")
+            if not isinstance(device_id, str) or not device_id:
+                continue
+            settings = _as_dict(_as_dict(device.get("deviceExt")).get("deviceSettings"))
+            count = _safe_int(settings.get("segmentCount"))
+            if count is not None and count > 0:
+                counts[device_id] = count
+        return counts
 
     async def request_verification_code(
         self,
