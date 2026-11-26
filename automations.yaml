@@ -692,3 +692,259 @@
     target:
       entity_id: button.awtrix_1222c4_dismiss_notification
   mode: single
+- id: '1795685199914'
+  alias: Büro Fernbedienung Anruf und Licht
+  description: 'Mitte kurz schaltet den Anruf an oder aus: Matrix auf Nicht stören,
+    Sonos pausiert nur wenn etwas läuft, und der nächste Druck stellt den Willkommenstext
+    her und spielt nur dann weiter, wenn diese Taste pausiert hat. Mitte lang schaltet
+    die Büroleuchte um.'
+  triggers:
+  - trigger: event
+    event_type: zha_event
+    event_data:
+      device_ieee: 68:0a:e2:ff:fe:36:ca:1f
+      command: toggle
+    id: mitte_kurz
+  - trigger: event
+    event_type: zha_event
+    event_data:
+      device_ieee: 68:0a:e2:ff:fe:36:ca:1f
+      command: move_to_level_with_on_off
+    id: mitte_lang
+  actions:
+  - choose:
+    - conditions:
+      - condition: trigger
+        id: mitte_lang
+      sequence:
+      - if:
+        - condition: state
+          entity_id: input_boolean.buro_fernbedienung_gehalten
+          state: 'off'
+        then:
+        - action: input_boolean.turn_on
+          target:
+            entity_id: input_boolean.buro_fernbedienung_gehalten
+        - action: light.toggle
+          target:
+            entity_id: light.tz3000_hafsqare_ts0011
+          note: Die Büroleuchte kann nur ein- und ausgeschaltet werden.
+      - delay:
+          milliseconds: 1200
+        note: Wiederholte Halte-Signale setzen diese Pause zurück. Erst danach gilt
+          die Taste als losgelassen.
+      - action: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.buro_fernbedienung_gehalten
+    - conditions:
+      - condition: trigger
+        id: mitte_kurz
+      sequence:
+      - action: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.buro_fernbedienung_gehalten
+      - delay:
+          milliseconds: 600
+        note: Der kurze Druck kommt sofort. Das Halten für die Leuchte folgt erst
+          danach, deshalb wird der Anruf so lange zurückgestellt.
+      - if:
+        - condition: state
+          entity_id: input_boolean.buro_fernbedienung_gehalten
+          state: 'on'
+        then:
+        - stop: Mitte wird gehalten, das schaltet die Leuchte.
+      - if:
+        - condition: state
+          entity_id: input_boolean.buro_anruf
+          state: 'off'
+        then:
+        - if:
+          - condition: media_player.is_playing
+            target:
+              entity_id: media_player.buro
+          then:
+          - action: media_player.media_pause
+            target:
+              entity_id: media_player.buro
+            continue_on_error: true
+          - action: input_boolean.turn_on
+            target:
+              entity_id: input_boolean.buro_anruf_musik_pausiert
+          else:
+          - action: input_boolean.turn_off
+            target:
+              entity_id: input_boolean.buro_anruf_musik_pausiert
+        - action: input_boolean.turn_on
+          target:
+            entity_id: input_boolean.buro_anruf
+        - action: script.awtrix_set_to_dnd
+        else:
+        - action: script.awtrix_set_to_welcome
+        - if:
+          - condition: state
+            entity_id: input_boolean.buro_anruf_musik_pausiert
+            state: 'on'
+          then:
+          - action: media_player.media_play
+            target:
+              entity_id: media_player.buro
+            continue_on_error: true
+          - action: input_boolean.turn_off
+            target:
+              entity_id: input_boolean.buro_anruf_musik_pausiert
+        - action: input_boolean.turn_off
+          target:
+            entity_id: input_boolean.buro_anruf
+  mode: restart
+  max_exceeded: silent
+- id: '1795685214361'
+  alias: Büro Fernbedienung Sonos
+  description: Oben und unten ändern die Lautstärke der Sonos im Büro in Schritten
+    von 5 Prozent. Gedrückt halten dreht weiter, bis losgelassen. Links ist der vorherige
+    Titel, rechts der nächste.
+  triggers:
+  - trigger: event
+    event_type: zha_event
+    event_data:
+      device_ieee: 68:0a:e2:ff:fe:36:ca:1f
+      command: step_with_on_off
+    id: lauter
+  - trigger: event
+    event_type: zha_event
+    event_data:
+      device_ieee: 68:0a:e2:ff:fe:36:ca:1f
+      command: move_with_on_off
+    id: lauter_halten
+  - trigger: event
+    event_type: zha_event
+    event_data:
+      device_ieee: 68:0a:e2:ff:fe:36:ca:1f
+      command: step
+    id: leiser
+  - trigger: event
+    event_type: zha_event
+    event_data:
+      device_ieee: 68:0a:e2:ff:fe:36:ca:1f
+      command: move
+    id: leiser_halten
+  - trigger: event
+    event_type: zha_event
+    event_data:
+      device_ieee: 68:0a:e2:ff:fe:36:ca:1f
+      command: move_up_release
+    id: los
+  - trigger: event
+    event_type: zha_event
+    event_data:
+      device_ieee: 68:0a:e2:ff:fe:36:ca:1f
+      command: move_down_release
+    id: los
+  - trigger: event
+    event_type: zha_event
+    event_data:
+      device_ieee: 68:0a:e2:ff:fe:36:ca:1f
+      command: stop
+    id: los
+  - trigger: event
+    event_type: zha_event
+    event_data:
+      device_ieee: 68:0a:e2:ff:fe:36:ca:1f
+      command: stop_with_on_off
+    id: los
+  - trigger: event
+    event_type: zha_event
+    event_data:
+      device_ieee: 68:0a:e2:ff:fe:36:ca:1f
+      command: press
+      params:
+        param1: 257
+    id: zurueck
+  - trigger: event
+    event_type: zha_event
+    event_data:
+      device_ieee: 68:0a:e2:ff:fe:36:ca:1f
+      command: press
+      params:
+        param1: 256
+    id: weiter
+  actions:
+  - choose:
+    - conditions:
+      - condition: trigger
+        id: lauter
+      sequence:
+      - action: media_player.volume_set
+        target:
+          entity_id: media_player.buro
+        data:
+          volume_level: '{{ [0, [1, (state_attr(''media_player.buro'', ''volume_level'')
+            | float(0)) + 0.05] | min] | max }}'
+        continue_on_error: true
+    - conditions:
+      - condition: trigger
+        id: leiser
+      sequence:
+      - action: media_player.volume_set
+        target:
+          entity_id: media_player.buro
+        data:
+          volume_level: '{{ [0, [1, (state_attr(''media_player.buro'', ''volume_level'')
+            | float(0)) - 0.05] | min] | max }}'
+        continue_on_error: true
+    - conditions:
+      - condition: trigger
+        id: lauter_halten
+      sequence:
+      - repeat:
+          count: 30
+          sequence:
+          - action: media_player.volume_set
+            target:
+              entity_id: media_player.buro
+            data:
+              volume_level: '{{ [0, [1, (state_attr(''media_player.buro'', ''volume_level'')
+                | float(0)) + 0.05] | min] | max }}'
+            continue_on_error: true
+          - delay:
+              milliseconds: 350
+        note: Loslassen bricht diese Wiederholung ab, weil die Automation dann neu
+          startet.
+    - conditions:
+      - condition: trigger
+        id: leiser_halten
+      sequence:
+      - repeat:
+          count: 30
+          sequence:
+          - action: media_player.volume_set
+            target:
+              entity_id: media_player.buro
+            data:
+              volume_level: '{{ [0, [1, (state_attr(''media_player.buro'', ''volume_level'')
+                | float(0)) - 0.05] | min] | max }}'
+            continue_on_error: true
+          - delay:
+              milliseconds: 350
+    - conditions:
+      - condition: trigger
+        id: zurueck
+      sequence:
+      - action: media_player.media_previous_track
+        target:
+          entity_id: media_player.buro
+        continue_on_error: true
+    - conditions:
+      - condition: trigger
+        id: weiter
+      sequence:
+      - action: media_player.media_next_track
+        target:
+          entity_id: media_player.buro
+        continue_on_error: true
+    - conditions:
+      - condition: trigger
+        id: los
+      sequence:
+      - stop: Lautstärke losgelassen
+  mode: restart
+  max_exceeded: silent

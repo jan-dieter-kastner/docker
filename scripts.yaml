@@ -7,7 +7,7 @@ awtrix_set_to_dnd:
         topic: awtrix_1222c4/notify
         qos: "2"
         retain: true
-        payload: '{"text":"Nicht stören!","rainbow":true,"icon":651,"hold":true}'
+        payload: '{"text":"Nicht stören!","rainbow":true,"icon":651,"hold":true,"stack":false}'
 
 awtrix_set_to_welcome:
   alias: Set a welcome message on Matrix display
@@ -18,7 +18,7 @@ awtrix_set_to_welcome:
         topic: awtrix_1222c4/notify
         qos: "2"
         retain: true
-        payload: '{"text":"abandon hope all ye who enter here!","rainbow":true,"icon":275,"hold":true}'
+        payload: '{"text":"abandon hope all ye who enter here!","rainbow":true,"icon":275,"hold":true,"stack":false}'
 
 awtrix_set_to_beer:
   alias: Set a beer message on Matrix display
@@ -29,4 +29,4 @@ awtrix_set_to_beer:
         topic: awtrix_1222c4/notify
         qos: "2"
         retain: true
-        payload: '{"text":"Hol Bier und zwar schnell Du armseliges Frettchen","rainbow":true,"icon":3253,"hold":true}'
+        payload: '{"text":"Hol Bier und zwar schnell Du armseliges Frettchen","rainbow":true,"icon":3253,"hold":true,"stack":false}'
