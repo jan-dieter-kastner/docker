@@ -254,8 +254,8 @@
     path: andrew-codechimp/battery_notes_battery_threshold.yaml
 - id: '1793206472619'
   alias: wasserleck spüle
-  description: Sirene im Flur und Nachricht an beide Telefone, wenn der Sensor unter
-    der Spüle Wasser meldet.
+  description: Sirene im Flur, Nachricht an beide Telefone und Durchsage auf den erreichbaren
+    Alexa-Lautsprechern, wenn der Sensor unter der Spüle Wasser meldet.
   triggers:
   - options:
       behavior: each
@@ -274,11 +274,36 @@
     data:
       message: Wasser unter der Spüle.
       title: Wasserleck
+  - parallel:
+    - action: notify.send_message
+      continue_on_error: true
+      data:
+        message: Wasser unter der Spüle.
+      target:
+        entity_id: notify.bad_jan_dieters_echo_show_bad_durchsagen
+    - action: notify.send_message
+      continue_on_error: true
+      data:
+        message: Wasser unter der Spüle.
+      target:
+        entity_id: notify.wohnzimmer_jan_dieter_s_sonos_era_300_durchsagen
+    - action: notify.send_message
+      continue_on_error: true
+      data:
+        message: Wasser unter der Spüle.
+      target:
+        entity_id: notify.jan_dieter_s_sonos_one_second_edition_durchsagen
+    - action: notify.send_message
+      continue_on_error: true
+      data:
+        message: Wasser unter der Spüle.
+      target:
+        entity_id: notify.jan_dieter_s_2nd_sonos_one_second_edition_durchsagen
   mode: single
 - id: '1793206566448'
   alias: wasserleck waschmaschine
-  description: Sirene im Flur und Nachricht an beide Telefone, wenn der Sensor an
-    der Waschmaschine Wasser meldet.
+  description: Sirene im Flur, Nachricht an beide Telefone und Durchsage auf den erreichbaren
+    Alexa-Lautsprechern, wenn der Sensor an der Waschmaschine Wasser meldet.
   triggers:
   - options:
       behavior: each
@@ -297,6 +322,31 @@
     data:
       message: Wasser an der Waschmaschine.
       title: Wasserleck
+  - parallel:
+    - action: notify.send_message
+      continue_on_error: true
+      data:
+        message: Wasser an der Waschmaschine.
+      target:
+        entity_id: notify.bad_jan_dieters_echo_show_bad_durchsagen
+    - action: notify.send_message
+      continue_on_error: true
+      data:
+        message: Wasser an der Waschmaschine.
+      target:
+        entity_id: notify.wohnzimmer_jan_dieter_s_sonos_era_300_durchsagen
+    - action: notify.send_message
+      continue_on_error: true
+      data:
+        message: Wasser an der Waschmaschine.
+      target:
+        entity_id: notify.jan_dieter_s_sonos_one_second_edition_durchsagen
+    - action: notify.send_message
+      continue_on_error: true
+      data:
+        message: Wasser an der Waschmaschine.
+      target:
+        entity_id: notify.jan_dieter_s_2nd_sonos_one_second_edition_durchsagen
   mode: single
 - id: '1795645967935'
   alias: Büro heizen im Homeoffice
@@ -536,8 +586,8 @@
   mode: single
 - id: '1795649569877'
   alias: Heizung Nachtabsenkung
-  description: Senkt Schlafzimmer, Kinderzimmer und Wohnzimmer um 22:30 auf 17 °C
-    und stellt werktags um 06:30 die gespeicherte Tagestemperatur wieder her. Ein
+  description: Senkt Schlafzimmer, Kinderzimmer, Wohnzimmer und Bad um 22:30 auf 17
+    °C und stellt werktags um 06:30 die gespeicherte Tagestemperatur wieder her. Ein
     Thermostat, das aus ist, bleibt aus.
   triggers:
   - at: '22:30:00'
@@ -622,6 +672,25 @@
             temperature: 17
           target:
             entity_id: climate.wohnzimmer_heizung_wohnzimmer
+      - if:
+        - condition: state
+          entity_id: climate.badezimmer
+          state: heat
+        - condition: numeric_state
+          entity_id: climate.badezimmer
+          attribute: temperature
+          above: 17.5
+        then:
+        - action: input_number.set_value
+          target:
+            entity_id: input_number.tagestemperatur_badezimmer
+          data:
+            value: '{{ state_attr(''climate.badezimmer'', ''temperature'') }}'
+        - action: climate.set_temperature
+          target:
+            entity_id: climate.badezimmer
+          data:
+            temperature: 17
     - conditions:
       - condition: trigger
         id: morning
@@ -659,10 +728,22 @@
               float(22) }}'
           target:
             entity_id: climate.wohnzimmer_heizung_wohnzimmer
+      - if:
+        - condition: state
+          entity_id: climate.badezimmer
+          state: heat
+        then:
+        - action: climate.set_temperature
+          target:
+            entity_id: climate.badezimmer
+          data:
+            temperature: '{{ states(''input_number.tagestemperatur_badezimmer'') |
+              float(20) }}'
   mode: single
 - id: '1795649571672'
   alias: Haustür offen
   description: Nachricht an beide Telefone, wenn die Haustür 10 Minuten offen bleibt.
+    Im Wohnzimmer sagt es der Era 300 dazu, solange jemand zu Hause ist.
   triggers:
   - entity_id: binary_sensor.haustur_offnung
     for:
@@ -678,6 +759,21 @@
     data:
       message: Die Haustür ist seit 10 Minuten offen.
       title: Haustür offen
+  - if:
+    - condition: zone.in_zone
+      options:
+        behavior: any
+        zone: zone.home
+      target:
+        entity_id:
+        - person.jan_dieter_kastner
+        - person.sylvia_kastner
+    then:
+    - action: notify.send_message
+      data:
+        message: Die Haustür ist seit 10 Minuten offen.
+      target:
+        entity_id: notify.wohnzimmer_jan_dieter_s_sonos_era_300_durchsagen
   mode: single
 - id: '1795649573303'
   alias: Matrix aus beim Verlassen des Büros
@@ -948,3 +1044,357 @@
       - stop: Lautstärke losgelassen
   mode: restart
   max_exceeded: silent
+- id: '1795721000001'
+  alias: Geräte fertig
+  description: Benachrichtigt beide Handys, wenn Waschmaschine, Trockner oder Snapmaker
+    einen Lauf beenden.
+  triggers:
+  - entity_id: sensor.waschmaschine_betriebszustand
+    from:
+    - run
+    - pause
+    - delayedstart
+    id: washer
+    to: finished
+    trigger: state
+  - entity_id: sensor.trockner_betriebszustand
+    from:
+    - run
+    - pause
+    - delayedstart
+    id: dryer
+    to: finished
+    trigger: state
+  - entity_id: sensor.buro_printerbitch_print_state
+    from:
+    - printing
+    - paused
+    id: snapmaker
+    to: complete
+    trigger: state
+  actions:
+  - choose:
+    - conditions:
+      - condition: trigger
+        id: washer
+      sequence:
+      - action: notify.mobile_app_jdk_iphone_16
+        data:
+          message: Die Waschmaschine ist fertig.
+          title: Waschmaschine
+      - action: notify.mobile_app_sylvias_iphone
+        data:
+          message: Die Waschmaschine ist fertig.
+          title: Waschmaschine
+    - conditions:
+      - condition: trigger
+        id: dryer
+      sequence:
+      - action: notify.mobile_app_jdk_iphone_16
+        data:
+          message: Der Trockner ist fertig.
+          title: Trockner
+      - action: notify.mobile_app_sylvias_iphone
+        data:
+          message: Der Trockner ist fertig.
+          title: Trockner
+    - conditions:
+      - condition: trigger
+        id: snapmaker
+      sequence:
+      - action: notify.mobile_app_jdk_iphone_16
+        data:
+          message: Der Snapmaker-Druck ist fertig.
+          title: Snapmaker
+      - action: notify.mobile_app_sylvias_iphone
+        data:
+          message: Der Snapmaker-Druck ist fertig.
+          title: Snapmaker
+  mode: queued
+  max: 5
+- id: '1795721614446'
+  alias: Bad Echo Durchsagen
+  description: Spricht auf dem Echo Show im Bad. Waschmaschine, Trockner, Snapmaker
+    und das offene Fenster nur, wenn jemand im Bad ist. Nach dem Duschen einmal „Bitte
+    das Fenster öffnen“, wenn es feucht bleibt und das Fenster zu ist.
+  triggers:
+  - entity_id: sensor.waschmaschine_betriebszustand
+    from:
+    - run
+    - pause
+    - delayedstart
+    id: waschmaschine
+    to: finished
+    trigger: state
+  - entity_id: sensor.trockner_betriebszustand
+    from:
+    - run
+    - pause
+    - delayedstart
+    id: trockner
+    to: finished
+    trigger: state
+  - entity_id: sensor.buro_printerbitch_print_state
+    from:
+    - printing
+    - paused
+    id: snapmaker
+    to: complete
+    trigger: state
+  - entity_id: binary_sensor.fenster_bad_offnung
+    id: fenster
+    note: Der Kontaktmelder hat die Klasse opening, deshalb kein window.opened.
+    to: 'on'
+    trigger: state
+  - above: 70
+    entity_id: sensor.sonoff_snzb_02d_luftfeuchtigkeit_3
+    for:
+      minutes: 10
+    id: feucht
+    trigger: numeric_state
+  actions:
+  - choose:
+    - conditions:
+      - condition: trigger
+        id:
+        - waschmaschine
+        - trockner
+        - snapmaker
+      - condition: occupancy.is_detected
+        target:
+          entity_id: binary_sensor.sonoff_snzb_06p_2
+      sequence:
+      - action: notify.send_message
+        data:
+          message: '{% if trigger.id == ''waschmaschine'' %}
+
+            Die Waschmaschine ist fertig.
+
+            {% elif trigger.id == ''trockner'' %}
+
+            Der Trockner ist fertig.
+
+            {% else %}
+
+            Der Snapmaker-Druck ist fertig.
+
+            {% endif %}'
+        target:
+          entity_id: notify.bad_jan_dieters_echo_show_bad_durchsagen
+    - conditions:
+      - condition: trigger
+        id: fenster
+      - condition: occupancy.is_detected
+        target:
+          entity_id: binary_sensor.sonoff_snzb_06p_2
+      - condition: state
+        entity_id: climate.badezimmer
+        state: heat
+      sequence:
+      - action: notify.send_message
+        data:
+          message: Das Fenster ist offen. Die Heizung pausiert.
+        target:
+          entity_id: notify.bad_jan_dieters_echo_show_bad_durchsagen
+    - conditions:
+      - condition: trigger
+        id: feucht
+      - condition: state
+        entity_id: binary_sensor.fenster_bad_offnung
+        state: 'off'
+      - condition: template
+        value_template: '{{ trigger.from_state is not none and is_number(trigger.from_state.state)
+          }}'
+      sequence:
+      - action: notify.send_message
+        data:
+          message: Bitte das Fenster öffnen.
+        target:
+          entity_id: notify.bad_jan_dieters_echo_show_bad_durchsagen
+  max: 5
+  mode: queued
+- id: '1795722177787'
+  alias: Es klingelt
+  description: Sagt im Wohnzimmer Bescheid, wenn es an der Haustür klingelt und jemand
+    zu Hause ist.
+  triggers:
+  - options:
+      behavior: each
+    target:
+      entity_id: binary_sensor.haustur_klingeln
+    trigger: occupancy.detected
+  conditions:
+  - condition: zone.in_zone
+    options:
+      behavior: any
+      zone: zone.home
+    target:
+      entity_id:
+      - person.jan_dieter_kastner
+      - person.sylvia_kastner
+  actions:
+  - action: notify.send_message
+    data:
+      message: Es klingelt.
+    target:
+      entity_id: notify.wohnzimmer_jan_dieter_s_sonos_era_300_durchsagen
+  mode: single
+- id: '1795722182994'
+  alias: Herd noch an
+  description: Sagt im Wohnzimmer Bescheid und schreibt beiden, wenn jemand geht und
+    Backofen oder Kochfeld noch an ist.
+  triggers:
+  - entity_id:
+    - person.jan_dieter_kastner
+    - person.sylvia_kastner
+    to: not_home
+    trigger: state
+  conditions:
+  - condition: or
+    conditions:
+    - condition: state
+      entity_id: switch.backofen_power
+      state: 'on'
+    - condition: state
+      entity_id: switch.kochfeld_power
+      state: 'on'
+  actions:
+  - action: notify.send_message
+    data:
+      message: '{% if is_state(''switch.backofen_power'', ''on'') and is_state(''switch.kochfeld_power'',
+        ''on'') %}
+
+        Backofen und Kochfeld sind noch an.
+
+        {% elif is_state(''switch.backofen_power'', ''on'') %}
+
+        Der Backofen ist noch an.
+
+        {% else %}
+
+        Das Kochfeld ist noch an.
+
+        {% endif %}'
+    target:
+      entity_id: notify.wohnzimmer_jan_dieter_s_sonos_era_300_durchsagen
+  - action: notify.mobile_app_jdk_iphone_16
+    data:
+      message: '{% if is_state(''switch.backofen_power'', ''on'') and is_state(''switch.kochfeld_power'',
+        ''on'') %}
+
+        Backofen und Kochfeld sind noch an.
+
+        {% elif is_state(''switch.backofen_power'', ''on'') %}
+
+        Der Backofen ist noch an.
+
+        {% else %}
+
+        Das Kochfeld ist noch an.
+
+        {% endif %}'
+      title: Küche
+  - action: notify.mobile_app_sylvias_iphone
+    data:
+      message: '{% if is_state(''switch.backofen_power'', ''on'') and is_state(''switch.kochfeld_power'',
+        ''on'') %}
+
+        Backofen und Kochfeld sind noch an.
+
+        {% elif is_state(''switch.backofen_power'', ''on'') %}
+
+        Der Backofen ist noch an.
+
+        {% else %}
+
+        Das Kochfeld ist noch an.
+
+        {% endif %}'
+      title: Küche
+  mode: single
+- id: '1795722187048'
+  alias: Robomops pausiert bei Heimkehr
+  description: Pausiert den Robomops und sagt es im Wohnzimmer, wenn die erste Person
+    nach Hause kommt, während er saugt.
+  triggers:
+  - entity_id: person.jan_dieter_kastner
+    id: jan
+    to: home
+    trigger: state
+  - entity_id: person.sylvia_kastner
+    id: sylvia
+    to: home
+    trigger: state
+  conditions:
+  - condition: state
+    entity_id: vacuum.robomops
+    state: cleaning
+  actions:
+  - choose:
+    - conditions:
+      - condition: trigger
+        id: jan
+      - condition: state
+        entity_id: person.sylvia_kastner
+        state: not_home
+      sequence:
+      - action: vacuum.pause
+        target:
+          entity_id: vacuum.robomops
+      - action: notify.send_message
+        data:
+          message: Der Robomops hält an.
+        target:
+          entity_id: notify.wohnzimmer_jan_dieter_s_sonos_era_300_durchsagen
+    - conditions:
+      - condition: trigger
+        id: sylvia
+      - condition: state
+        entity_id: person.jan_dieter_kastner
+        state: not_home
+      sequence:
+      - action: vacuum.pause
+        target:
+          entity_id: vacuum.robomops
+      - action: notify.send_message
+        data:
+          message: Der Robomops hält an.
+        target:
+          entity_id: notify.wohnzimmer_jan_dieter_s_sonos_era_300_durchsagen
+  mode: single
+- id: '1795722205457'
+  alias: Gute Nacht sagen
+  description: Startet Gute Nacht, wenn jemand den Satz zu Assist sagt. Alexa startet
+    dasselbe Skript direkt.
+  triggers:
+  - command:
+    - gute nacht
+    - gute Nacht
+    - schlaf gut
+    trigger: conversation
+  actions:
+  - action: script.gute_nacht
+  mode: single
+- id: '1795722208269'
+  alias: Gute Nacht beenden
+  description: Hebt Bitte nicht stören am Morgen wieder auf, wenn am Abend Gute Nacht
+    gesagt wurde. Das Echo im Bad bleibt unverändert.
+  triggers:
+  - at: 06:30:00
+    trigger: time
+  conditions:
+  - condition: state
+    entity_id: input_boolean.gute_nacht
+    state: 'on'
+  actions:
+  - action: switch.turn_off
+    continue_on_error: true
+    target:
+      entity_id:
+      - switch.wohnzimmer_jan_dieter_s_sonos_era_300_bitte_nicht_storen
+      - switch.jan_dieter_s_sonos_one_second_edition_bitte_nicht_storen
+      - switch.jan_dieter_s_2nd_sonos_one_second_edition_bitte_nicht_storen
+  - action: input_boolean.turn_off
+    target:
+      entity_id: input_boolean.gute_nacht
+  mode: single

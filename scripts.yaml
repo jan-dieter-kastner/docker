@@ -2,31 +2,138 @@ awtrix_set_to_dnd:
   alias: Set a do not disturb message on Matrix display
   mode: single
   sequence:
-    - action: mqtt.publish
-      data:
-        topic: awtrix_1222c4/notify
-        qos: "2"
-        retain: true
-        payload: '{"text":"Nicht stören!","rainbow":true,"icon":651,"hold":true,"stack":false}'
-
+  - action: mqtt.publish
+    data:
+      topic: awtrix_1222c4/notify
+      qos: '2'
+      retain: true
+      payload: '{"text":"Nicht stören!","rainbow":true,"icon":651,"hold":true,"stack":false}'
 awtrix_set_to_welcome:
   alias: Set a welcome message on Matrix display
   mode: single
   sequence:
-    - action: mqtt.publish
-      data:
-        topic: awtrix_1222c4/notify
-        qos: "2"
-        retain: true
-        payload: '{"text":"abandon hope all ye who enter here!","rainbow":true,"icon":275,"hold":true,"stack":false}'
-
+  - action: mqtt.publish
+    data:
+      topic: awtrix_1222c4/notify
+      qos: '2'
+      retain: true
+      payload: '{"text":"abandon hope all ye who enter here!","rainbow":true,"icon":275,"hold":true,"stack":false}'
 awtrix_set_to_beer:
   alias: Set a beer message on Matrix display
   mode: single
   sequence:
-    - action: mqtt.publish
+  - action: mqtt.publish
+    data:
+      topic: awtrix_1222c4/notify
+      qos: '2'
+      retain: true
+      payload: '{"text":"Hol Bier und zwar schnell Du armseliges Frettchen","rainbow":true,"icon":3253,"hold":true,"stack":false}'
+gute_nacht:
+  alias: Gute Nacht
+  description: Schaltet die Abendbeleuchtung aus, senkt die Heizung wie um 22:30 und
+    stellt die Alexa-Lautsprecher außer dem Echo im Bad auf Bitte nicht stören. Das
+    Bad bleibt ansagbar.
+  icon: mdi:weather-night
+  mode: single
+  sequence:
+  - action: homeassistant.turn_off
+    target:
+      entity_id:
+      - switch.tz3000_w0qqde0g_ts011f_3
+      - switch.tz3000_w0qqde0g_ts011f_4
+      - switch.tz3000_w0qqde0g_ts011f_5
+      - switch.tz3000_w0qqde0g_ts011f_2
+      - light.arco
+      - light.ikea_of_sweden_tradfri_driver_30w
+      - light.tz3000_hafsqare_ts0011
+      - light.tz3000_hafsqare_ts0011_2
+      - light.tz3000_hafsqare_ts0011_3
+      - light.tz3000_hafsqare_ts0011_4
+      - light.tz3000_hafsqare_ts0011_5
+  - if:
+    - condition: state
+      entity_id: climate.schlafzimmer
+      state: heat
+    - above: 17.5
+      attribute: temperature
+      condition: numeric_state
+      entity_id: climate.schlafzimmer
+    then:
+    - action: input_number.set_value
       data:
-        topic: awtrix_1222c4/notify
-        qos: "2"
-        retain: true
-        payload: '{"text":"Hol Bier und zwar schnell Du armseliges Frettchen","rainbow":true,"icon":3253,"hold":true,"stack":false}'
+        value: '{{ state_attr(''climate.schlafzimmer'', ''temperature'') }}'
+      target:
+        entity_id: input_number.tagestemperatur_schlafzimmer
+    - action: climate.set_temperature
+      data:
+        temperature: 17
+      target:
+        entity_id: climate.schlafzimmer
+  - if:
+    - condition: state
+      entity_id: climate.kinderzimmer
+      state: heat
+    - above: 17.5
+      attribute: temperature
+      condition: numeric_state
+      entity_id: climate.kinderzimmer
+    then:
+    - action: input_number.set_value
+      data:
+        value: '{{ state_attr(''climate.kinderzimmer'', ''temperature'') }}'
+      target:
+        entity_id: input_number.tagestemperatur_kinderzimmer
+    - action: climate.set_temperature
+      data:
+        temperature: 17
+      target:
+        entity_id: climate.kinderzimmer
+  - if:
+    - condition: state
+      entity_id: climate.wohnzimmer_heizung_wohnzimmer
+      state: heat
+    - above: 17.5
+      attribute: temperature
+      condition: numeric_state
+      entity_id: climate.wohnzimmer_heizung_wohnzimmer
+    then:
+    - action: input_number.set_value
+      data:
+        value: '{{ state_attr(''climate.wohnzimmer_heizung_wohnzimmer'', ''temperature'')
+          }}'
+      target:
+        entity_id: input_number.tagestemperatur_wohnzimmer
+    - action: climate.set_temperature
+      data:
+        temperature: 17
+      target:
+        entity_id: climate.wohnzimmer_heizung_wohnzimmer
+  - if:
+    - condition: state
+      entity_id: climate.badezimmer
+      state: heat
+    - above: 17.5
+      attribute: temperature
+      condition: numeric_state
+      entity_id: climate.badezimmer
+    then:
+    - action: input_number.set_value
+      data:
+        value: '{{ state_attr(''climate.badezimmer'', ''temperature'') }}'
+      target:
+        entity_id: input_number.tagestemperatur_badezimmer
+    - action: climate.set_temperature
+      data:
+        temperature: 17
+      target:
+        entity_id: climate.badezimmer
+  - action: switch.turn_on
+    continue_on_error: true
+    target:
+      entity_id:
+      - switch.wohnzimmer_jan_dieter_s_sonos_era_300_bitte_nicht_storen
+      - switch.jan_dieter_s_sonos_one_second_edition_bitte_nicht_storen
+      - switch.jan_dieter_s_2nd_sonos_one_second_edition_bitte_nicht_storen
+  - action: input_boolean.turn_on
+    target:
+      entity_id: input_boolean.gute_nacht
