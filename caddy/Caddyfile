@@ -1,0 +1,82 @@
+{
+	auto_https off
+	admin off
+}
+
+http://ca.home.arpa:8080 {
+	handle /home-ca.crt {
+		header Content-Type "application/octet-stream"
+		header Content-Disposition "attachment; filename=\"home-ca.crt\""
+		root * /srv/public
+		file_server
+	}
+	handle {
+		redir https://ca.home.arpa/home-ca.crt
+	}
+}
+
+https://ha.home.arpa:8443, https://homeassistant.home.arpa:8443 {
+	tls /certs/home.crt /certs/home.key
+	reverse_proxy 10.13.238.1:8123 {
+		header_up -X-Forwarded-For
+		header_up -X-Forwarded-Host
+		header_up -X-Forwarded-Proto
+	}
+}
+
+https://mealie.home.arpa:8443 {
+	tls /certs/home.crt /certs/home.key
+	reverse_proxy 10.13.238.1:9925
+}
+
+https://portainer.home.arpa:8443 {
+	tls /certs/home.crt /certs/home.key
+	reverse_proxy https://10.13.238.1:9443 {
+		transport http {
+			tls_insecure_skip_verify
+		}
+	}
+}
+
+https://snapmaker.home.arpa:8443 {
+	tls /certs/home.crt /certs/home.key
+	reverse_proxy 10.13.37.204:80
+}
+
+https://proxmox.home.arpa:8443 {
+	tls /certs/home.crt /certs/home.key
+	reverse_proxy https://10.13.37.151:8006 {
+		transport http {
+			tls_insecure_skip_verify
+		}
+	}
+}
+
+https://matrix.home.arpa:8443 {
+	tls /certs/home.crt /certs/home.key
+	reverse_proxy 10.13.37.12:80
+}
+
+https://ca.home.arpa:8443, https://dockerha.home.arpa:8443, https://home.arpa:8443 {
+	tls /certs/home.crt /certs/home.key
+	handle /home-ca.crt {
+		header Content-Type "application/octet-stream"
+		header Content-Disposition "attachment; filename=\"home-ca.crt\""
+		root * /srv/public
+		file_server
+	}
+	handle {
+		header Content-Type text/plain
+		respond "Home Assistant  https://ha.home.arpa
+Mealie           https://mealie.home.arpa
+Portainer        https://portainer.home.arpa
+Fileserver       smb://fileserver.home.arpa
+Plex             plex.home.arpa
+Snapmaker        https://snapmaker.home.arpa
+Proxmox          https://proxmox.home.arpa
+Matrix           https://matrix.home.arpa
+UniFi            https://unifi.home.arpa
+Certificate      http://ca.home.arpa/home-ca.crt
+" 200
+	}
+}
